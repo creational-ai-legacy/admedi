@@ -1,0 +1,3 @@
+# git-crypt encrypted files
+docs/** filter=git-crypt diff=git-crypt
+docs/**/** filter=git-crypt diff=git-crypt
