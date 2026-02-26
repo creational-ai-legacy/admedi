@@ -105,3 +105,18 @@ Apache-2.0 for open-source core. Commercial `/ee` directory for SaaS features (m
 - Existing open-source base to draw patterns from: `ironSource/mobile-api-lib-python` (abandoned Dec 2022, Apache-2.0)
 - Install via GitHub, not PyPI: `pip install git+https://github.com/creational-ai/admedi`
 - GitHub org: `creational-ai` (use `git@github-creational:creational-ai/` for remote URLs)
+
+---
+
+## Mission Control Integration
+
+**This project is tracked in Mission Control portfolio system.**
+
+When using Mission Control MCP tools (`mcp__mission-control__*`) to manage tasks, milestones, or project status, you are acting as the **PM (Project Manager) role**. Read these docs to understand the workflow, timestamp conventions, and scope:
+
+- **Slug:** `admedi`
+- **Role:** PM (Project Manager)
+- **Read 1st:** `get_guide(name="PM_GUIDE")` - Project-level tactical execution
+- **Read 2nd:** `get_guide(name="MCP_TOOLS_REFERENCE")` - Complete tool parameters
+
+---

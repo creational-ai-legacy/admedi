@@ -1,6 +1,6 @@
-# Admedi
+# Admedi — Ad Mediation, Codified
 
-Config-as-code for ad mediation. Define country tiers in YAML, diff against live configs, sync across your entire app portfolio.
+Define country tiers in YAML, diff against live configs, sync across your entire app portfolio.
 
 ## What It Does
 
