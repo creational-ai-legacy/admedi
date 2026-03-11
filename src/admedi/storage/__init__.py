@@ -1,0 +1,1 @@
+"""Admedi storage adapters."""

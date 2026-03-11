@@ -1,0 +1,1 @@
+"""Admedi MCP server."""

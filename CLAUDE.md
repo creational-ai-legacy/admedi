@@ -35,13 +35,13 @@ admedi/
 ├── engine/         # ConfigEngine: Loader, Differ, Applier
 ├── cli/            # typer-based CLI commands
 ├── mcp/            # FastMCP server
-├── storage/        # Local file, SQLite, Postgres adapters
+├── storage/        # Local file, PostgreSQL (RDS/Supabase) adapters
 └── models/         # Pydantic models for 9 core entities
 ```
 
 ## Technology Stack
 
-- **Language**: Python 3.10+ (match/case, type unions)
+- **Language**: Python 3.14+ (match/case, type unions, improved error messages, performance)
 - **HTTP**: `httpx` (async) — concurrent multi-app API calls
 - **CLI**: `typer` — type-hint-driven, auto-generated help
 - **MCP**: `FastMCP` — Creational.ai's standard MCP framework
@@ -57,7 +57,7 @@ Three-layer design with two adapter boundaries:
 
 1. **Interface Layer**: Python library, CLI (typer), FastMCP server, Cowork plugin (future)
 2. **Core Engine (ConfigEngine)**: Loader (YAML → TierTemplate) → Differ (local vs remote) → Applier (push changes)
-3. **Adapter Layer**: Mediation adapters (LevelPlay MVP; MAX, AdMob future) + Storage adapters (local file default; SQLite, Postgres future)
+3. **Adapter Layer**: Mediation adapters (LevelPlay MVP; MAX, AdMob future) + Storage adapters (local file default; PostgreSQL via async SQLAlchemy Core for RDS/Supabase)
 
 Key design patterns:
 - **Dual adapter interfaces**: `MediationAdapter` (12 methods for platform API CRUD) and `StorageAdapter` (5 methods for persistence). Adding a new mediator or storage backend = implementing an interface.

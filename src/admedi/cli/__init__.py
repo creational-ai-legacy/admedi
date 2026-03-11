@@ -1,0 +1,1 @@
+"""Admedi CLI commands."""
