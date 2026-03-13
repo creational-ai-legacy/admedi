@@ -19,12 +19,16 @@ from enum import Enum
 class AdFormat(str, Enum):
     """Supported ad unit formats.
 
-    Values match the LevelPlay API's ``adUnit`` field strings.
+    Values match the LevelPlay API field strings. The Groups v4 API uses
+    ``"rewarded"`` while the legacy Mediation Management v2 API uses
+    ``"rewardedVideo"`` — both are included for compatibility.
     """
 
     BANNER = "banner"
     INTERSTITIAL = "interstitial"
+    REWARDED = "rewarded"
     REWARDED_VIDEO = "rewardedVideo"
+    NATIVE = "native"
 
 
 class Platform(str, Enum):

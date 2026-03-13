@@ -8,7 +8,7 @@ Example::
     from admedi.adapters.storage import StorageAdapter
 
     class LocalFileStorageAdapter(StorageAdapter):
-        async def save_config(self, config: TierTemplate) -> None:
+        async def save_sync_log(self, log: SyncLog) -> None:
             ...
 """
 
@@ -18,50 +18,21 @@ from abc import ABC, abstractmethod
 
 from admedi.models.config_snapshot import ConfigSnapshot
 from admedi.models.sync_log import SyncLog
-from admedi.models.tier_template import TierTemplate
 
 
 class StorageAdapter(ABC):
     """Abstract base class for persistence backends.
 
     Concrete adapters (e.g., ``LocalFileStorageAdapter``,
-    ``PostgresStorageAdapter``) implement all 5 async methods to
-    persist tier configs, sync history, and configuration snapshots.
+    ``PostgresStorageAdapter``) implement 3 async methods to
+    persist sync history and configuration snapshots.
 
     Example::
 
         storage = LocalFileStorageAdapter(data_dir="/path/to/data")
-        await storage.save_config(tier_template)
-        loaded = await storage.load_config("shelf-sort-interstitial")
+        await storage.save_sync_log(sync_log)
+        history = await storage.list_sync_history("app_key")
     """
-
-    @abstractmethod
-    async def save_config(self, config: TierTemplate) -> None:
-        """Persist a tier template configuration.
-
-        Args:
-            config: The tier template to save.
-
-        Raises:
-            AdmediError: If persistence fails.
-        """
-        ...
-
-    @abstractmethod
-    async def load_config(self, config_id: str) -> TierTemplate | None:
-        """Load a tier template by identifier.
-
-        Args:
-            config_id: Unique identifier for the config (e.g., template name
-                or slug).
-
-        Returns:
-            The loaded ``TierTemplate``, or ``None`` if not found.
-
-        Raises:
-            AdmediError: If loading fails for reasons other than not found.
-        """
-        ...
 
     @abstractmethod
     async def save_sync_log(self, log: SyncLog) -> None:

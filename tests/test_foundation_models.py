@@ -297,47 +297,55 @@ class TestSyncLog:
     """Tests for the SyncLog model."""
 
     def test_create_minimal(self) -> None:
-        """SyncLog with required fields only."""
+        """SyncLog with required fields only (error defaults to None)."""
+        from admedi.models.apply_result import ApplyStatus
+
         ts = datetime(2026, 2, 1, 10, 0, tzinfo=timezone.utc)
         log = SyncLog(
-            timestamp=ts,
             app_key="abc123",
-            action="apply",
-            diff_summary={"groups_added": 2},
-            result="success",
+            timestamp=ts,
+            action="sync",
+            groups_created=2,
+            groups_updated=1,
+            status=ApplyStatus.SUCCESS,
         )
         assert log.timestamp == ts
         assert log.app_key == "abc123"
-        assert log.action == "apply"
-        assert log.diff_summary == {"groups_added": 2}
-        assert log.result == "success"
-        assert log.user is None
-        assert log.error_detail is None
+        assert log.action == "sync"
+        assert log.groups_created == 2
+        assert log.groups_updated == 1
+        assert log.status == ApplyStatus.SUCCESS
+        assert log.error is None
 
     def test_create_with_all_fields(self) -> None:
-        """SyncLog with all fields populated."""
+        """SyncLog with all fields populated including error."""
+        from admedi.models.apply_result import ApplyStatus
+
         ts = datetime(2026, 2, 1, 10, 0, tzinfo=timezone.utc)
         log = SyncLog(
-            timestamp=ts,
             app_key="abc123",
-            user="admin@example.com",
-            action="rollback",
-            diff_summary={"groups_removed": 1, "instances_changed": 3},
-            result="partial_failure",
-            error_detail="Instance batch rejected by API",
+            timestamp=ts,
+            action="sync",
+            groups_created=0,
+            groups_updated=0,
+            status=ApplyStatus.FAILED,
+            error="API returned 500",
         )
-        assert log.user == "admin@example.com"
-        assert log.error_detail == "Instance batch rejected by API"
+        assert log.status == ApplyStatus.FAILED
+        assert log.error == "API returned 500"
 
     def test_round_trip(self) -> None:
         """SyncLog round-trips via model_dump/model_validate."""
+        from admedi.models.apply_result import ApplyStatus
+
         ts = datetime(2026, 2, 1, 10, 0, tzinfo=timezone.utc)
         log = SyncLog(
-            timestamp=ts,
             app_key="abc123",
-            action="diff",
-            diff_summary={"changes": []},
-            result="success",
+            timestamp=ts,
+            action="sync",
+            groups_created=1,
+            groups_updated=0,
+            status=ApplyStatus.SUCCESS,
         )
         dumped = log.model_dump()
         restored = SyncLog.model_validate(dumped)
@@ -345,38 +353,20 @@ class TestSyncLog:
 
     def test_datetime_serialization(self) -> None:
         """SyncLog datetime field serializes and deserializes correctly."""
+        from admedi.models.apply_result import ApplyStatus
+
         ts = datetime(2026, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
         log = SyncLog(
-            timestamp=ts,
             app_key="key",
-            action="apply",
-            diff_summary={},
-            result="success",
+            timestamp=ts,
+            action="sync",
+            groups_created=0,
+            groups_updated=0,
+            status=ApplyStatus.DRY_RUN,
         )
         dumped = log.model_dump()
         restored = SyncLog.model_validate(dumped)
         assert restored.timestamp == ts
-
-    def test_nested_diff_summary(self) -> None:
-        """SyncLog handles nested diff_summary dict."""
-        summary = {
-            "groups": {
-                "added": ["Tier1", "Tier2"],
-                "removed": [],
-                "modified": {"Default": {"floor_price": {"old": 0.5, "new": 1.0}}},
-            },
-            "instances": {"count": 5},
-        }
-        log = SyncLog(
-            timestamp=datetime.now(tz=timezone.utc),
-            app_key="key",
-            action="apply",
-            diff_summary=summary,
-            result="success",
-        )
-        dumped = log.model_dump()
-        restored = SyncLog.model_validate(dumped)
-        assert restored.diff_summary == summary
 
     def test_missing_required_field_raises(self) -> None:
         """Missing required field raises ValidationError."""
@@ -384,7 +374,7 @@ class TestSyncLog:
             SyncLog(
                 timestamp=datetime.now(tz=timezone.utc),
                 app_key="key",
-                # missing action, diff_summary, result
+                # missing action, groups_created, groups_updated, status
             )  # type: ignore[call-arg]
 
 

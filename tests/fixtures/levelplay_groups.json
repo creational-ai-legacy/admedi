@@ -1,0 +1,111 @@
+[
+  {
+    "groupId": 12345,
+    "groupName": "US Tier 1",
+    "adFormat": "interstitial",
+    "countries": ["US"],
+    "position": 1,
+    "floorPrice": 15.0,
+    "abTest": "N/A",
+    "mediationAdUnitId": "mau_001",
+    "mediationAdUnitName": "Interstitial US",
+    "segments": [],
+    "instances": [
+      {
+        "id": 101,
+        "name": "ironSource Default",
+        "networkName": "ironSource",
+        "isBidder": false,
+        "groupRate": 12.5,
+        "countriesRate": [
+          {
+            "countryCode": "US",
+            "rate": 18.0
+          }
+        ]
+      },
+      {
+        "id": 102,
+        "name": "AdMob Bidding",
+        "networkName": "AdMob",
+        "isBidder": true,
+        "groupRate": 10.0,
+        "countriesRate": null
+      }
+    ]
+  },
+  {
+    "groupId": 12346,
+    "groupName": "APAC Tier 2",
+    "adFormat": "banner",
+    "countries": ["JP", "KR", "TW"],
+    "position": 2,
+    "floorPrice": 5.0,
+    "abTest": "A",
+    "mediationAdUnitId": "mau_002",
+    "mediationAdUnitName": "Banner APAC",
+    "segments": null,
+    "instances": [
+      {
+        "id": 201,
+        "name": "UnityAds Banner",
+        "networkName": "UnityAds",
+        "isBidder": false,
+        "groupRate": 4.5,
+        "countriesRate": [
+          {
+            "countryCode": "JP",
+            "rate": 6.0
+          },
+          {
+            "countryCode": "KR",
+            "rate": 5.5
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "groupId": 12347,
+    "groupName": "Global Rewarded",
+    "adFormat": "rewardedVideo",
+    "countries": [],
+    "position": 3,
+    "floorPrice": null,
+    "abTest": null,
+    "mediationAdUnitId": null,
+    "mediationAdUnitName": null,
+    "segments": null,
+    "instances": [
+      {
+        "id": 301,
+        "name": "Liftoff Bidding RV",
+        "networkName": "Liftoff Bidding",
+        "isBidder": true,
+        "groupRate": null,
+        "countriesRate": [
+          {
+            "countryCode": "US",
+            "rate": 25.0
+          },
+          {
+            "countryCode": "GB",
+            "rate": 20.0
+          },
+          {
+            "countryCode": "DE",
+            "rate": 18.0
+          }
+        ]
+      },
+      {
+        "id": 302,
+        "name": "Vungle RV",
+        "networkName": "Vungle",
+        "isBidder": false,
+        "groupRate": 8.0,
+        "countriesRate": null
+      }
+    ]
+  }
+]

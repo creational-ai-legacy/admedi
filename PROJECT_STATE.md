@@ -1,10 +1,10 @@
 # Project State: Admedi
 
-> **Last Updated**: 2026-02-27T21:57:48-0800
+> **Last Updated**: 2026-03-12T19:08:51-0700
 
 **Admedi** is a config-driven ad mediation management tool that replaces manual dashboard clicking with config-as-code: define country tiers in YAML, diff against live mediation configs via platform APIs, and sync across an entire app portfolio.
 
-**Current Status**: Core milestone in progress -- Foundation task complete with 9 pydantic v2 models, abstract adapter interfaces, typed exceptions, and 509 passing tests.
+**Current Status**: Core milestone nearing completion -- Foundation, Auth-Reads, and Config-Engine tasks complete. Full config-as-code pipeline operational: YAML template loading, diffing, applying via CLI, and local audit storage. 1098 tests passing. Next: Dogfood on Shelf Sort portfolio.
 
 ---
 
@@ -15,12 +15,13 @@
 | ID | Name | Type | Status | Tests | Docs |
 |-----|------|------|--------|-------|------|
 | foundation | Project Foundation | foundation | ✅ Complete | 509 passing | `core-foundation-*.md` |
-| auth | LevelPlay Authentication | feature | ⬜ Pending | -- | -- |
-| config-engine | ConfigEngine (Loader, Differ, Applier) | feature | ⬜ Pending | -- | -- |
-| interfaces | CLI + MCP + Local Storage | feature | ⬜ Pending | -- | -- |
+| auth-reads | LevelPlay Auth + Core Reads | feature | ✅ Complete | 205 passing | `core-auth-reads-*.md` |
+| config-engine | ConfigEngine + Group Writes + CLI + Storage | feature | ✅ Complete | 386 passing | `core-config-engine-*.md` |
 | dogfood | Shelf Sort Dogfood | validation | ⬜ Pending | -- | -- |
 
-**Total Tests**: 509 passing (100% pass rate)
+**Post-Core (deferred)**: Instance CRUD, placement ops, reporting API, MCP server, `admedi revenue`, `admedi manage-instances`
+
+**Total Tests**: 1098 passing (100% pass rate), 10 deselected (integration markers)
 
 ---
 
@@ -28,6 +29,9 @@
 
 | Date | Decision | Rationale |
 |------|----------|-----------|
+| 2026-03-11 | Revised task plan: 3 tasks to dogfood (down from 4) | Merged auth+reads, merged engine+CLI+storage, deferred MCP and non-tier-sync ops. Faster path to working `admedi sync-tiers`. |
+| 2026-03-11 | Defer MCP server to post-core | CLI-first approach -- once it works locally, adding cloud/AI interfaces is straightforward. Easier to debug. |
+| 2026-03-11 | Defer instance CRUD, placements, reporting | Independent of tier sync critical path. Shelf Sort apps already have all instances configured -- we just rearrange tiers. |
 | 2026-02-27 | `setuptools.build_meta` over `_legacy` backend | The `_legacy` backend path does not exist; `build_meta` is the standard PEP 517 backend |
 | 2026-02-27 | camelCase for network registry field names | Majority pattern across networks; outliers documented in `_UNVERIFIED_CASING` |
 | 2026-02-27 | Fyber `adSpotId` over lib's `adSoptId` | The lib's spelling is almost certainly a typo |
@@ -38,48 +42,54 @@
 ## What's Next
 
 **Recommended Next Steps**:
-1. LevelPlay Authentication -- OAuth 2.0 bearer token flow, auto-refresh, `list_apps` endpoint
-2. ConfigEngine -- YAML template loader, differ (local vs remote), applier (push changes)
-3. CLI + MCP interfaces and local file storage adapter
+1. Run integration tests with real credentials to validate adapter + write operations against live LevelPlay API
+2. Portfolio Dogfood -- real Shelf Sort validation for 2+ weeks with `admedi sync-tiers`
+3. After dogfood: open-source packaging, MCP server, extended operations
 
-**System Status**: ✅ **Foundation Complete**
-- 9 pydantic v2 models with full validation
-- Abstract adapter interfaces (MediationAdapter + StorageAdapter)
-- 34-network credential registry
-- 509 tests, zero lint/type errors
+**System Status**: ✅ **Config-Engine Complete**
+- Full config-as-code pipeline: YAML -> Loader -> Differ -> Applier -> CLI
+- 4 CLI commands: audit, sync-tiers, snapshot, status
+- Group write operations: create, update, delete via LevelPlay v4 API
+- Local file storage: JSONL sync logs, per-snapshot JSON files in .admedi/
+- Safety: dry-run default, pre-write snapshots, A/B test detection, per-app error isolation
+- 1098 tests passing, zero regressions
 
 ---
 
 ## Latest Health Check
 
-### 2026-02-27 - Core Foundation Task Finalization
+### 2026-03-12 - Config-Engine Task Finalization
 **Status**: ✅ On Track
 
 **Context**:
-Foundation task completed -- the first task in the Core milestone. All 10 implementation steps finished with zero deviations from plan. This health check runs as part of task finalization.
+Config-Engine task completed -- the third task in the Core milestone. All 14 implementation steps (Steps 0-13) finished with zero deviations from plan. The full config-as-code pipeline is now operational: YAML template loading, diffing against live API state, applying changes via CLI, and persisting audit trails locally.
 
 **Findings**:
-- ✅ All work aligns with the Core milestone's first phase (repo scaffolding, models, adapters) as defined in the roadmap
-- ✅ Models derived from real LevelPlay API response shapes with camelCase alias support -- production-grade data layer
-- ✅ Architecture matches the three-layer design (Interface, Core Engine, Adapter) from the architecture doc
-- ✅ No scope drift -- implementation matches plan exactly across all 10 steps
-- ✅ Complexity is proportionate: 22 source files for 9 models + 5 enums + exceptions + adapters + network registry
-- ✅ 509 tests passing, zero ruff errors, zero mypy errors across 22 source files
+- ✅ Work aligns with Core milestone phase 3 (engine + CLI + storage) as defined in the milestone spec
+- ✅ Architecture follows the three-layer design: ConfigEngine orchestrates Loader/Differ/Applier; CLI delegates to engine; storage is pluggable via StorageAdapter interface
+- ✅ Production-grade safety: dry-run default, pre-write snapshots, A/B test detection at both diff-time and apply-time, per-app error isolation, post-write verification
+- ✅ No scope drift -- all 14 steps implemented per plan with zero deviations
+- ✅ Complexity proportionate: engine (5 modules), CLI (2 modules), storage (1 module), models (4 modules) -- clean separation of concerns
+- ✅ 1098 tests passing (712 existing + 386 new config engine), 10 integration tests deselected by default
 
 **Challenges**:
-- `setuptools.backends._legacy:_Backend` was specified in the design but does not exist; resolved by using `setuptools.build_meta`
-- ironSource lib has inconsistent field casing across 34 networks; resolved by normalizing to camelCase and documenting all deviations in `_UNVERIFIED_CASING`
+- LevelPlay Groups v4 API uses different field names for POST vs PUT -- silent acceptance of wrong field names required careful mapping per endpoint
+- Python 3.14 changed `str()` behavior on `(str, Enum)` subclasses, requiring test assertion updates in Step 2a
+- Export-tracking tests in `test_foundation_final.py` required updates at Steps 1, 2a, 2b as new models were added to `__init__.py`
 
 **Results**:
-- ✅ Installable Python package with `uv sync` and all 6 subpackages importable
-- ✅ 9 pydantic v2 models with validation, boolean normalization, and serialization round-trips
-- ✅ Abstract adapter interfaces with capability negotiation pattern
-- ✅ Data-driven network credential registry covering all 34 LevelPlay networks
-- ✅ Typed exception hierarchy with 5 specific subclasses
-- ✅ Shelf Sort TierTemplate constructs and validates correctly
+- ✅ ConfigEngine orchestrator with 4 async methods: audit, sync, snapshot, status
+- ✅ Loader: YAML -> validated PortfolioConfig with human-readable error messages
+- ✅ Differ: template vs remote comparison with name+position matching, format-union iteration, A/B test detection
+- ✅ Applier: dry-run default, pre-write snapshots, ascending-position CREATE ordering, post-write verification, sync log recording
+- ✅ Group write operations: create_group, update_group, delete_group via LevelPlay v4 API
+- ✅ CLI: 4 typer commands (audit, sync-tiers, snapshot, status) with rich terminal output, JSON output mode, proper exit codes
+- ✅ LocalFileStorageAdapter: JSONL sync logs, per-snapshot JSON files, .admedi/ directory auto-creation
+- ✅ Real Shelf Sort YAML template (6 apps, 4 tiers, per-tier ad_format scoping)
 
 **Lessons Learned**:
-- ironSource lib field casing is inconsistent and contains at least one typo (Fyber `adSoptId`) -- integration testing will be essential for verifying the credential registry
-- The `(str, Enum)` pattern behavior changed in Python 3.14 regarding `str()` output -- use `.value` explicitly for API strings
+- LevelPlay's POST/PUT field name asymmetry is a silent failure source -- must verify field names per endpoint, not assume consistency
+- Single-group position skip rule is essential for banner format to avoid false-positive diffs
+- Check existing model files before creating duplicates when a plan specifies co-location -- avoids import ambiguity
 
-**Next**: LevelPlay Authentication (OAuth 2.0 bearer token, auto-refresh, `list_apps` concrete adapter method)
+**Next**: Run integration tests against live LevelPlay API with real credentials, then proceed to Portfolio Dogfood (Shelf Sort validation for 2+ weeks)

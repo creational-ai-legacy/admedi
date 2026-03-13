@@ -1,49 +1,58 @@
 """SyncLog model for tracking mediation sync operations.
 
-Records each sync action (diff, apply, rollback) with its timestamp,
-target app, diff summary, and result.
+Records each sync action per app per sync operation with its timestamp,
+target app, group change counts, status, and optional error detail.
+One entry is created per app per sync.
+
+Serialized to JSONL via ``model_dump_json()`` by
+``LocalFileStorageAdapter.save_sync_log()``.
 
 Example:
     >>> from datetime import datetime, timezone
     >>> from admedi.models.sync_log import SyncLog
+    >>> from admedi.models.apply_result import ApplyStatus
     >>> log = SyncLog(
-    ...     timestamp=datetime.now(tz=timezone.utc),
     ...     app_key="abc123",
-    ...     action="apply",
-    ...     diff_summary={"groups_added": 2, "groups_removed": 0},
-    ...     result="success",
+    ...     timestamp=datetime.now(tz=timezone.utc),
+    ...     action="sync",
+    ...     groups_created=2,
+    ...     groups_updated=1,
+    ...     status=ApplyStatus.SUCCESS,
     ... )
     >>> log.action
-    'apply'
+    'sync'
+    >>> log.error is None
+    True
 """
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
+
+from admedi.models.apply_result import ApplyStatus
 
 
 class SyncLog(BaseModel):
-    """Record of a mediation sync operation.
+    """Record of a mediation sync operation for a single app.
 
     Attributes:
-        timestamp: When the sync operation occurred.
         app_key: Target application identifier.
-        user: Who initiated the sync, if known.
-        action: Type of sync operation (e.g., "apply", "diff", "rollback").
-        diff_summary: Summary of changes as a nested dict.
-        result: Outcome of the operation (e.g., "success", "partial_failure").
-        error_detail: Error description if the operation failed.
+        timestamp: When the sync operation occurred (timezone-aware UTC).
+        action: Type of sync operation (e.g., ``"sync"``).
+        groups_created: Number of groups created during this sync.
+        groups_updated: Number of groups updated during this sync.
+        status: Outcome status of the sync operation.
+        error: Error description if the operation failed; ``None`` on success.
     """
 
     model_config = ConfigDict(populate_by_name=True)
 
-    timestamp: datetime
     app_key: str
-    user: str | None = Field(default=None)
+    timestamp: datetime
     action: str
-    diff_summary: dict[str, Any]
-    result: str
-    error_detail: str | None = Field(default=None)
+    groups_created: int
+    groups_updated: int
+    status: ApplyStatus
+    error: str | None = None

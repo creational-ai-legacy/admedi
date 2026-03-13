@@ -1,0 +1,107 @@
+# Shelf Sort Tier Template
+# ========================
+#
+# Config-as-code tier template for the Shelf Sort portfolio.
+# Admedi uses this file to define the desired mediation state:
+# tiers, country targeting, and ad format scoping.
+#
+# Workflow:
+#   1. Edit this file to change tier/country assignments
+#   2. Run `admedi audit` to see what differs from live configs
+#   3. Run `admedi sync-tiers --dry-run` to preview changes
+#   4. Run `admedi sync-tiers` to apply changes
+#
+# Schema version 1 supports:
+#   - Per-tier ad_format scoping (each tier declares which formats it applies to)
+#   - Country codes: ISO 3166-1 alpha-2 (e.g., US, GB) or "*" for catch-all
+#   - Exactly one default tier (is_default: true) required
+#
+# Portfolio: 2 variants x 3 platforms = 6 apps
+# Tiers: 4 tiers matching the LevelPlay dashboard configuration
+
+schema_version: 1
+mediator: levelplay
+
+# ---------------------------------------------------------------------------
+# Portfolio Apps
+# ---------------------------------------------------------------------------
+# Each app_key is the LevelPlay application identifier.
+# Use placeholder keys until dogfood; replace with real keys from the
+# LevelPlay dashboard before first sync.
+
+portfolio:
+  # Shelf Sort (original)
+  - app_key: "1f93a90ad"
+    name: "Shelf Sort iOS"
+    platform: iOS
+
+  - app_key: "2a84b91be"
+    name: "Shelf Sort Android"
+    platform: Android
+
+  - app_key: "3c75c82cf"
+    name: "Shelf Sort Amazon"
+    platform: Amazon
+
+  # Shelf Sort Plus (premium variant)
+  - app_key: "4d66d73dg"
+    name: "Shelf Sort Plus iOS"
+    platform: iOS
+
+  - app_key: "5e57e64eh"
+    name: "Shelf Sort Plus Android"
+    platform: Android
+
+  - app_key: "6f48f55fi"
+    name: "Shelf Sort Plus Amazon"
+    platform: Amazon
+
+# ---------------------------------------------------------------------------
+# Tier Definitions
+# ---------------------------------------------------------------------------
+# Each tier specifies:
+#   - name: Human-readable label (matches LevelPlay group names)
+#   - countries: ISO 3166-1 alpha-2 codes targeted by this tier
+#   - position: Priority order (1 = highest priority, checked first)
+#   - ad_formats: Which ad formats this tier applies to
+#   - is_default: true for the catch-all tier (exactly one required)
+#
+# Tiers are scoped per ad_format. A tier with ad_formats [interstitial, rewarded]
+# creates separate groups for each format in LevelPlay.
+#
+# Position ordering:
+#   1 = Tier 1 (US only, highest eCPM)
+#   2 = Tier 2 (high-value international markets)
+#   3 = Tier 3 (mid-value European markets)
+#   4 = All Countries (catch-all default)
+
+tiers:
+  # Tier 1: US-only premium tier
+  # Highest eCPM market, gets its own waterfall configuration
+  - name: "Tier 1"
+    countries: ["US"]
+    position: 1
+    ad_formats: [interstitial, rewarded]
+
+  # Tier 2: High-value international markets
+  # Strong eCPM countries that justify dedicated waterfall tuning
+  - name: "Tier 2"
+    countries: ["AU", "CA", "DE", "GB", "JP", "NZ", "KR", "TW"]
+    position: 2
+    ad_formats: [interstitial, rewarded]
+
+  # Tier 3: Mid-value European markets
+  # Moderate eCPM, separate from the catch-all for finer control
+  - name: "Tier 3"
+    countries: ["FR", "NL"]
+    position: 3
+    ad_formats: [interstitial, rewarded]
+
+  # All Countries: Default catch-all tier
+  # Covers every country not assigned to a higher tier.
+  # Includes all 4 ad formats (banner and native only appear here).
+  - name: "All Countries"
+    countries: ["*"]
+    position: 4
+    is_default: true
+    ad_formats: [banner, interstitial, rewarded, native]

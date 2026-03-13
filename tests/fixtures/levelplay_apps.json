@@ -1,0 +1,69 @@
+[
+  {
+    "appKey": "1a2b3c4d5",
+    "appName": "Shelf Sort",
+    "platform": "Android",
+    "bundleId": "com.mochibits.shelfsort",
+    "appStatus": "active",
+    "coppa": false,
+    "taxonomy": "games_puzzle",
+    "creationDate": "2025-06-15",
+    "adUnits": {
+      "banner": {
+        "active": true,
+        "placementIds": [101, 102]
+      },
+      "interstitial": {
+        "active": true,
+        "placementIds": [201]
+      },
+      "rewardedVideo": {
+        "active": true,
+        "placementIds": [301, 302]
+      }
+    },
+    "ccpa": "do_not_sell",
+    "networkReportingApi": true,
+    "icon": "https://cdn.example.com/icons/shelfsort.png"
+  },
+  {
+    "appKey": "5e6f7g8h9",
+    "appName": "Shelf Sort iOS",
+    "platform": "iOS",
+    "bundleId": "com.mochibits.shelfsort",
+    "appStatus": "active",
+    "coppa": false,
+    "taxonomy": "games_puzzle",
+    "creationDate": "2025-07-01",
+    "adUnits": {
+      "banner": {
+        "active": true,
+        "placementIds": [401]
+      },
+      "interstitial": {
+        "active": false,
+        "placementIds": []
+      },
+      "rewardedVideo": {
+        "active": true,
+        "placementIds": [501]
+      }
+    },
+    "networkReportingApi": false,
+    "icon": "https://cdn.example.com/icons/shelfsort-ios.png"
+  },
+  {
+    "appKey": "9i0j1k2l3",
+    "appName": "Shelf Sort Amazon",
+    "platform": "Amazon",
+    "bundleId": "com.mochibits.shelfsort.amazon",
+    "appStatus": "active",
+    "coppa": true,
+    "adUnits": {
+      "banner": {
+        "active": true,
+        "placementIds": [601]
+      }
+    }
+  }
+]

@@ -1,0 +1,55 @@
+[
+  {
+    "id": 201,
+    "name": "ironSource Default",
+    "networkName": "ironSource",
+    "isBidder": false,
+    "groupRate": 10.5,
+    "countriesRate": [
+      {"countryCode": "US", "rate": 15.0},
+      {"countryCode": "GB", "rate": 12.0}
+    ],
+    "adUnit": "interstitial",
+    "isLive": true,
+    "isOptimized": false
+  },
+  {
+    "id": 202,
+    "name": "AdMob Bidding",
+    "networkName": "AdMob",
+    "isBidder": true,
+    "groupRate": 8.0,
+    "countriesRate": null,
+    "adUnit": "banner",
+    "isLive": true,
+    "isOptimized": true
+  },
+  {
+    "providerName": "Meta",
+    "instanceName": "Meta Audience Network",
+    "instanceId": 203,
+    "isBidder": true,
+    "globalPricing": 12.0,
+    "countriesPricing": [
+      {"country": "US", "eCPM": 20.0},
+      {"country": "CA", "eCPM": 16.5},
+      {"country": "JP", "eCPM": 14.0}
+    ],
+    "adUnit": "rewardedVideo",
+    "isLive": "active",
+    "isOptimized": false
+  },
+  {
+    "providerName": "Liftoff",
+    "instanceName": "Liftoff Monetize",
+    "instanceId": 204,
+    "isBidder": false,
+    "globalPricing": 6.5,
+    "countriesPricing": [
+      {"country": "DE", "eCPM": 9.0}
+    ],
+    "adUnit": "interstitial",
+    "isLive": "inactive",
+    "isOptimized": false
+  }
+]

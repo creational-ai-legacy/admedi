@@ -27,7 +27,6 @@ from admedi.models.group import Group
 from admedi.models.instance import Instance
 from admedi.models.placement import Placement
 from admedi.models.sync_log import SyncLog
-from admedi.models.tier_template import TierTemplate
 
 
 # ---------------------------------------------------------------------------
@@ -169,13 +168,7 @@ class ReadOnlyMediationAdapter(MediationAdapter):
 
 
 class FullStorageAdapter(StorageAdapter):
-    """Concrete storage adapter implementing all 5 methods."""
-
-    async def save_config(self, config: TierTemplate) -> None:
-        pass
-
-    async def load_config(self, config_id: str) -> TierTemplate | None:
-        return None
+    """Concrete storage adapter implementing all 3 methods."""
 
     async def save_sync_log(self, log: SyncLog) -> None:
         pass
@@ -394,10 +387,10 @@ class TestStorageAdapterAbstract:
         """An incomplete storage subclass should raise TypeError."""
 
         class PartialStorage(StorageAdapter):
-            async def save_config(self, config: TierTemplate) -> None:
+            async def save_sync_log(self, log: SyncLog) -> None:
                 pass
 
-            # Missing the other 4 methods
+            # Missing the other 2 methods
 
         with pytest.raises(TypeError):
             PartialStorage()  # type: ignore[abstract]
@@ -453,11 +446,13 @@ class TestStep8ImportPaths:
         assert MediationAdapter is not None
         assert StorageAdapter is not None
 
-    def test_adapters_all_has_three_entries(self) -> None:
-        """admedi.adapters.__all__ should have 3 entries."""
+    def test_adapters_all_has_five_entries(self) -> None:
+        """admedi.adapters.__all__ should have 5 entries (3 base + 2 LevelPlay)."""
         import admedi.adapters
 
-        assert len(admedi.adapters.__all__) == 3
+        assert len(admedi.adapters.__all__) == 5
         assert "AdapterCapability" in admedi.adapters.__all__
+        assert "LevelPlayAdapter" in admedi.adapters.__all__
         assert "MediationAdapter" in admedi.adapters.__all__
         assert "StorageAdapter" in admedi.adapters.__all__
+        assert "load_credential_from_env" in admedi.adapters.__all__

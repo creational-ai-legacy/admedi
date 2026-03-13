@@ -61,15 +61,19 @@ class TestModelsPackageExports:
         assert Platform.__name__ == "Platform"
         assert TierType.__name__ == "TierType"
 
-    def test_models_all_has_19_entries(self) -> None:
-        """admedi.models.__all__ contains exactly 19 names."""
+    def test_models_all_has_32_entries(self) -> None:
+        """admedi.models.__all__ contains exactly 32 names."""
         import admedi.models
 
         expected = {
-            "AdFormat", "App", "Capping", "ConfigSnapshot", "CountryRate",
-            "Credential", "Group", "Instance", "Mediator", "Networks",
-            "Pacing", "Placement", "Platform", "SyncLog", "TierDefinition",
-            "TierTemplate", "TierType", "WaterfallConfig", "WaterfallTier",
+            "AdFormat", "App", "AppApplyResult", "AppDiffReport", "AppStatus",
+            "ApplyResult", "ApplyStatus", "Capping", "ConfigSnapshot",
+            "CountryRate", "Credential", "DiffAction", "DiffReport",
+            "FieldChange", "Group", "GroupDiff", "Instance", "Mediator",
+            "Networks", "Pacing", "Placement", "Platform", "PortfolioApp",
+            "PortfolioConfig", "PortfolioStatus", "PortfolioTier", "SyncLog",
+            "TierDefinition", "TierTemplate", "TierType", "WaterfallConfig",
+            "WaterfallTier",
         }
         actual = set(admedi.models.__all__)
         assert actual == expected, f"Missing: {expected - actual}, Extra: {actual - expected}"
@@ -90,11 +94,17 @@ class TestAdaptersPackageExports:
         assert MediationAdapter.__name__ == "MediationAdapter"
         assert StorageAdapter.__name__ == "StorageAdapter"
 
-    def test_adapters_all_has_3_entries(self) -> None:
-        """admedi.adapters.__all__ contains exactly 3 names."""
+    def test_adapters_all_has_5_entries(self) -> None:
+        """admedi.adapters.__all__ contains exactly 5 names (3 base + 2 LevelPlay)."""
         import admedi.adapters
 
-        expected = {"AdapterCapability", "MediationAdapter", "StorageAdapter"}
+        expected = {
+            "AdapterCapability",
+            "LevelPlayAdapter",
+            "MediationAdapter",
+            "StorageAdapter",
+            "load_credential_from_env",
+        }
         actual = set(admedi.adapters.__all__)
         assert actual == expected
 

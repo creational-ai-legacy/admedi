@@ -37,17 +37,18 @@ class App(BaseModel):
         app_key: Unique application identifier from LevelPlay.
         app_name: Display name of the application.
         platform: Target mobile platform (Android, iOS, Amazon).
-        bundle_id: Platform-specific bundle identifier (e.g., com.example.app).
+        bundle_id: Platform-specific bundle identifier (nullable for archived apps).
         app_status: Application status string, defaults to "active".
         mediator: Admedi-internal mediator identifier, defaults to LEVELPLAY.
-        coppa: Whether the app is COPPA-compliant, defaults to False.
+        coppa: COPPA compliance flag (API returns int 0/1, also accepts bool).
         taxonomy: App taxonomy category, if set.
         creation_date: Date string when the app was created (e.g., "2025-06-15").
         ad_units: Nested dict of ad unit configuration from the API.
-        ccpa: CCPA compliance string, if set.
-        network_reporting_api: Whether network reporting API is enabled.
+        ccpa: CCPA compliance flag (API returns int 0/1).
+        network_reporting_api: Network reporting API status (dict of network->status).
         bundle_ref_id: Bundle reference identifier, if set.
         icon: App icon URL, if set.
+        track_id: Platform store track ID, if set.
     """
 
     model_config = ConfigDict(populate_by_name=True)
@@ -55,14 +56,15 @@ class App(BaseModel):
     app_key: str = Field(alias="appKey")
     app_name: str = Field(alias="appName")
     platform: Platform
-    bundle_id: str = Field(alias="bundleId")
+    bundle_id: str | None = Field(default=None, alias="bundleId")
     app_status: str = Field(default="active", alias="appStatus")
     mediator: Mediator = Field(default=Mediator.LEVELPLAY)
-    coppa: bool = Field(default=False)
+    coppa: bool | int = Field(default=False)
     taxonomy: str | None = Field(default=None)
     creation_date: str | None = Field(default=None, alias="creationDate")
     ad_units: dict[str, Any] | None = Field(default=None, alias="adUnits")
-    ccpa: str | None = Field(default=None)
-    network_reporting_api: bool | None = Field(default=None, alias="networkReportingApi")
-    bundle_ref_id: str | None = Field(default=None, alias="bundleRefId")
+    ccpa: int | str | None = Field(default=None)
+    network_reporting_api: dict[str, Any] | list[Any] | bool | None = Field(default=None, alias="networkReportingApi")
+    bundle_ref_id: str | int | None = Field(default=None, alias="bundleRefId")
     icon: str | None = Field(default=None)
+    track_id: str | int | None = Field(default=None, alias="trackId")

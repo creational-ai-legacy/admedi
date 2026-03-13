@@ -27,10 +27,11 @@ MEDIATION_MGMT_V2_URL: str = f"{LEVELPLAY_BASE_URL}/partners/publisher/mediation
 """Legacy Mediation Management v2 endpoint."""
 
 INSTANCES_V1_URL: str = f"{LEVELPLAY_BASE_URL}/partners/publisher/instances/v1"
-"""Standalone Instances API v1 endpoint (primary for admedi)."""
+"""Standalone Instances API v1 endpoint (returns 410 Gone as of 2026-03)."""
 
 INSTANCES_V3_URL: str = f"{LEVELPLAY_BASE_URL}/partners/publisher/instances/v3"
-"""Standalone Instances API v3 endpoint (reference only -- ironSource lib uses v3; v1 is primary)."""
+"""Standalone Instances API v3 endpoint (returns 410 Gone as of 2026-03).
+Instance data is now only available embedded in Groups v4 responses."""
 
 PLACEMENTS_URL: str = f"{LEVELPLAY_BASE_URL}/partners/publisher/placements/v1"
 """Placements API v1 endpoint."""

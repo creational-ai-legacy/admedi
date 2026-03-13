@@ -39,3 +39,9 @@ class Credential(BaseModel):
     secret_key: str
     refresh_token: str
     token_expiry: datetime | None = Field(default=None)
+    """When the current access token expires, if known.
+
+    Note: The LevelPlay adapter tracks token expiry internally
+    (``_token_expiry``) rather than on the Credential. This field
+    exists for optional serialization by storage adapters.
+    """

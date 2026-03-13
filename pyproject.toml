@@ -16,7 +16,11 @@ dependencies = [
     "pyjwt>=2.8",
     "ruamel.yaml>=0.18",
     "python-dotenv>=1.0",
+    "rich>=13.0",
 ]
+
+[project.scripts]
+admedi = "admedi.cli.main:app"
 
 [dependency-groups]
 dev = [
@@ -42,3 +46,7 @@ init_typed = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+addopts = "-m 'not integration'"
+markers = [
+    "integration: marks tests as integration tests (deselected by default)",
+]

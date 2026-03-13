@@ -40,8 +40,8 @@ class TestAdFormat:
         assert AdFormat.REWARDED_VIDEO.value == "rewardedVideo"
 
     def test_member_count(self) -> None:
-        """AdFormat has exactly 3 members."""
-        assert len(AdFormat) == 3
+        """AdFormat has exactly 5 members."""
+        assert len(AdFormat) == 5
 
     def test_is_str_subclass(self) -> None:
         """AdFormat members are str instances for JSON serialization."""
