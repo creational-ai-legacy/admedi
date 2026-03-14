@@ -17,11 +17,15 @@ Examples:
 
 from __future__ import annotations
 
+from collections import defaultdict
+
+from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from admedi.models.app import App
 from admedi.models.apply_result import (
     ApplyResult,
     ApplyStatus,
@@ -29,6 +33,7 @@ from admedi.models.apply_result import (
     PortfolioStatus,
 )
 from admedi.models.diff import DiffAction, DiffReport
+from admedi.models.group import Group
 
 
 def _get_console(console: Console | None) -> Console:
@@ -325,3 +330,109 @@ def display_snapshot_info(
             border_style="green",
         )
     )
+
+
+def display_show(
+    app: App,
+    groups: list[Group],
+    snapshot_path: str | None = None,
+    console: Console | None = None,
+) -> None:
+    """Render a Rich view of an app's live mediation settings.
+
+    Shows a header panel with app metadata, then one table per ad format
+    with group tiers, country targeting, and waterfall details (bidding
+    networks and manual instances with rates).
+
+    Args:
+        app: The App model with name, platform, and key.
+        groups: List of Group models from the live API.
+        snapshot_path: If provided, shown as a footer line.
+        console: Optional console for output capture in tests.
+    """
+    con = _get_console(console)
+
+    # Header panel
+    con.print()
+    con.print(Panel(
+        f"[bold]{app.app_name}[/bold]\n"
+        f"[dim]Platform:[/dim] {app.platform.value}  "
+        f"[dim]Key:[/dim] {app.app_key}  "
+        f"[dim]Groups:[/dim] {len(groups)}",
+        title="[bold cyan]admedi[/bold cyan]",
+        border_style="cyan",
+    ))
+
+    if not groups:
+        con.print("[dim]No mediation groups configured.[/dim]")
+        if snapshot_path:
+            con.print(f"\n[dim]Snapshot saved to:[/dim] [cyan]{snapshot_path}[/cyan]")
+        con.print()
+        return
+
+    # Organize by ad format, sorted by position within each
+    by_format: dict[str, list[Group]] = defaultdict(list)
+    for g in groups:
+        by_format[g.ad_format.value].append(g)
+    for fmt in by_format:
+        by_format[fmt].sort(key=lambda g: g.position)
+
+    # One table per format
+    for fmt in sorted(by_format.keys()):
+        fmt_groups = by_format[fmt]
+
+        table = Table(
+            title=fmt,
+            box=box.ROUNDED,
+            title_style="bold",
+            border_style="dim",
+            show_lines=True,
+            padding=(0, 1),
+        )
+        table.add_column("#", style="dim", justify="right", width=3)
+        table.add_column("Group", style="cyan", no_wrap=True)
+        table.add_column("Countries")
+        table.add_column("Waterfall")
+
+        for g in fmt_groups:
+            countries = (
+                Text("* (all)", style="dim")
+                if g.countries == ["*"]
+                else Text(", ".join(g.countries))
+            )
+            waterfall = _format_waterfall(g)
+            table.add_row(str(g.position), g.group_name, countries, waterfall)
+
+        con.print(table)
+
+    if snapshot_path:
+        con.print(f"\n[dim]Snapshot saved to:[/dim] [cyan]{snapshot_path}[/cyan]")
+    con.print()
+
+
+def _format_waterfall(group: Group) -> Text:
+    """Format a group's waterfall instances as styled Text."""
+    if not group.instances:
+        return Text("(none)", style="dim")
+
+    bidders = [i for i in group.instances if i.is_bidder]
+    manuals = [i for i in group.instances if not i.is_bidder]
+
+    wf = Text()
+
+    if bidders:
+        networks = ", ".join(sorted({i.network_name for i in bidders}))
+        wf.append("Bidding: ", style="bold green")
+        wf.append(networks)
+
+    if manuals:
+        for j, m in enumerate(manuals):
+            if bidders or j > 0:
+                wf.append("\n")
+            rate_str = f" @ ${m.group_rate:.2f}" if m.group_rate else ""
+            wf.append("Manual:  ", style="bold yellow")
+            wf.append(f"{m.network_name}{rate_str}")
+            if m.instance_name and m.instance_name != "Default":
+                wf.append(f" ({m.instance_name})", style="dim")
+
+    return wf

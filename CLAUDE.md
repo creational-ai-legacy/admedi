@@ -2,8 +2,6 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-This workspace uses specialized agents. See `agents.md` for role definitions.
-
 ## Project Overview
 
 Admedi is a config-driven ad mediation management tool by Creational.ai. It replaces manual dashboard clicking with config-as-code: define country tiers in YAML, diff against live mediation configs via platform APIs, and sync across an entire app portfolio. The immediate use case is managing Mochibits' Shelf Sort portfolio (6 apps x 3 platforms = 18 LevelPlay configuration surfaces).
@@ -29,12 +27,6 @@ See `PROJECT_STATE.md` for current status and progress. See `README.md` for how 
 - GitHub org: `creational-ai` (use `git@github-creational:creational-ai/` for remote URLs)
 - Existing open-source base to draw patterns from: `ironSource/mobile-api-lib-python` (abandoned Dec 2022, Apache-2.0)
 - Licensing: Apache-2.0 for open-source core. Commercial `/ee` directory for SaaS features.
-
----
-
-## Agent Roles
-
-Roles are **assigned per session** — do not assume any role unless the user explicitly activates it (e.g., "You are the examiner"). See `agents.md` for full role definitions.
 
 ---
 

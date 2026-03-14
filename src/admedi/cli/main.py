@@ -36,11 +36,13 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from ruamel.yaml import YAML
 
 from admedi.adapters.levelplay import LevelPlayAdapter, load_credential_from_env
 from admedi.cli.display import (
     display_apply_result,
     display_audit_table,
+    display_show,
     display_snapshot_info,
     display_status_table,
     display_sync_preview,
@@ -97,6 +99,81 @@ def _handle_template_error(exc: ConfigValidationError | FileNotFoundError) -> No
     raise typer.Exit(code=2) from exc
 
 
+def _resolve_app_key(value: str) -> str:
+    """Resolve an app alias to an app key via profiles.yaml.
+
+    If profiles.yaml exists and contains a matching alias, return the
+    mapped app key. Otherwise return the value as-is (raw app key).
+    """
+    profiles_path = Path("profiles.yaml")
+    if not profiles_path.exists():
+        return value
+
+    yaml = YAML()
+    data = yaml.load(profiles_path)
+    profiles = data.get("profiles") if data else None
+    if profiles and value in profiles:
+        return str(profiles[value])
+    return value
+
+
+@app.command()
+def show(
+    app_key: Annotated[
+        str,
+        typer.Option("--app", help="App key or profile alias."),
+    ],
+    output: Annotated[
+        str | None,
+        typer.Option("--output", "-o", help="Override snapshot file path."),
+    ] = None,
+) -> None:
+    """Show live mediation settings for an app.
+
+    Fetches the current mediation groups from LevelPlay, displays
+    them as a Rich-formatted view organized by ad format, and saves
+    a YAML snapshot to settings/{app_key}_snapshot.yaml (override with -o).
+
+    The --app flag accepts a profile alias (from profiles.yaml) or a raw app key.
+
+    Exit codes: 0 = success, 2 = error.
+    """
+    cred = _load_credential()
+    resolved_key = _resolve_app_key(app_key)
+
+    async def _show_async() -> None:
+        async with LevelPlayAdapter(cred) as adapter:
+            apps = await adapter.list_apps()
+            groups = await adapter.get_groups(resolved_key)
+
+            # Resolve App model
+            target_app = None
+            for a in apps:
+                if a.app_key == resolved_key:
+                    target_app = a
+                    break
+
+            if target_app is None:
+                typer.echo(f"Error: app key '{resolved_key}' not found.", err=True)
+                raise typer.Exit(code=2)
+
+            # Save modular snapshot (networks.yaml + per-app YAML)
+            from admedi.engine.snapshot import save_modular_snapshot
+
+            # Use alias as filename if available, otherwise app key
+            alias = app_key if app_key != resolved_key else resolved_key
+            app_file = output or f"{alias}.yaml"
+            snapshot_path = save_modular_snapshot(
+                groups, resolved_key, target_app.app_name,
+                app_file=app_file,
+                platform=target_app.platform,
+            )
+
+        display_show(target_app, groups, snapshot_path=snapshot_path)
+
+    asyncio.run(_show_async())
+
+
 @app.command()
 def audit(
     config: Annotated[
@@ -105,7 +182,7 @@ def audit(
     ] = Path("admedi.yaml"),
     app_key: Annotated[
         str | None,
-        typer.Option("--app", help="Filter to a specific app key."),
+        typer.Option("--app", help="Filter to a specific app key or profile alias."),
     ] = None,
     output_format: Annotated[
         OutputFormat,
@@ -120,7 +197,8 @@ def audit(
     Exit codes: 0 = no drift, 1 = drift detected, 2 = error.
     """
     cred = _load_credential()
-    app_keys = [app_key] if app_key else None
+    resolved = _resolve_app_key(app_key) if app_key else None
+    app_keys = [resolved] if resolved else None
 
     async def _audit_async() -> None:
         async with LevelPlayAdapter(cred) as adapter:
@@ -152,7 +230,7 @@ def sync_tiers(
     ] = Path("admedi.yaml"),
     app_key: Annotated[
         str | None,
-        typer.Option("--app", help="Filter to a specific app key."),
+        typer.Option("--app", help="Filter to a specific app key or profile alias."),
     ] = None,
     dry_run: Annotated[
         bool,
@@ -176,7 +254,8 @@ def sync_tiers(
     but not applied (dry-run or user declined), 2 = error.
     """
     cred = _load_credential()
-    app_keys = [app_key] if app_key else None
+    resolved = _resolve_app_key(app_key) if app_key else None
+    app_keys = [resolved] if resolved else None
 
     async def _sync_async() -> None:
         async with LevelPlayAdapter(cred) as adapter:
@@ -243,7 +322,7 @@ def sync_tiers(
 def snapshot(
     app_key: Annotated[
         str | None,
-        typer.Option("--app", help="App key to snapshot."),
+        typer.Option("--app", help="App key or profile alias to snapshot."),
     ] = None,
     output: Annotated[
         str | None,
@@ -279,6 +358,7 @@ def snapshot(
         raise typer.Exit(code=2)
 
     cred = _load_credential()
+    resolved_app_key = _resolve_app_key(app_key) if app_key else None
 
     if all_apps:
         # --all flow: load template and snapshot each app
@@ -325,9 +405,10 @@ def snapshot(
             async with LevelPlayAdapter(cred) as adapter:
                 storage = LocalFileStorageAdapter()
                 engine = ConfigEngine(adapter=adapter, storage=storage)
-                await engine.snapshot(app_key, output_path=output)
+                await engine.snapshot(resolved_app_key, output_path=output)
                 display_snapshot_info(
-                    output or f"{app_key}_snapshot.yaml", app_key
+                    output or f"{resolved_app_key}_snapshot.yaml",
+                    resolved_app_key,
                 )
 
         asyncio.run(_snapshot_async())
