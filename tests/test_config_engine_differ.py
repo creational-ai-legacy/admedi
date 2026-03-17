@@ -134,7 +134,7 @@ class TestPerfectMatch:
         """All interstitial groups match -- all UNCHANGED."""
         template = _shelf_sort_template()
         remote = _matching_remote_groups(AdFormat.INTERSTITIAL)
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         interstitial_diffs = [
             d for d in report.group_diffs if d.ad_format == AdFormat.INTERSTITIAL
@@ -154,7 +154,7 @@ class TestPerfectMatch:
             + [_make_group("All Countries", AdFormat.BANNER, ["*"], 4, group_id=201)]
             + [_make_group("All Countries", AdFormat.NATIVE, ["*"], 4, group_id=301)]
         )
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         for diff in report.group_diffs:
             assert diff.action == DiffAction.UNCHANGED, (
@@ -165,7 +165,7 @@ class TestPerfectMatch:
         """AppDiffReport has correct app_key and app_name."""
         template = _shelf_sort_template()
         remote = _matching_remote_groups(AdFormat.INTERSTITIAL)
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         assert report.app_key == APP_KEY
         assert report.app_name == APP_NAME
@@ -191,7 +191,7 @@ class TestCountryMismatch:
             _make_group("Tier 3", AdFormat.INTERSTITIAL, ["FR", "NL"], 3, group_id=103),
             _make_group("All Countries", AdFormat.INTERSTITIAL, ["*"], 4, group_id=104),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         tier2_diffs = [
             d
@@ -232,7 +232,7 @@ class TestCountryMismatch:
             _make_group("Tier 1", AdFormat.INTERSTITIAL, ["US", "CA"], 1, group_id=1),
             _make_group("All Countries", AdFormat.INTERSTITIAL, ["*"], 2, group_id=2),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         tier1_diff = next(
             d for d in report.group_diffs if d.group_name == "Tier 1"
@@ -261,7 +261,7 @@ class TestMissingGroup:
             ),
             _make_group("All Countries", AdFormat.INTERSTITIAL, ["*"], 4, group_id=104),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         creates = [
             d
@@ -274,7 +274,7 @@ class TestMissingGroup:
     def test_empty_remote_all_creates(self) -> None:
         """Empty remote group list with template tiers produces all CREATE."""
         template = _shelf_sort_template()
-        report = compute_diff(template, [], APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, [], APP_KEY, APP_NAME)
 
         creates = [d for d in report.group_diffs if d.action == DiffAction.CREATE]
         # 4 tiers x 2 formats (interstitial + rewarded) + 1 (banner All Countries) + 1 (native All Countries) = 10
@@ -311,7 +311,7 @@ class TestExtraGroup:
             _make_group("All Countries", AdFormat.INTERSTITIAL, ["*"], 2, group_id=2),
             _make_group("Mystery Group", AdFormat.INTERSTITIAL, ["JP"], 3, group_id=3),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         extras = [d for d in report.group_diffs if d.action == DiffAction.EXTRA]
         assert len(extras) == 1
@@ -345,7 +345,7 @@ class TestExtraGroup:
             _make_group("Native Group", AdFormat.NATIVE, ["US"], 1, group_id=10),
             _make_group("Native All", AdFormat.NATIVE, ["*"], 2, group_id=11),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         native_diffs = [
             d for d in report.group_diffs if d.ad_format == AdFormat.NATIVE
@@ -381,7 +381,7 @@ class TestPositionMismatch:
             _make_group("Tier 1", AdFormat.INTERSTITIAL, ["US"], 3, group_id=1),
             _make_group("All Countries", AdFormat.INTERSTITIAL, ["*"], 2, group_id=2),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         tier1_diff = next(
             d
@@ -415,7 +415,7 @@ class TestSingleGroupPositionSkip:
         remote = [
             _make_group("All Countries", AdFormat.BANNER, ["*"], 1, group_id=50),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         banner_diffs = [
             d for d in report.group_diffs if d.ad_format == AdFormat.BANNER
@@ -447,7 +447,7 @@ class TestSingleGroupPositionSkip:
             _make_group("Tier 1", AdFormat.INTERSTITIAL, ["US"], 3, group_id=1),
             _make_group("All Countries", AdFormat.INTERSTITIAL, ["*"], 2, group_id=2),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         tier1_diff = next(
             d
@@ -484,7 +484,7 @@ class TestAbTestDetection:
                 ab_test="experiment_123",
             ),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         assert report.has_ab_test is True
         assert report.ab_test_warning is not None
@@ -513,7 +513,7 @@ class TestAbTestDetection:
                 ab_test="N/A",
             ),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         assert report.has_ab_test is False
         assert report.ab_test_warning is None
@@ -541,7 +541,7 @@ class TestAbTestDetection:
                 ab_test=None,
             ),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         assert report.has_ab_test is False
         assert report.ab_test_warning is None
@@ -549,7 +549,7 @@ class TestAbTestDetection:
     def test_no_ab_test_when_no_remote_groups(self) -> None:
         """No remote groups means no A/B test."""
         template = _shelf_sort_template()
-        report = compute_diff(template, [], APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, [], APP_KEY, APP_NAME)
 
         assert report.has_ab_test is False
         assert report.ab_test_warning is None
@@ -574,7 +574,7 @@ class TestAllCountries:
         remote = [
             _make_group("All Countries", AdFormat.BANNER, ["*"], 1, group_id=1),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         assert len(report.group_diffs) == 1
         assert report.group_diffs[0].action == DiffAction.UNCHANGED
@@ -597,7 +597,7 @@ class TestAllCountries:
                 "All Countries", AdFormat.BANNER, ["US", "GB", "DE"], 1, group_id=1
             ),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         diff = report.group_diffs[0]
         assert diff.action == DiffAction.UPDATE
@@ -631,7 +631,7 @@ class TestDesiredGroup:
         remote = [
             _make_group("All Countries", AdFormat.INTERSTITIAL, ["*"], 2, group_id=2),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         create_diff = next(
             d for d in report.group_diffs if d.action == DiffAction.CREATE
@@ -667,7 +667,7 @@ class TestDesiredGroup:
             _make_group("Tier 1", AdFormat.INTERSTITIAL, ["US"], 1, group_id=42),
             _make_group("All Countries", AdFormat.INTERSTITIAL, ["*"], 2, group_id=43),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         update_diff = next(
             d for d in report.group_diffs if d.action == DiffAction.UPDATE
@@ -696,7 +696,7 @@ class TestDesiredGroup:
         remote = [
             _make_group("All Countries", AdFormat.BANNER, ["*"], 1, group_id=1),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         assert report.group_diffs[0].action == DiffAction.UNCHANGED
         assert report.group_diffs[0].desired_group is None
@@ -718,7 +718,7 @@ class TestDesiredGroup:
             _make_group("All Countries", AdFormat.INTERSTITIAL, ["*"], 1, group_id=1),
             _make_group("Rogue Group", AdFormat.INTERSTITIAL, ["JP"], 2, group_id=99),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         extra_diff = next(
             d for d in report.group_diffs if d.action == DiffAction.EXTRA
@@ -757,7 +757,7 @@ class TestPositionMatching:
                 "All Countries", AdFormat.INTERSTITIAL, ["*"], 2, group_id=11
             ),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         # "Tier 1" didn't match by name; "US Premium" didn't match by name.
         # They match by position (both position=1).
@@ -801,7 +801,7 @@ class TestDefaultOnlyFormat:
             _make_group("All Countries", AdFormat.INTERSTITIAL, ["*"], 2, group_id=2),
             _make_group("All Countries", AdFormat.BANNER, ["*"], 1, group_id=3),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         banner_diffs = [
             d for d in report.group_diffs if d.ad_format == AdFormat.BANNER
@@ -845,7 +845,7 @@ class TestKnownLimitations:
             _make_group("Tier 1", AdFormat.INTERSTITIAL, ["US"], 1, group_id=1),
             _make_group("All Countries", AdFormat.INTERSTITIAL, ["*"], 3, group_id=2),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         interstitial_diffs = [
             d for d in report.group_diffs if d.ad_format == AdFormat.INTERSTITIAL
@@ -911,7 +911,7 @@ class TestMultiFormatConsistency:
             _make_group("Tier 1", AdFormat.INTERSTITIAL, ["US"], 1, group_id=1),
             _make_group("All Countries", AdFormat.INTERSTITIAL, ["*"], 2, group_id=2),
         ]
-        report = compute_diff(template, remote, APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, remote, APP_KEY, APP_NAME)
 
         interstitial_diffs = [
             d for d in report.group_diffs if d.ad_format == AdFormat.INTERSTITIAL
@@ -946,7 +946,7 @@ class TestMultiFormatConsistency:
                 ),
             ],
         )
-        report = compute_diff(template, [], APP_KEY, APP_NAME)
+        report = compute_diff(template.tiers, [], APP_KEY, APP_NAME)
 
         for diff in report.group_diffs:
             assert diff.desired_group is not None

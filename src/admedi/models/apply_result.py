@@ -12,6 +12,7 @@ Examples:
     >>> from admedi.models.apply_result import ApplyStatus, AppApplyResult, ApplyResult
     >>> result = AppApplyResult(
     ...     app_key="abc123",
+    ...     app_name="Shelf Sort",
     ...     status=ApplyStatus.SUCCESS,
     ...     groups_created=2,
     ...     groups_updated=1,
@@ -60,9 +61,13 @@ class AppApplyResult(BaseModel):
 
     Attributes:
         app_key: The application identifier.
+        app_name: Human-readable display name for the app. Defaults to ``""``
+            for backward compatibility with callers that don't supply it.
         status: Outcome status of the apply operation.
         groups_created: Number of groups successfully created.
         groups_updated: Number of groups successfully updated.
+        groups_deleted: Number of groups successfully deleted. Defaults to ``0``
+            for backward compatibility.
         error: Error description if the operation failed; ``None`` on success.
         warnings: Post-write verification warnings (e.g., mismatches between
             expected and actual state after a write). Defaults to empty list.
@@ -71,9 +76,11 @@ class AppApplyResult(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     app_key: str
+    app_name: str = ""
     status: ApplyStatus
     groups_created: int
     groups_updated: int
+    groups_deleted: int = 0
     error: str | None
     warnings: list[str] = []
 

@@ -90,6 +90,7 @@ class Applier:
         app_results = [
             AppApplyResult(
                 app_key=report.app_key,
+                app_name=report.app_name,
                 status=ApplyStatus.DRY_RUN,
                 groups_created=0,
                 groups_updated=0,
@@ -123,6 +124,7 @@ class Applier:
             )
             return AppApplyResult(
                 app_key=app_report.app_key,
+                app_name=app_report.app_name,
                 status=ApplyStatus.FAILED,
                 groups_created=0,
                 groups_updated=0,
@@ -135,14 +137,14 @@ class Applier:
         """Inner per-app processing logic without error isolation.
 
         Steps:
-            0. Idempotency guard: skip if all diffs are UNCHANGED.
+            0. Idempotency guard: skip if all diffs are UNCHANGED or EXTRA.
             1. A/B test check from diff-time.
             2. Pre-write snapshot with fresh A/B test re-check.
-            3. Execute CREATEs in ascending position order per ad_format.
+            3a. Execute DELETEs first (frees positions).
+            3b. Execute CREATEs in ascending position order per ad_format.
             4. Execute UPDATEs after all CREATEs.
-            5. Skip DELETE and EXTRA actions.
-            6. Post-write verification.
-            7. Save sync log.
+            5. Post-write verification.
+            6. Save sync log.
 
         Args:
             app_report: The per-app diff report to process.
@@ -151,14 +153,16 @@ class Applier:
             AppApplyResult with the outcome for this app.
         """
         app_key = app_report.app_key
+        app_name = app_report.app_name
 
-        # Step 0: Idempotency guard
+        # Step 0: Idempotency guard -- skip if all diffs are UNCHANGED or EXTRA
         if all(
-            diff.action == DiffAction.UNCHANGED
+            diff.action in (DiffAction.UNCHANGED, DiffAction.EXTRA)
             for diff in app_report.group_diffs
         ):
             return AppApplyResult(
                 app_key=app_key,
+                app_name=app_name,
                 status=ApplyStatus.SUCCESS,
                 groups_created=0,
                 groups_updated=0,
@@ -169,6 +173,7 @@ class Applier:
         if app_report.has_ab_test:
             return AppApplyResult(
                 app_key=app_key,
+                app_name=app_name,
                 status=ApplyStatus.SKIPPED,
                 groups_created=0,
                 groups_updated=0,
@@ -194,6 +199,7 @@ class Applier:
             if group.ab_test is not None and group.ab_test != "N/A":
                 return AppApplyResult(
                     app_key=app_key,
+                    app_name=app_name,
                     status=ApplyStatus.SKIPPED,
                     groups_created=0,
                     groups_updated=0,
@@ -202,6 +208,9 @@ class Applier:
                 )
 
         # Partition diffs by action
+        deletes = [
+            d for d in app_report.group_diffs if d.action == DiffAction.DELETE
+        ]
         creates = [
             d for d in app_report.group_diffs if d.action == DiffAction.CREATE
         ]
@@ -209,36 +218,68 @@ class Applier:
             d for d in app_report.group_diffs if d.action == DiffAction.UPDATE
         ]
 
-        # Step 3: Execute CREATEs in ascending position order per ad_format
+        # Step 3a: Execute DELETEs first (frees positions)
+        groups_deleted = await self._execute_deletes(app_key, deletes)
+
+        # Step 3b: Execute CREATEs in ascending position order per ad_format
         groups_created = await self._execute_creates(app_key, creates)
 
         # Step 4: Execute UPDATEs after all CREATEs
         groups_updated = await self._execute_updates(app_key, updates)
 
-        # Step 5: DELETE and EXTRA are NOT processed (implicit skip)
+        # Step 5: Post-write verification
+        warnings = await self._verify_writes(
+            app_key, creates, updates, deletes
+        )
 
-        # Step 6: Post-write verification
-        warnings = await self._verify_writes(app_key, creates, updates)
-
-        # Step 7: Save sync log
+        # Step 6: Save sync log
         sync_log = SyncLog(
             app_key=app_key,
             timestamp=datetime.now(tz=timezone.utc),
             action="sync",
             groups_created=groups_created,
             groups_updated=groups_updated,
+            groups_deleted=groups_deleted,
             status=ApplyStatus.SUCCESS,
         )
         await self._storage.save_sync_log(sync_log)
 
         return AppApplyResult(
             app_key=app_key,
+            app_name=app_name,
             status=ApplyStatus.SUCCESS,
             groups_created=groups_created,
             groups_updated=groups_updated,
+            groups_deleted=groups_deleted,
             error=None,
             warnings=warnings,
         )
+
+    async def _execute_deletes(
+        self, app_key: str, deletes: list[GroupDiff]
+    ) -> int:
+        """Execute DELETE operations before creates and updates.
+
+        Deleting groups first frees positions so subsequent creates
+        land at the correct slots.
+
+        Args:
+            app_key: The app to delete groups from.
+            deletes: List of GroupDiff with action=DELETE.
+
+        Returns:
+            Number of groups successfully deleted.
+        """
+        if not deletes:
+            return 0
+
+        count = 0
+        for diff in deletes:
+            if diff.group_id is not None:
+                await self._adapter.delete_group(app_key, diff.group_id)
+                count += 1
+
+        return count
 
     async def _execute_creates(
         self, app_key: str, creates: list[GroupDiff]
@@ -306,12 +347,14 @@ class Applier:
         app_key: str,
         creates: list[GroupDiff],
         updates: list[GroupDiff],
+        deletes: list[GroupDiff] | None = None,
     ) -> list[str]:
         """Post-write verification: check that writes took effect.
 
         Calls ``adapter.get_groups()`` and verifies:
         - CREATE groups exist (match by group_name AND ad_format)
         - UPDATE groups reflect updated countries
+        - DELETE groups do NOT exist (match by group_id)
 
         Mismatches are returned as warnings and logged via
         ``logging.warning()``. Verification failure does NOT change
@@ -321,11 +364,16 @@ class Applier:
             app_key: The app to verify.
             creates: CREATE diffs to verify existence.
             updates: UPDATE diffs to verify country changes.
+            deletes: DELETE diffs to verify absence. Defaults to ``None``
+                for backward compatibility.
 
         Returns:
             List of warning strings for any mismatches found.
         """
-        if not creates and not updates:
+        if deletes is None:
+            deletes = []
+
+        if not creates and not updates and not deletes:
             return []
 
         post_groups = await self._adapter.get_groups(app_key)
@@ -381,5 +429,16 @@ class Applier:
                     )
                     warnings.append(msg)
                     logger.warning(msg)
+
+        # Verify DELETEs are absent
+        post_group_ids = {g.group_id for g in post_groups if g.group_id is not None}
+        for diff in deletes:
+            if diff.group_id is not None and diff.group_id in post_group_ids:
+                msg = (
+                    f"Group '{diff.group_name}' (id={diff.group_id}) "
+                    f"still exists after DELETE"
+                )
+                warnings.append(msg)
+                logger.warning(msg)
 
         return warnings

@@ -1,6 +1,6 @@
 """Pure-function Differ for config-as-code comparison.
 
-Compares a ``PortfolioConfig`` (desired state from YAML template) against
+Compares a ``list[PortfolioTier]`` (desired state from YAML template) against
 remote ``Group`` models (live LevelPlay state) and produces a structured
 ``AppDiffReport`` describing the actions needed to reconcile them.
 
@@ -23,9 +23,9 @@ repositions should be done in separate syncs.
 
 Examples:
     >>> from admedi.engine.differ import compute_diff
-    >>> from admedi.models.portfolio import PortfolioConfig
+    >>> from admedi.models.portfolio import PortfolioTier
     >>> from admedi.models.group import Group
-    >>> # report = compute_diff(template, remote_groups, "abc123", "My App")
+    >>> # report = compute_diff(tiers, remote_groups, "abc123", "My App")
     >>> # report.group_diffs  # list of GroupDiff entries
 """
 
@@ -41,23 +41,23 @@ from admedi.models.diff import (
 )
 from admedi.models.enums import AdFormat
 from admedi.models.group import Group
-from admedi.models.portfolio import PortfolioConfig, PortfolioTier
+from admedi.models.portfolio import PortfolioTier
 
 
 def compute_diff(
-    template: PortfolioConfig,
+    tiers: list[PortfolioTier],
     remote_groups: list[Group],
     app_key: str,
     app_name: str,
 ) -> AppDiffReport:
-    """Compare a portfolio template against remote groups for one app.
+    """Compare portfolio tiers against remote groups for one app.
 
     Pure function -- no side effects, no API calls. Iterates over the
     **union** of template ad_formats and remote ad_formats to ensure
     remote groups in uncovered formats are surfaced as ``EXTRA``.
 
     Args:
-        template: The desired portfolio configuration from YAML.
+        tiers: The desired portfolio tiers from the template.
         remote_groups: Live groups fetched from the LevelPlay API.
         app_key: The app's unique key.
         app_name: Display name of the app.
@@ -66,7 +66,7 @@ def compute_diff(
         An ``AppDiffReport`` with per-group diffs and A/B test detection.
     """
     # Build format -> tiers mapping from template
-    template_by_format = _build_template_format_map(template)
+    template_by_format = _build_template_format_map(tiers)
 
     # Build format -> groups mapping from remote
     remote_by_format = _build_remote_format_map(remote_groups)
@@ -105,11 +105,11 @@ def compute_diff(
 
 
 def _build_template_format_map(
-    template: PortfolioConfig,
+    tiers: list[PortfolioTier],
 ) -> dict[AdFormat, list[PortfolioTier]]:
     """Build a mapping of ad format to template tiers that include it."""
     result: dict[AdFormat, list[PortfolioTier]] = defaultdict(list)
-    for tier in template.tiers:
+    for tier in tiers:
         for fmt in tier.ad_formats:
             result[fmt].append(tier)
     return dict(result)

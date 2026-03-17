@@ -7,12 +7,10 @@ When ``None``, a default ``Console()`` is created. For tests, inject a
 Examples:
     >>> from io import StringIO
     >>> from rich.console import Console
-    >>> from admedi.cli.display import display_snapshot_info
+    >>> from admedi.cli.display import display_show
     >>> buf = StringIO()
     >>> console = Console(file=buf, highlight=False)
-    >>> display_snapshot_info("/tmp/snapshot.yaml", "Shelf Sort", console=console)
-    >>> "Shelf Sort" in buf.getvalue()
-    True
+    >>> # display_show(app, groups, snapshot_path="...", console=console)
 """
 
 from __future__ import annotations
@@ -125,8 +123,9 @@ def display_sync_preview(
 ) -> None:
     """Render sync preview as a rich table.
 
-    Columns: App, Group, Change. CREATE/UPDATE actions are shown prominently.
-    EXTRA groups are shown with dimmed styling for visual distinction.
+    Columns: App, Group, Change. CREATE/UPDATE/DELETE actions are shown
+    prominently. EXTRA groups are shown with dimmed styling for visual
+    distinction.
 
     Args:
         diff_report: The diff report to display as a sync preview.
@@ -168,7 +167,8 @@ def display_sync_preview(
                     change_text = Text("EXTRA (no action)", style="dim")
                     group_text = Text(group_diff.group_name, style="dim")
                 case DiffAction.DELETE:
-                    change_text = Text("DELETE (reserved)", style="dim red")
+                    has_any_actionable = True
+                    change_text = Text("DELETE", style="bold red")
                     group_text = Text(group_diff.group_name)
                 case _:
                     continue
@@ -183,11 +183,16 @@ def display_sync_preview(
     if not has_any_actionable:
         con.print("\n[green]No changes to apply.[/green]")
     else:
-        total = diff_report.total_creates + diff_report.total_updates
+        total = (
+            diff_report.total_creates
+            + diff_report.total_updates
+            + diff_report.total_deletes
+        )
         con.print(
             f"\n[bold]{total} change(s)[/bold] will be applied "
             f"({diff_report.total_creates} create, "
-            f"{diff_report.total_updates} update)"
+            f"{diff_report.total_updates} update, "
+            f"{diff_report.total_deletes} delete)"
         )
 
 
@@ -217,6 +222,7 @@ def display_apply_result(
     table.add_column("Status", no_wrap=True)
     table.add_column("Created", justify="right")
     table.add_column("Updated", justify="right")
+    table.add_column("Deleted", justify="right")
 
     all_warnings: list[tuple[str, str]] = []
 
@@ -224,14 +230,15 @@ def display_apply_result(
         status_text = _format_apply_status(app_result)
 
         table.add_row(
-            app_result.app_key,
+            app_result.app_name or app_result.app_key,
             status_text,
             str(app_result.groups_created),
             str(app_result.groups_updated),
+            str(app_result.groups_deleted),
         )
 
         for warning in app_result.warnings:
-            all_warnings.append((app_result.app_key, warning))
+            all_warnings.append((app_result.app_name or app_result.app_key, warning))
 
     con.print(table)
 
@@ -246,8 +253,8 @@ def display_apply_result(
     # Display warnings if any
     if all_warnings:
         con.print("\n[bold yellow]Warnings:[/bold yellow]")
-        for app_key, warning in all_warnings:
-            con.print(f"  [{app_key}] {warning}")
+        for app_label, warning in all_warnings:
+            con.print(f"  [{app_label}] {warning}")
 
 
 def _format_apply_status(app_result: AppApplyResult) -> Text:
@@ -309,33 +316,11 @@ def display_status_table(
     con.print(table)
 
 
-def display_snapshot_info(
-    path: str,
-    app_name: str,
-    console: Console | None = None,
-) -> None:
-    """Display confirmation message for snapshot export.
-
-    Args:
-        path: File path where the snapshot was saved.
-        app_name: Display name of the app that was snapshotted.
-        console: Optional console for output capture in tests.
-    """
-    con = _get_console(console)
-    con.print(
-        Panel(
-            f"Snapshot saved for [bold]{app_name}[/bold]\n"
-            f"Path: [cyan]{path}[/cyan]",
-            title="Snapshot Export",
-            border_style="green",
-        )
-    )
-
-
 def display_show(
     app: App,
     groups: list[Group],
     snapshot_path: str | None = None,
+    settings_path: str | None = None,
     console: Console | None = None,
 ) -> None:
     """Render a Rich view of an app's live mediation settings.
@@ -347,7 +332,8 @@ def display_show(
     Args:
         app: The App model with name, platform, and key.
         groups: List of Group models from the live API.
-        snapshot_path: If provided, shown as a footer line.
+        snapshot_path: If provided, shown as a footer line for the raw snapshot.
+        settings_path: If provided, shown as a footer line for the modular settings.
         console: Optional console for output capture in tests.
     """
     con = _get_console(console)
@@ -367,6 +353,8 @@ def display_show(
         con.print("[dim]No mediation groups configured.[/dim]")
         if snapshot_path:
             con.print(f"\n[dim]Snapshot saved to:[/dim] [cyan]{snapshot_path}[/cyan]")
+        if settings_path:
+            con.print(f"[dim]Settings saved to:[/dim] [cyan]{settings_path}[/cyan]")
         con.print()
         return
 
@@ -407,7 +395,47 @@ def display_show(
 
     if snapshot_path:
         con.print(f"\n[dim]Snapshot saved to:[/dim] [cyan]{snapshot_path}[/cyan]")
+    if settings_path:
+        con.print(f"[dim]Settings saved to:[/dim] [cyan]{settings_path}[/cyan]")
     con.print()
+
+
+def display_tier_warnings(
+    warnings: list[str],
+    console: Console | None = None,
+) -> None:
+    """Render per-format country variance warnings as a Rich panel.
+
+    When ``_extract_tiers()`` detects that the same tier name has different
+    country lists across ad formats, it emits human-readable warning strings.
+    This function displays them in a yellow-bordered panel after the show
+    command output.
+
+    If *warnings* is empty, nothing is printed.
+
+    Args:
+        warnings: List of warning strings from ``_extract_tiers()``.
+        console: Optional console for output capture in tests.
+
+    Example::
+
+        >>> from io import StringIO
+        >>> from rich.console import Console
+        >>> from admedi.cli.display import display_tier_warnings
+        >>> buf = StringIO()
+        >>> console = Console(file=buf, highlight=False)
+        >>> display_tier_warnings(["Tier 2: countries differ..."], console=console)
+    """
+    if not warnings:
+        return
+
+    con = _get_console(console)
+    warning_lines = "\n".join(f"[yellow]  {w}[/yellow]" for w in warnings)
+    con.print(Panel(
+        warning_lines,
+        title="[bold yellow]Tier Warnings[/bold yellow]",
+        border_style="yellow",
+    ))
 
 
 def _format_waterfall(group: Group) -> Text:

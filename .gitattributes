@@ -2,3 +2,5 @@
 .env filter=git-crypt diff=git-crypt
 docs/** filter=git-crypt diff=git-crypt
 docs/**/** filter=git-crypt diff=git-crypt
+settings/** filter=git-crypt diff=git-crypt
+snapshots/** filter=git-crypt diff=git-crypt

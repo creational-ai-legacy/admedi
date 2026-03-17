@@ -43,6 +43,8 @@ class SyncLog(BaseModel):
         action: Type of sync operation (e.g., ``"sync"``).
         groups_created: Number of groups created during this sync.
         groups_updated: Number of groups updated during this sync.
+        groups_deleted: Number of groups deleted during this sync. Defaults to
+            ``0`` for backward compatibility.
         status: Outcome status of the sync operation.
         error: Error description if the operation failed; ``None`` on success.
     """
@@ -54,5 +56,6 @@ class SyncLog(BaseModel):
     action: str
     groups_created: int
     groups_updated: int
+    groups_deleted: int = 0
     status: ApplyStatus
     error: str | None = None

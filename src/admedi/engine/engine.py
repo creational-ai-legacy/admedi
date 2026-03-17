@@ -1,12 +1,11 @@
 """ConfigEngine orchestrator for config-as-code mediation management.
 
-Ties together the Loader, Differ, Applier, and Snapshot Generator into a
-cohesive async API that the CLI commands delegate to. Each public method
-corresponds to a CLI command:
+Ties together the Loader, Differ, and Applier into a cohesive async API
+that the CLI commands delegate to. Each public method corresponds to a
+CLI command:
 
 - ``audit()``   -> ``admedi audit``
 - ``sync()``    -> ``admedi sync-tiers``
-- ``snapshot()`` -> ``admedi snapshot``
 - ``status()``  -> ``admedi status``
 
 Group data caching strategy: within a single ``audit()`` or ``sync()``
@@ -32,7 +31,6 @@ from admedi.adapters.storage import StorageAdapter
 from admedi.engine.applier import Applier
 from admedi.engine.differ import compute_diff
 from admedi.engine.loader import load_template
-from admedi.engine.snapshot import generate_snapshot
 from admedi.models.apply_result import AppStatus, ApplyResult, PortfolioStatus
 from admedi.models.diff import DiffReport
 from admedi.models.group import Group
@@ -42,9 +40,9 @@ from admedi.models.portfolio import PortfolioConfig
 class ConfigEngine:
     """Orchestrates config-as-code mediation management operations.
 
-    Provides four async methods corresponding to CLI commands: audit,
-    sync, snapshot, and status. Each method manages the full lifecycle
-    of its operation: loading templates, fetching remote state, computing
+    Provides three async methods corresponding to CLI commands: audit,
+    sync, and status. Each method manages the full lifecycle of its
+    operation: loading templates, fetching remote state, computing
     diffs, and applying changes.
 
     Attributes:
@@ -102,7 +100,7 @@ class ConfigEngine:
         # Compute diff per app using cached group data
         app_reports = [
             compute_diff(
-                template,
+                template.tiers,
                 groups_by_app[app.app_key],
                 app.app_key,
                 app.name,
@@ -147,47 +145,6 @@ class ConfigEngine:
             diff_report, dry_run=dry_run
         )
         return diff_report, apply_result
-
-    async def snapshot(
-        self,
-        app_key: str,
-        output_path: str | Path | None = None,
-    ) -> str:
-        """Generate a YAML snapshot of an app's current mediation groups.
-
-        Fetches groups from the adapter, resolves the app name via
-        ``adapter.list_apps()``, and generates a structured YAML
-        snapshot organized by ad format.
-
-        Args:
-            app_key: The application key to snapshot.
-            output_path: Optional file path to write the snapshot to.
-                If ``None``, the YAML string is returned without writing.
-
-        Returns:
-            The generated YAML snapshot as a string.
-        """
-        # Fetch groups and app list concurrently
-        groups, all_apps = await asyncio.gather(
-            self._adapter.get_groups(app_key),
-            self._adapter.list_apps(),
-        )
-
-        # Resolve app name from the apps list
-        app_name = app_key  # fallback
-        for app in all_apps:
-            if app.app_key == app_key:
-                app_name = app.app_name
-                break
-
-        yaml_str = generate_snapshot(groups, app_key, app_name)
-
-        if output_path is not None:
-            path = Path(output_path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(yaml_str, encoding="utf-8")
-
-        return yaml_str
 
     async def status(
         self,

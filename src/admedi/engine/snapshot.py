@@ -2,15 +2,20 @@
 
 Two output modes:
 
-1. **Modular** (``save_modular_snapshot``): Splits output into a shared
-   ``networks.yaml`` (waterfall presets defined once) and a per-app YAML
-   (tiers, countries, preset references). This is the default for ``show``.
+1. **Modular** (``save_modular_snapshot``): Splits output into per-app files:
+   ``{alias}-networks.yaml`` (waterfall presets), ``{alias}-tiers.yaml``
+   (country groupings), and a per-app YAML (tier names, preset references).
+   This is the default for ``show``.
 
-2. **Legacy** (``generate_snapshot``): Single-file YAML with all instance
-   data inlined per group. Kept for ``snapshot`` command compatibility.
+2. **Raw** (``save_raw_snapshot``): Full-fidelity YAML snapshot using
+   Pydantic ``model_dump`` serialization. Preserves all API data (group IDs,
+   instance IDs, rates, country rate overrides, floor prices, etc.) for
+   lossless round-trip via ``load_snapshot`` / ``model_validate``.
+
+The ``show`` command produces both outputs from a single API fetch.
 
 Examples:
-    >>> from admedi.engine.snapshot import generate_snapshot
+    >>> from admedi.engine.snapshot import save_raw_snapshot
     >>> from admedi.models.group import Group
     >>> groups = [
     ...     Group.model_validate({
@@ -20,14 +25,13 @@ Examples:
     ...         "position": 1,
     ...     })
     ... ]
-    >>> yaml_str = generate_snapshot(groups, "abc123", "My App")
-    >>> "US Tier 1" in yaml_str
-    True
+    >>> path = save_raw_snapshot(groups, "abc123", "My App", "my-app")
+    >>> path
+    'snapshots/my-app.yaml'
 """
 
 from __future__ import annotations
 
-from collections import defaultdict
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
@@ -35,12 +39,14 @@ from typing import Any
 
 from ruamel.yaml import YAML
 
-from admedi.models.enums import Platform
+from pydantic import BaseModel
+
+from admedi.models.enums import AdFormat, Platform
 from admedi.models.group import Group
 
 
 # ---------------------------------------------------------------------------
-# Modular snapshot (networks.yaml + per-app YAML)
+# Modular snapshot (per-app networks + tiers + app YAML)
 # ---------------------------------------------------------------------------
 
 
@@ -51,11 +57,11 @@ def save_modular_snapshot(
     app_file: str,
     settings_dir: str = "settings",
     platform: Platform | None = None,
-) -> str:
-    """Save a modular snapshot: networks.yaml + tiers.yaml + per-app YAML.
+) -> tuple[str, list[str]]:
+    """Save a modular snapshot: per-app networks, tiers, and app YAML.
 
-    Extracts unique waterfall patterns into ``settings/networks.yaml``,
-    unique tier structures into ``settings/tiers.yaml``, then writes a
+    Extracts unique waterfall patterns into ``{alias}-networks.yaml``,
+    unique tier structures into ``{alias}-tiers.yaml``, then writes a
     compact per-app file that references both by name.
 
     Args:
@@ -67,25 +73,30 @@ def save_modular_snapshot(
         platform: Optional platform identifier.
 
     Returns:
-        The path to the saved per-app YAML file.
+        A 2-tuple of ``(path, warnings)`` where *path* is the saved
+        per-app YAML file and *warnings* is a list of human-readable
+        strings describing any per-format country differences found
+        in tiers (empty when all formats agree).
     """
     settings = Path(settings_dir)
     settings.mkdir(parents=True, exist_ok=True)
 
-    # Extract and merge network presets
+    alias_stem = Path(app_file).stem
+
+    # Write per-app network presets (overwrite, no merge)
     network_presets = _extract_network_presets(groups)
-    _merge_yaml_file(
-        settings / "networks.yaml",
+    _write_yaml_file(
+        settings / f"{alias_stem}-networks.yaml",
         network_presets,
         header="# Admedi network presets\n"
         "# Waterfall configurations referenced by app settings\n\n",
     )
     network_lookup = _build_network_lookup(network_presets)
 
-    # Extract and merge tier definitions
-    tier_defs = _extract_tiers(groups)
-    _merge_yaml_file(
-        settings / "tiers.yaml",
+    # Write per-app tier definitions (overwrite, no merge)
+    tier_defs, warnings = _extract_tiers(groups)
+    _write_yaml_file(
+        settings / f"{alias_stem}-tiers.yaml",
         tier_defs,
         header="# Admedi tier definitions\n"
         "# Country groupings referenced by app settings\n\n",
@@ -99,7 +110,7 @@ def save_modular_snapshot(
     )
     app_path.write_text(app_yaml, encoding="utf-8")
 
-    return str(app_path)
+    return str(app_path), warnings
 
 
 def _waterfall_signature(group: Group) -> tuple:
@@ -197,45 +208,94 @@ def _build_network_lookup(
 # ---------------------------------------------------------------------------
 
 
-def _extract_tiers(groups: list[Group]) -> dict[str, dict[str, Any]]:
-    """Extract unique tier definitions keyed by group name.
+def _extract_tiers(
+    groups: list[Group],
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Extract unique tier definitions keyed by group name, with format associations.
 
-    Each tier is stored once with its country list. Deduplicates across
-    formats — if "Tier 1" appears in both interstitial and rewarded with
-    the same countries, it's stored once.
+    Each tier is stored once with its country list and a ``formats`` field
+    listing every ad format that references the tier.  Iterates all groups
+    sorted by position; for each group, either creates a new tier entry or
+    adds the format to the existing tier's format set.
+
+    When the same tier name appears across multiple formats with different
+    country lists, the countries are merged to the **sorted union** and a
+    human-readable warning is appended to the warnings list.
+
+    Default tiers (those with ``'*'`` in countries) are sorted last in the
+    returned dict so they appear at the bottom of the YAML output.
+
+    Returns:
+        A 2-tuple of:
+        - Dict mapping tier name to ``{"countries": [...], "formats": [...]}``.
+          The ``formats`` value is a sorted list of strings (not a set).
+        - List of warning strings describing per-format country differences.
+          Empty when all formats share the same countries for each tier.
     """
     tiers: dict[str, dict[str, Any]] = {}
     for g in sorted(groups, key=lambda g: g.position):
-        if g.group_name not in tiers:
-            tiers[g.group_name] = {"countries": list(g.countries)}
-    return tiers
+        if g.group_name in tiers:
+            tiers[g.group_name]["_format_set"].add(g.ad_format.value)
+            tiers[g.group_name]["_country_sets"][g.ad_format.value] = set(
+                g.countries
+            )
+        else:
+            tiers[g.group_name] = {
+                "countries": list(g.countries),
+                "_format_set": {g.ad_format.value},
+                "_country_sets": {g.ad_format.value: set(g.countries)},
+            }
+
+    # Detect per-format country variance, take union, and build warnings
+    warnings: list[str] = []
+    for tier_name, tier_data in tiers.items():
+        country_sets: dict[str, set[str]] = tier_data.pop("_country_sets")
+        unique_sets = {frozenset(cs) for cs in country_sets.values()}
+        if len(unique_sets) > 1:
+            # Countries differ across formats -- take sorted union
+            union_countries = sorted(
+                set().union(*country_sets.values())
+            )
+            tier_data["countries"] = union_countries
+
+            # Build warning with per-format detail
+            per_format_parts = ", ".join(
+                f"{fmt}: {sorted(countries)}"
+                for fmt, countries in sorted(country_sets.items())
+            )
+            warning = (
+                f"Tier '{tier_name}': countries differ across formats "
+                f"({per_format_parts}) -- merged to union {union_countries}"
+            )
+            warnings.append(warning)
+
+    # Convert internal format sets to sorted lists and remove the temporary key
+    for tier_data in tiers.values():
+        tier_data["formats"] = sorted(tier_data.pop("_format_set"))
+
+    # Sort so default tiers ('*' in countries) come last
+    tiers = dict(
+        sorted(tiers.items(), key=lambda t: "*" in t[1]["countries"])
+    )
+    return tiers, warnings
 
 
 # ---------------------------------------------------------------------------
-# Shared merge helper
+# YAML write helper
 # ---------------------------------------------------------------------------
 
 
-def _merge_yaml_file(
+def _write_yaml_file(
     path: Path,
-    new_entries: dict[str, Any],
+    entries: dict[str, Any],
     header: str,
     root_key: str = "presets",
 ) -> None:
-    """Merge new entries into an existing YAML file, or create it."""
+    """Write entries to a YAML file (overwrites existing)."""
     yaml = YAML()
     yaml.default_flow_style = False
-
-    existing: dict[str, Any] = {}
-    if path.exists():
-        data = yaml.load(path)
-        if data and root_key in data:
-            existing = dict(data[root_key])
-
-    merged = {**existing, **new_entries}
-
     stream = StringIO()
-    yaml.dump({root_key: merged}, stream)
+    yaml.dump({root_key: entries}, stream)
     path.write_text(header + stream.getvalue(), encoding="utf-8")
 
 
@@ -251,7 +311,23 @@ def _build_app_yaml(
     platform: Platform | None,
     network_lookup: dict[tuple, str],
 ) -> str:
-    """Build a compact per-app YAML with tier lists + waterfall preset references."""
+    """Build a compact per-app YAML with metadata and a flat waterfall mapping.
+
+    The ``waterfall`` section maps each LevelPlay-compatible ad format to its
+    resolved network preset name (or ``"none"`` when no groups exist for that
+    format).  All four formats (banner, interstitial, native, rewarded) always
+    appear, regardless of whether the app has groups configured for them.
+
+    Args:
+        groups: List of Group models from the live API.
+        app_key: Application key.
+        app_name: Application display name.
+        platform: Optional platform identifier.
+        network_lookup: Reverse lookup from waterfall signature to preset name.
+
+    Returns:
+        YAML string with header comments and app data.
+    """
     timestamp = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     data: dict[str, Any] = {
@@ -261,32 +337,23 @@ def _build_app_yaml(
     if platform is not None:
         data["platform"] = platform.value
 
-    # Group by format
-    by_format: dict[str, list[Group]] = defaultdict(list)
+    # Group by format (explicit string key, no defaultdict side effects)
+    by_format: dict[str, list[Group]] = {}
     for g in groups:
-        by_format[g.ad_format.value].append(g)
+        by_format.setdefault(g.ad_format.value, []).append(g)
 
-    groups_data: dict[str, dict[str, Any]] = {}
-    for fmt in sorted(by_format.keys()):
-        fmt_groups = by_format[fmt]
+    # Build flat waterfall mapping for all LevelPlay-compatible formats
+    waterfall_data: dict[str, str] = {}
+    for fmt in [f for f in AdFormat if f != AdFormat.REWARDED_VIDEO]:
+        fmt_groups = by_format.get(fmt.value, [])
+        if fmt_groups:
+            wf_sig = _waterfall_signature(fmt_groups[0])
+            wf_name = network_lookup.get(wf_sig, "none")
+        else:
+            wf_name = "none"
+        waterfall_data[fmt.value] = wf_name
 
-        # Tier names in position order
-        tier_names = [
-            g.group_name
-            for g in sorted(fmt_groups, key=lambda g: g.position)
-        ]
-
-        # Resolve waterfall preset (use the first group's — all groups in
-        # a format typically share the same waterfall)
-        wf_sig = _waterfall_signature(fmt_groups[0])
-        wf_name = network_lookup.get(wf_sig, "none")
-
-        groups_data[fmt] = {
-            "tiers": tier_names,
-            "waterfall": wf_name,
-        }
-
-    data["groups"] = groups_data
+    data["waterfall"] = waterfall_data
 
     yaml = YAML()
     yaml.default_flow_style = False
@@ -302,102 +369,187 @@ def _build_app_yaml(
 
 
 # ---------------------------------------------------------------------------
-# Legacy single-file snapshot (for `snapshot` command compatibility)
+# Raw full-fidelity snapshot (Pydantic model_dump serialization)
 # ---------------------------------------------------------------------------
 
 
-def generate_snapshot(
+def save_raw_snapshot(
     groups: list[Group],
     app_key: str,
     app_name: str,
+    alias: str,
+    snapshots_dir: str = "snapshots",
     platform: Platform | None = None,
 ) -> str:
-    """Generate a single-file YAML snapshot with inlined instance data.
+    """Save full-fidelity raw snapshot using Pydantic model_dump serialization.
+
+    Serializes each Group via ``model_dump(mode="json", by_alias=True,
+    exclude_none=True)`` and organizes them by ad format. The output YAML
+    preserves all API data (group IDs, instance IDs, rates, country rate
+    overrides, floor prices, A/B tests, segments) for lossless round-trip
+    reconstruction via ``model_validate()``.
 
     Args:
-        groups: List of Group models to serialize.
-        app_key: Application key for the snapshot header.
-        app_name: Application display name for the snapshot header.
+        groups: List of Group models from the live API.
+        app_key: Application key.
+        app_name: Application display name.
+        alias: Profile alias used as the filename (e.g. ``"ss-ios"``).
+        snapshots_dir: Directory for output files.
         platform: Optional platform identifier.
 
     Returns:
-        A YAML-formatted string with all instance data inlined.
+        The path to the saved snapshot YAML file.
 
     Examples:
-        >>> yaml_str = generate_snapshot([], "key1", "Test App")
-        >>> "app_key: key1" in yaml_str
-        True
-        >>> "groups:" in yaml_str
-        True
+        >>> from admedi.engine.snapshot import save_raw_snapshot
+        >>> from admedi.models.group import Group
+        >>> groups = [
+        ...     Group.model_validate({
+        ...         "groupName": "US Tier 1",
+        ...         "adFormat": "interstitial",
+        ...         "countries": ["US"],
+        ...         "position": 1,
+        ...     })
+        ... ]
+        >>> path = save_raw_snapshot(groups, "abc123", "My App", "my-app")
+        >>> path
+        'snapshots/my-app.yaml'
     """
-    timestamp = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    snapshots = Path(snapshots_dir)
+    snapshots.mkdir(parents=True, exist_ok=True)
 
+    # Organize groups by ad format
+    by_format: dict[str, list[dict[str, Any]]] = {}
+    for group in groups:
+        dumped = group.model_dump(mode="json", by_alias=True, exclude_none=True)
+        fmt = dumped["adFormat"]
+        by_format.setdefault(fmt, []).append(dumped)
+
+    # Build snapshot data dict
     data: dict[str, Any] = {
         "app_key": app_key,
         "app_name": app_name,
     }
-
     if platform is not None:
         data["platform"] = platform.value
+    data["groups"] = by_format
 
-    groups_by_format: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for group in groups:
-        group_dict = _serialize_group(group)
-        groups_by_format[group.ad_format.value].append(group_dict)
-
-    data["groups"] = dict(groups_by_format) if groups_by_format else {}
-
+    # Serialize to YAML
     yaml = YAML()
     yaml.default_flow_style = False
-
     stream = StringIO()
     yaml.dump(data, stream)
-    yaml_body = stream.getvalue()
 
-    header_lines = [
-        "# Generated by admedi snapshot",
-        f"# App: {app_name} ({app_key})",
-        f"# Captured: {timestamp}",
-        "",
-    ]
-    header = "\n".join(header_lines)
+    # Build header comment
+    timestamp = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    header = (
+        f"# Captured by admedi show\n"
+        f"# App: {app_name} ({app_key})\n"
+        f"# Captured: {timestamp}\n\n"
+    )
 
-    return header + yaml_body
+    # Write file
+    file_path = snapshots / f"{alias}.yaml"
+    file_path.write_text(header + stream.getvalue(), encoding="utf-8")
 
-
-def _serialize_group(group: Group) -> dict[str, Any]:
-    """Serialize a Group model to a dict with inlined instance data."""
-    group_dict: dict[str, Any] = {
-        "name": group.group_name,
-        "group_id": group.group_id,
-        "countries": list(group.countries),
-        "position": group.position,
-        "floor_price": group.floor_price,
-        "ab_test": group.ab_test,
-    }
-
-    instances_list: list[dict[str, Any]] = []
-    if group.instances:
-        for instance in group.instances:
-            instances_list.append(_serialize_instance(instance))
-
-    group_dict["instances"] = instances_list
-
-    return group_dict
+    return str(file_path)
 
 
-def _serialize_instance(instance: "Instance") -> dict[str, Any]:
-    """Serialize an Instance model to a dict for legacy snapshot output."""
-    from admedi.models.instance import Instance  # noqa: F811
+# ---------------------------------------------------------------------------
+# Snapshot data model and loader
+# ---------------------------------------------------------------------------
 
-    instance_dict: dict[str, Any] = {
-        "id": instance.instance_id,
-        "name": instance.instance_name,
-        "network": instance.network_name,
-        "is_bidder": instance.is_bidder,
-    }
 
-    if instance.group_rate is not None:
-        instance_dict["rate"] = instance.group_rate
+class SnapshotData(BaseModel):
+    """Data loaded from a raw snapshot YAML file.
 
-    return instance_dict
+    Encapsulates the app metadata and reconstructed Group models from a
+    snapshot file written by ``save_raw_snapshot()``.
+
+    Attributes:
+        app_key: Application key from the snapshot header.
+        app_name: Application display name from the snapshot header.
+        platform: Optional platform identifier from the snapshot header.
+        groups: List of Group models reconstructed from the snapshot data.
+
+    Examples:
+        >>> from admedi.engine.snapshot import SnapshotData
+        >>> from admedi.models.group import Group
+        >>> data = SnapshotData(
+        ...     app_key="abc123",
+        ...     app_name="Test App",
+        ...     groups=[],
+        ... )
+        >>> data.app_key
+        'abc123'
+        >>> len(data.groups)
+        0
+    """
+
+    app_key: str
+    app_name: str
+    platform: Platform | None = None
+    groups: list[Group]
+
+
+def load_snapshot(snapshot_path: str | Path) -> SnapshotData:
+    """Load a snapshot YAML file and reconstruct Group models.
+
+    Reads a YAML file written by ``save_raw_snapshot()`` and reconstructs
+    the original Group models via ``Group.model_validate()``. Since
+    ``save_raw_snapshot()`` serializes with ``by_alias=True``, the YAML
+    field names are the alias names that ``model_validate()`` accepts
+    natively -- no custom mapping needed.
+
+    Args:
+        snapshot_path: Path to the snapshot YAML file.
+
+    Returns:
+        SnapshotData with app metadata and reconstructed Group models.
+
+    Raises:
+        FileNotFoundError: If the snapshot file doesn't exist.
+        ValueError: If the snapshot format is invalid (e.g., missing
+            ``groups`` key, malformed YAML).
+
+    Examples:
+        >>> from admedi.engine.snapshot import load_snapshot
+        >>> data = load_snapshot("snapshots/ss-ios.yaml")  # doctest: +SKIP
+        >>> data.app_key  # doctest: +SKIP
+        'abc123'
+    """
+    path = Path(snapshot_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Snapshot file not found: {snapshot_path}")
+
+    yaml = YAML()
+    data = yaml.load(path)
+
+    if data is None or "groups" not in data:
+        raise ValueError(
+            f"Invalid snapshot format: missing 'groups' key in {snapshot_path}"
+        )
+
+    # Extract header metadata
+    app_key: str = data.get("app_key", "")
+    app_name: str = data.get("app_name", "")
+
+    # Parse platform if present
+    platform: Platform | None = None
+    if "platform" in data:
+        platform = Platform(data["platform"])
+
+    # Reconstruct Group models from groups dict (keyed by ad format)
+    groups: list[Group] = []
+    groups_dict = data["groups"]
+    if groups_dict:
+        for _ad_format, group_list in groups_dict.items():
+            for group_dict in group_list:
+                groups.append(Group.model_validate(group_dict))
+
+    return SnapshotData(
+        app_key=app_key,
+        app_name=app_name,
+        platform=platform,
+        groups=groups,
+    )

@@ -565,11 +565,11 @@ class TestUpdateExecution:
 
 
 class TestDeleteExtraSkip:
-    """Tests that DELETE and EXTRA actions are not processed."""
+    """Tests that DELETE calls delete_group and EXTRA is skipped."""
 
     @pytest.mark.asyncio
-    async def test_delete_not_processed(self) -> None:
-        """DELETE action does not call any adapter write methods."""
+    async def test_delete_calls_delete_group(self) -> None:
+        """DELETE action calls adapter.delete_group() but not create or update."""
         adapter, storage = _make_mocks()
         applier = Applier(adapter=adapter, storage=storage)
 
@@ -590,7 +590,7 @@ class TestDeleteExtraSkip:
 
         adapter.create_group.assert_not_called()
         adapter.update_group.assert_not_called()
-        adapter.delete_group.assert_not_called()
+        adapter.delete_group.assert_called_once_with("app1", 99)
 
     @pytest.mark.asyncio
     async def test_extra_not_processed(self) -> None:

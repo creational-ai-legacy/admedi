@@ -40,9 +40,6 @@ htmlcov/
 *.db
 *.sqlite3
 
-# Generated snapshots (runtime output)
-*_snapshot.yaml
-
 # Local symlinks
 docs-main
 

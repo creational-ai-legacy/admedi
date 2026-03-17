@@ -1,23 +1,28 @@
-"""Tests for the ConfigEngine orchestrator.
+"""Tests for the ConfigEngine orchestrator and Applier.
 
-Covers audit(), sync(), snapshot(), status() methods with mocked adapter
-and storage. Verifies template loading, concurrent group fetching, diff
-computation, applier delegation, app_keys filtering, group data caching,
-and correct model output structure.
+Covers audit(), sync(), status() methods with mocked adapter and storage.
+Verifies template loading, concurrent group fetching, diff computation,
+applier delegation, app_keys filtering, group data caching, and correct
+model output structure. Also covers Applier deletion phase (Step 7).
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 import pytest
 
+from admedi.engine.applier import Applier
 from admedi.engine.engine import ConfigEngine
-from admedi.models.app import App
-from admedi.models.apply_result import ApplyStatus, PortfolioStatus
-from admedi.models.diff import DiffAction, DiffReport
+from admedi.models.apply_result import AppApplyResult, ApplyStatus, PortfolioStatus
+from admedi.models.diff import (
+    AppDiffReport,
+    DiffAction,
+    DiffReport,
+    GroupDiff,
+)
 from admedi.models.enums import AdFormat, Mediator, Platform
 from admedi.models.group import Group
 from admedi.models.sync_log import SyncLog
@@ -43,21 +48,6 @@ def _make_group(
             "countries": countries or ["US"],
             "position": position,
             "groupId": group_id,
-        }
-    )
-
-
-def _make_app(
-    app_key: str = "app1",
-    app_name: str = "Test App",
-    platform: str = "Android",
-) -> App:
-    """Create an App model for testing."""
-    return App.model_validate(
-        {
-            "appKey": app_key,
-            "appName": app_name,
-            "platform": platform,
         }
     )
 
@@ -270,130 +260,6 @@ class TestSync:
 
 
 # ---------------------------------------------------------------------------
-# Test Classes: snapshot()
-# ---------------------------------------------------------------------------
-
-
-class TestSnapshot:
-    """Tests for ConfigEngine.snapshot()."""
-
-    @pytest.mark.asyncio
-    async def test_snapshot_returns_yaml_string(self) -> None:
-        """snapshot() returns a YAML string."""
-        adapter, storage = _make_mocks()
-        adapter.get_groups.return_value = [
-            _make_group("Tier 1", group_id=100)
-        ]
-        adapter.list_apps.return_value = [
-            _make_app(app_key="test-key", app_name="Test App"),
-        ]
-
-        engine = ConfigEngine(adapter=adapter, storage=storage)
-
-        yaml_str = await engine.snapshot("test-key")
-
-        assert isinstance(yaml_str, str)
-        assert "Tier 1" in yaml_str
-
-    @pytest.mark.asyncio
-    async def test_snapshot_contains_group_data_by_format(self) -> None:
-        """snapshot() returns YAML with groups organized by ad_format."""
-        adapter, storage = _make_mocks()
-        adapter.get_groups.return_value = [
-            _make_group(
-                "Interstitial Group",
-                ad_format=AdFormat.INTERSTITIAL,
-                group_id=1,
-            ),
-            _make_group(
-                "Banner Group",
-                ad_format=AdFormat.BANNER,
-                group_id=2,
-            ),
-        ]
-        adapter.list_apps.return_value = [
-            _make_app(app_key="test-key", app_name="Test App"),
-        ]
-
-        engine = ConfigEngine(adapter=adapter, storage=storage)
-
-        yaml_str = await engine.snapshot("test-key")
-
-        assert "interstitial:" in yaml_str
-        assert "banner:" in yaml_str
-        assert "Interstitial Group" in yaml_str
-        assert "Banner Group" in yaml_str
-
-    @pytest.mark.asyncio
-    async def test_snapshot_resolves_app_name_from_list_apps(self) -> None:
-        """snapshot() calls list_apps() to resolve the app name."""
-        adapter, storage = _make_mocks()
-        adapter.get_groups.return_value = []
-        adapter.list_apps.return_value = [
-            _make_app(app_key="my-key", app_name="My App Name"),
-        ]
-
-        engine = ConfigEngine(adapter=adapter, storage=storage)
-
-        yaml_str = await engine.snapshot("my-key")
-
-        assert "My App Name" in yaml_str
-        adapter.list_apps.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_snapshot_fallback_name_when_not_found(self) -> None:
-        """snapshot() uses app_key as fallback when app not in list_apps()."""
-        adapter, storage = _make_mocks()
-        adapter.get_groups.return_value = []
-        adapter.list_apps.return_value = [
-            _make_app(app_key="other-key", app_name="Other App"),
-        ]
-
-        engine = ConfigEngine(adapter=adapter, storage=storage)
-
-        yaml_str = await engine.snapshot("unknown-key")
-
-        assert "unknown-key" in yaml_str
-
-    @pytest.mark.asyncio
-    async def test_snapshot_writes_to_file_when_output_path_given(
-        self, tmp_path: Path
-    ) -> None:
-        """snapshot(output_path=...) writes YAML to file."""
-        adapter, storage = _make_mocks()
-        adapter.get_groups.return_value = [
-            _make_group("Tier 1", group_id=100)
-        ]
-        adapter.list_apps.return_value = [
-            _make_app(app_key="test-key", app_name="Test App"),
-        ]
-
-        engine = ConfigEngine(adapter=adapter, storage=storage)
-
-        output = tmp_path / "snapshot.yaml"
-        yaml_str = await engine.snapshot("test-key", output_path=output)
-
-        assert output.exists()
-        file_content = output.read_text(encoding="utf-8")
-        assert file_content == yaml_str
-        assert "Tier 1" in file_content
-
-    @pytest.mark.asyncio
-    async def test_snapshot_no_file_when_output_path_none(self) -> None:
-        """snapshot(output_path=None) does not write to file."""
-        adapter, storage = _make_mocks()
-        adapter.get_groups.return_value = []
-        adapter.list_apps.return_value = []
-
-        engine = ConfigEngine(adapter=adapter, storage=storage)
-
-        yaml_str = await engine.snapshot("test-key")
-
-        # Returns a string, no file I/O
-        assert isinstance(yaml_str, str)
-
-
-# ---------------------------------------------------------------------------
 # Test Classes: status()
 # ---------------------------------------------------------------------------
 
@@ -547,7 +413,311 @@ class TestImportExport:
         assert "ConfigEngine" in admedi.engine.__all__
 
     def test_engine_all_has_five_entries(self) -> None:
-        """Engine __all__ has 5 entries after adding ConfigEngine."""
+        """Engine __all__ has 5 entries (Applier, ConfigEngine, compute_diff, load_template, load_tiers_settings)."""
         import admedi.engine
 
         assert len(admedi.engine.__all__) == 5
+
+
+# ---------------------------------------------------------------------------
+# Test Classes: Applier Deletion Phase (Step 7)
+# ---------------------------------------------------------------------------
+
+
+def _make_delete_diff(
+    name: str = "Legacy Group",
+    group_id: int = 500,
+    ad_format: AdFormat = AdFormat.INTERSTITIAL,
+) -> GroupDiff:
+    """Create a GroupDiff with action=DELETE for testing."""
+    return GroupDiff(
+        action=DiffAction.DELETE,
+        group_name=name,
+        group_id=group_id,
+        ad_format=ad_format,
+        changes=[],
+        desired_group=None,
+    )
+
+
+def _make_create_diff(
+    name: str = "New Tier",
+    ad_format: AdFormat = AdFormat.INTERSTITIAL,
+) -> GroupDiff:
+    """Create a GroupDiff with action=CREATE for testing."""
+    desired = _make_group(name, ad_format=ad_format, group_id=None)
+    return GroupDiff(
+        action=DiffAction.CREATE,
+        group_name=name,
+        group_id=None,
+        ad_format=ad_format,
+        changes=[],
+        desired_group=desired,
+    )
+
+
+def _make_unchanged_diff(
+    name: str = "Stable Group",
+    group_id: int = 100,
+) -> GroupDiff:
+    """Create a GroupDiff with action=UNCHANGED for testing."""
+    return GroupDiff(
+        action=DiffAction.UNCHANGED,
+        group_name=name,
+        group_id=group_id,
+        ad_format=AdFormat.INTERSTITIAL,
+        changes=[],
+        desired_group=None,
+    )
+
+
+def _make_extra_diff(
+    name: str = "Extra Group",
+    group_id: int = 999,
+) -> GroupDiff:
+    """Create a GroupDiff with action=EXTRA for testing."""
+    return GroupDiff(
+        action=DiffAction.EXTRA,
+        group_name=name,
+        group_id=group_id,
+        ad_format=AdFormat.INTERSTITIAL,
+        changes=[],
+        desired_group=None,
+    )
+
+
+def _make_app_diff_report(
+    app_key: str = "app1",
+    app_name: str = "Test App",
+    group_diffs: list[GroupDiff] | None = None,
+    has_ab_test: bool = False,
+) -> AppDiffReport:
+    """Create an AppDiffReport for applier testing."""
+    return AppDiffReport(
+        app_key=app_key,
+        app_name=app_name,
+        group_diffs=group_diffs or [],
+        has_ab_test=has_ab_test,
+        ab_test_warning=None,
+    )
+
+
+def _make_applier_mocks() -> tuple[AsyncMock, AsyncMock]:
+    """Create mocked adapter and storage for Applier tests."""
+    adapter = AsyncMock()
+    storage = AsyncMock()
+    adapter.get_groups.return_value = []
+    return adapter, storage
+
+
+class TestApplierDeleteExecution:
+    """Tests for Applier DELETE execution phase (Step 7)."""
+
+    @pytest.mark.asyncio
+    async def test_delete_group_called_for_each_delete_diff(self) -> None:
+        """adapter.delete_group() is called once per DELETE diff."""
+        adapter, storage = _make_applier_mocks()
+        applier = Applier(adapter=adapter, storage=storage)
+
+        diffs = [
+            _make_delete_diff(name="Legacy 1", group_id=501),
+            _make_delete_diff(name="Legacy 2", group_id=502),
+            _make_delete_diff(name="Legacy 3", group_id=503),
+        ]
+        report = _make_app_diff_report(group_diffs=diffs)
+        diff_report = DiffReport(app_reports=[report])
+
+        result = await applier.apply(diff_report, dry_run=False)
+
+        assert adapter.delete_group.call_count == 3
+        adapter.delete_group.assert_any_call("app1", 501)
+        adapter.delete_group.assert_any_call("app1", 502)
+        adapter.delete_group.assert_any_call("app1", 503)
+
+    @pytest.mark.asyncio
+    async def test_deletions_execute_before_creates(self) -> None:
+        """Deletions execute before creates (verified by mock call order)."""
+        adapter, storage = _make_applier_mocks()
+        applier = Applier(adapter=adapter, storage=storage)
+
+        diffs = [
+            _make_create_diff(name="New Tier"),
+            _make_delete_diff(name="Old Tier", group_id=500),
+        ]
+        report = _make_app_diff_report(group_diffs=diffs)
+        diff_report = DiffReport(app_reports=[report])
+
+        # Track call order via side_effect
+        call_order: list[str] = []
+        adapter.delete_group.side_effect = lambda *a: call_order.append("delete")
+        adapter.create_group.side_effect = lambda *a: call_order.append("create")
+
+        await applier.apply(diff_report, dry_run=False)
+
+        assert call_order == ["delete", "create"]
+
+    @pytest.mark.asyncio
+    async def test_groups_deleted_count_correct(self) -> None:
+        """AppApplyResult.groups_deleted reflects the number of successful deletions."""
+        adapter, storage = _make_applier_mocks()
+        applier = Applier(adapter=adapter, storage=storage)
+
+        diffs = [
+            _make_delete_diff(name="Legacy 1", group_id=501),
+            _make_delete_diff(name="Legacy 2", group_id=502),
+        ]
+        report = _make_app_diff_report(group_diffs=diffs)
+        diff_report = DiffReport(app_reports=[report])
+
+        result = await applier.apply(diff_report, dry_run=False)
+
+        assert result.app_results[0].groups_deleted == 2
+
+    @pytest.mark.asyncio
+    async def test_dry_run_does_not_call_delete_group(self) -> None:
+        """Dry-run does NOT call adapter.delete_group()."""
+        adapter, storage = _make_applier_mocks()
+        applier = Applier(adapter=adapter, storage=storage)
+
+        diffs = [_make_delete_diff(name="Legacy", group_id=500)]
+        report = _make_app_diff_report(group_diffs=diffs)
+        diff_report = DiffReport(app_reports=[report])
+
+        result = await applier.apply(diff_report, dry_run=True)
+
+        adapter.delete_group.assert_not_called()
+        assert result.app_results[0].groups_deleted == 0
+
+    @pytest.mark.asyncio
+    async def test_empty_deletes_is_noop(self) -> None:
+        """Applier handles empty deletes list (no-op) without errors."""
+        adapter, storage = _make_applier_mocks()
+        applier = Applier(adapter=adapter, storage=storage)
+
+        diffs = [_make_create_diff(name="New Tier")]
+        report = _make_app_diff_report(group_diffs=diffs)
+        diff_report = DiffReport(app_reports=[report])
+
+        result = await applier.apply(diff_report, dry_run=False)
+
+        adapter.delete_group.assert_not_called()
+        assert result.app_results[0].groups_deleted == 0
+        assert result.app_results[0].groups_created == 1
+
+    @pytest.mark.asyncio
+    async def test_groups_deleted_in_sync_log(self) -> None:
+        """SyncLog entry includes groups_deleted count."""
+        adapter, storage = _make_applier_mocks()
+        applier = Applier(adapter=adapter, storage=storage)
+
+        diffs = [
+            _make_delete_diff(name="Legacy 1", group_id=501),
+            _make_delete_diff(name="Legacy 2", group_id=502),
+        ]
+        report = _make_app_diff_report(group_diffs=diffs)
+        diff_report = DiffReport(app_reports=[report])
+
+        await applier.apply(diff_report, dry_run=False)
+
+        storage.save_sync_log.assert_called_once()
+        sync_log = storage.save_sync_log.call_args[0][0]
+        assert sync_log.groups_deleted == 2
+
+    @pytest.mark.asyncio
+    async def test_verify_warns_if_deleted_group_still_exists(self) -> None:
+        """_verify_writes() warns if a deleted group still exists after deletion."""
+        adapter, storage = _make_applier_mocks()
+        applier = Applier(adapter=adapter, storage=storage)
+
+        # After deletion, the GET still returns the deleted group (simulating API failure)
+        still_there = _make_group("Legacy", group_id=500)
+        adapter.get_groups.return_value = [still_there]
+
+        diffs = [_make_delete_diff(name="Legacy", group_id=500)]
+        report = _make_app_diff_report(group_diffs=diffs)
+        diff_report = DiffReport(app_reports=[report])
+
+        result = await applier.apply(diff_report, dry_run=False)
+
+        assert len(result.app_results[0].warnings) > 0
+        assert "still exists after DELETE" in result.app_results[0].warnings[0]
+
+    @pytest.mark.asyncio
+    async def test_delete_skip_when_group_id_none(self) -> None:
+        """DELETE diff with group_id=None is skipped (no adapter call)."""
+        adapter, storage = _make_applier_mocks()
+        applier = Applier(adapter=adapter, storage=storage)
+
+        diff = GroupDiff(
+            action=DiffAction.DELETE,
+            group_name="Orphan",
+            group_id=None,
+            ad_format=AdFormat.INTERSTITIAL,
+            changes=[],
+            desired_group=None,
+        )
+        # Need another diff to avoid idempotency guard
+        create_diff = _make_create_diff(name="New Tier")
+        report = _make_app_diff_report(group_diffs=[diff, create_diff])
+        diff_report = DiffReport(app_reports=[report])
+
+        await applier.apply(diff_report, dry_run=False)
+
+        adapter.delete_group.assert_not_called()
+
+
+class TestApplierIdempotencyGuard:
+    """Tests for the updated idempotency guard (Step 7)."""
+
+    @pytest.mark.asyncio
+    async def test_idempotency_guard_skips_all_unchanged(self) -> None:
+        """Idempotency guard returns early for all-UNCHANGED diffs."""
+        adapter, storage = _make_applier_mocks()
+        applier = Applier(adapter=adapter, storage=storage)
+
+        diffs = [_make_unchanged_diff()]
+        report = _make_app_diff_report(group_diffs=diffs)
+        diff_report = DiffReport(app_reports=[report])
+
+        result = await applier.apply(diff_report, dry_run=False)
+
+        assert result.app_results[0].status == ApplyStatus.SUCCESS
+        assert result.app_results[0].groups_deleted == 0
+        adapter.delete_group.assert_not_called()
+        adapter.create_group.assert_not_called()
+        adapter.update_group.assert_not_called()
+        # No pre-write snapshot for idempotency guard
+        adapter.get_groups.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_idempotency_guard_skips_all_extra(self) -> None:
+        """Idempotency guard returns early for all-EXTRA diffs (defensive)."""
+        adapter, storage = _make_applier_mocks()
+        applier = Applier(adapter=adapter, storage=storage)
+
+        diffs = [_make_extra_diff()]
+        report = _make_app_diff_report(group_diffs=diffs)
+        diff_report = DiffReport(app_reports=[report])
+
+        result = await applier.apply(diff_report, dry_run=False)
+
+        assert result.app_results[0].status == ApplyStatus.SUCCESS
+        assert result.app_results[0].groups_deleted == 0
+        adapter.delete_group.assert_not_called()
+        adapter.get_groups.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_idempotency_guard_skips_mixed_unchanged_extra(self) -> None:
+        """Idempotency guard returns early for UNCHANGED + EXTRA mix."""
+        adapter, storage = _make_applier_mocks()
+        applier = Applier(adapter=adapter, storage=storage)
+
+        diffs = [_make_unchanged_diff(), _make_extra_diff()]
+        report = _make_app_diff_report(group_diffs=diffs)
+        diff_report = DiffReport(app_reports=[report])
+
+        result = await applier.apply(diff_report, dry_run=False)
+
+        assert result.app_results[0].status == ApplyStatus.SUCCESS
+        adapter.delete_group.assert_not_called()
+        adapter.get_groups.assert_not_called()

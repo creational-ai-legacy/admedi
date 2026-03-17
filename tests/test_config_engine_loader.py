@@ -15,10 +15,10 @@ from textwrap import dedent
 
 import pytest
 
-from admedi.engine.loader import load_template
+from admedi.engine.loader import load_template, load_tiers_settings
 from admedi.exceptions import ConfigValidationError
 from admedi.models.enums import AdFormat, Mediator, Platform
-from admedi.models.portfolio import PortfolioConfig
+from admedi.models.portfolio import PortfolioConfig, PortfolioTier
 
 
 # ---------------------------------------------------------------------------
@@ -611,3 +611,301 @@ class TestShelfSortTemplate:
 
         assert content.count("#") >= 5, "Template should contain multiple YAML comments"
         assert "Shelf Sort" in content, "Template should reference Shelf Sort in comments"
+
+
+# ---------------------------------------------------------------------------
+# load_tiers_settings() Tests
+# ---------------------------------------------------------------------------
+
+# Helper to write a tiers settings file in the expected directory structure.
+def _write_tiers_file(
+    tmp_path: Path, content: str, alias: str = "test-app"
+) -> str:
+    """Write a tiers settings YAML file and return the settings_dir path."""
+    settings_dir = tmp_path / "settings"
+    settings_dir.mkdir(exist_ok=True)
+    file_path = settings_dir / f"{alias}-tiers.yaml"
+    file_path.write_text(dedent(content))
+    return str(settings_dir)
+
+
+# A valid tiers settings YAML with multiple tiers including formats.
+VALID_TIERS_SETTINGS_YAML = """\
+tiers:
+  Tier 1:
+    countries:
+    - US
+    formats:
+    - interstitial
+    - rewarded
+  Tier 2:
+    countries:
+    - AU
+    - CA
+    - DE
+    - GB
+    formats:
+    - interstitial
+    - rewarded
+  Tier 3:
+    countries:
+    - FR
+    - NL
+    formats:
+    - interstitial
+    - rewarded
+  All Countries:
+    countries:
+    - '*'
+    formats:
+    - banner
+    - interstitial
+    - native
+    - rewarded
+"""
+
+
+class TestLoadTiersSettingsValid:
+    """Tests for successful tiers settings loading."""
+
+    def test_returns_list_of_portfolio_tier(self, tmp_path: Path) -> None:
+        """Valid tiers file returns a list of PortfolioTier objects."""
+        settings_dir = _write_tiers_file(tmp_path, VALID_TIERS_SETTINGS_YAML)
+
+        result = load_tiers_settings("test-app", settings_dir=settings_dir)
+
+        assert isinstance(result, list)
+        assert all(isinstance(t, PortfolioTier) for t in result)
+
+    def test_correct_tier_count(self, tmp_path: Path) -> None:
+        """Valid tiers file with 4 tiers returns 4 PortfolioTier objects."""
+        settings_dir = _write_tiers_file(tmp_path, VALID_TIERS_SETTINGS_YAML)
+
+        result = load_tiers_settings("test-app", settings_dir=settings_dir)
+
+        assert len(result) == 4
+
+    def test_tier_names_from_dict_keys(self, tmp_path: Path) -> None:
+        """Tier names come from the dict keys in the YAML."""
+        settings_dir = _write_tiers_file(tmp_path, VALID_TIERS_SETTINGS_YAML)
+
+        result = load_tiers_settings("test-app", settings_dir=settings_dir)
+
+        names = [t.name for t in result]
+        assert names == ["Tier 1", "Tier 2", "Tier 3", "All Countries"]
+
+    def test_position_from_dict_order(self, tmp_path: Path) -> None:
+        """Position is 1-based index from overall dict order."""
+        settings_dir = _write_tiers_file(tmp_path, VALID_TIERS_SETTINGS_YAML)
+
+        result = load_tiers_settings("test-app", settings_dir=settings_dir)
+
+        positions = [t.position for t in result]
+        assert positions == [1, 2, 3, 4]
+
+    def test_countries_preserved(self, tmp_path: Path) -> None:
+        """Countries field is preserved correctly."""
+        settings_dir = _write_tiers_file(tmp_path, VALID_TIERS_SETTINGS_YAML)
+
+        result = load_tiers_settings("test-app", settings_dir=settings_dir)
+
+        assert result[0].countries == ["US"]
+        assert result[1].countries == ["AU", "CA", "DE", "GB"]
+        assert result[3].countries == ["*"]
+
+    def test_is_default_true_for_wildcard(self, tmp_path: Path) -> None:
+        """Tier with '*' in countries has is_default=True."""
+        settings_dir = _write_tiers_file(tmp_path, VALID_TIERS_SETTINGS_YAML)
+
+        result = load_tiers_settings("test-app", settings_dir=settings_dir)
+
+        # "All Countries" has '*' -> is_default=True
+        all_countries = result[3]
+        assert all_countries.is_default is True
+
+    def test_is_default_false_for_non_wildcard(self, tmp_path: Path) -> None:
+        """Tiers without '*' in countries have is_default=False."""
+        settings_dir = _write_tiers_file(tmp_path, VALID_TIERS_SETTINGS_YAML)
+
+        result = load_tiers_settings("test-app", settings_dir=settings_dir)
+
+        assert result[0].is_default is False
+        assert result[1].is_default is False
+        assert result[2].is_default is False
+
+    def test_ad_formats_are_enum_instances(self, tmp_path: Path) -> None:
+        """ad_formats contains AdFormat enum instances, not strings."""
+        settings_dir = _write_tiers_file(tmp_path, VALID_TIERS_SETTINGS_YAML)
+
+        result = load_tiers_settings("test-app", settings_dir=settings_dir)
+
+        for tier in result:
+            for fmt in tier.ad_formats:
+                assert isinstance(fmt, AdFormat)
+
+    def test_tier_1_ad_formats(self, tmp_path: Path) -> None:
+        """Tier 1 has ad_formats=[interstitial, rewarded]."""
+        settings_dir = _write_tiers_file(tmp_path, VALID_TIERS_SETTINGS_YAML)
+
+        result = load_tiers_settings("test-app", settings_dir=settings_dir)
+
+        assert result[0].ad_formats == [AdFormat.INTERSTITIAL, AdFormat.REWARDED]
+
+    def test_default_tier_has_all_formats(self, tmp_path: Path) -> None:
+        """Default tier has all 4 LevelPlay-compatible formats."""
+        settings_dir = _write_tiers_file(tmp_path, VALID_TIERS_SETTINGS_YAML)
+
+        result = load_tiers_settings("test-app", settings_dir=settings_dir)
+
+        assert set(result[3].ad_formats) == {
+            AdFormat.BANNER,
+            AdFormat.INTERSTITIAL,
+            AdFormat.NATIVE,
+            AdFormat.REWARDED,
+        }
+
+    def test_default_tier_last_gets_highest_position(self, tmp_path: Path) -> None:
+        """Default tier (last in dict from Step 1 sorting) gets the highest position."""
+        settings_dir = _write_tiers_file(tmp_path, VALID_TIERS_SETTINGS_YAML)
+
+        result = load_tiers_settings("test-app", settings_dir=settings_dir)
+
+        default_tier = next(t for t in result if t.is_default)
+        max_position = max(t.position for t in result)
+        assert default_tier.position == max_position
+
+    def test_empty_tiers_dict_returns_empty_list(self, tmp_path: Path) -> None:
+        """Empty tiers dict returns an empty list."""
+        yaml_content = """\
+        tiers: {}
+        """
+        settings_dir = _write_tiers_file(tmp_path, yaml_content)
+
+        result = load_tiers_settings("test-app", settings_dir=settings_dir)
+
+        assert result == []
+
+    def test_single_format_tier(self, tmp_path: Path) -> None:
+        """A tier with a single format has a single-element ad_formats list."""
+        yaml_content = """\
+        tiers:
+          Banner Only:
+            countries:
+            - '*'
+            formats:
+            - banner
+        """
+        settings_dir = _write_tiers_file(tmp_path, yaml_content)
+
+        result = load_tiers_settings("test-app", settings_dir=settings_dir)
+
+        assert len(result) == 1
+        assert result[0].ad_formats == [AdFormat.BANNER]
+
+
+class TestLoadTiersSettingsErrors:
+    """Tests for error handling in load_tiers_settings()."""
+
+    def test_missing_file_raises_file_not_found(self, tmp_path: Path) -> None:
+        """Non-existent file raises FileNotFoundError."""
+        with pytest.raises(FileNotFoundError, match="Tiers settings file not found"):
+            load_tiers_settings("nonexistent", settings_dir=str(tmp_path / "settings"))
+
+    def test_missing_file_error_includes_path(self, tmp_path: Path) -> None:
+        """FileNotFoundError message includes the file path."""
+        with pytest.raises(FileNotFoundError, match="nonexistent-tiers.yaml"):
+            load_tiers_settings("nonexistent", settings_dir=str(tmp_path / "settings"))
+
+    def test_malformed_yaml_raises_config_validation_error(self, tmp_path: Path) -> None:
+        """Malformed YAML raises ConfigValidationError."""
+        yaml_content = ":\n  invalid: [yaml\n  missing bracket"
+        settings_dir = _write_tiers_file(tmp_path, yaml_content)
+
+        with pytest.raises(ConfigValidationError, match="Malformed YAML"):
+            load_tiers_settings("test-app", settings_dir=settings_dir)
+
+    def test_missing_tiers_key_raises_config_validation_error(self, tmp_path: Path) -> None:
+        """YAML without 'tiers' key raises ConfigValidationError."""
+        yaml_content = """\
+        something_else:
+          Tier 1:
+            countries:
+            - US
+        """
+        settings_dir = _write_tiers_file(tmp_path, yaml_content)
+
+        with pytest.raises(ConfigValidationError, match="missing required 'tiers' key"):
+            load_tiers_settings("test-app", settings_dir=settings_dir)
+
+    def test_empty_file_raises_config_validation_error(self, tmp_path: Path) -> None:
+        """Empty YAML file raises ConfigValidationError."""
+        settings_dir = _write_tiers_file(tmp_path, "")
+
+        with pytest.raises(ConfigValidationError, match="must contain a YAML mapping"):
+            load_tiers_settings("test-app", settings_dir=settings_dir)
+
+    def test_invalid_format_string_raises_config_validation_error(self, tmp_path: Path) -> None:
+        """Invalid format string in formats list raises ConfigValidationError."""
+        yaml_content = """\
+        tiers:
+          Bad Tier:
+            countries:
+            - US
+            formats:
+            - baner
+        """
+        settings_dir = _write_tiers_file(tmp_path, yaml_content)
+
+        with pytest.raises(ConfigValidationError, match="Invalid ad format 'baner'"):
+            load_tiers_settings("test-app", settings_dir=settings_dir)
+
+    def test_invalid_format_error_mentions_tier_name(self, tmp_path: Path) -> None:
+        """Error for invalid format mentions the tier name."""
+        yaml_content = """\
+        tiers:
+          My Custom Tier:
+            countries:
+            - US
+            formats:
+            - invalidformat
+        """
+        settings_dir = _write_tiers_file(tmp_path, yaml_content)
+
+        with pytest.raises(ConfigValidationError, match="My Custom Tier"):
+            load_tiers_settings("test-app", settings_dir=settings_dir)
+
+    def test_rewarded_video_is_rejected(self, tmp_path: Path) -> None:
+        """Legacy 'rewardedVideo' format string is rejected."""
+        yaml_content = """\
+        tiers:
+          Legacy Tier:
+            countries:
+            - '*'
+            formats:
+            - rewardedVideo
+        """
+        settings_dir = _write_tiers_file(tmp_path, yaml_content)
+
+        with pytest.raises(ConfigValidationError, match="Invalid ad format 'rewardedVideo'"):
+            load_tiers_settings("test-app", settings_dir=settings_dir)
+
+    def test_null_tiers_returns_empty_list(self, tmp_path: Path) -> None:
+        """YAML with 'tiers: null' returns empty list (null is falsy)."""
+        yaml_content = """\
+        tiers:
+        """
+        settings_dir = _write_tiers_file(tmp_path, yaml_content)
+
+        result = load_tiers_settings("test-app", settings_dir=settings_dir)
+
+        assert result == []
+
+
+class TestLoadTiersSettingsImport:
+    """Tests verifying load_tiers_settings is importable from admedi.engine."""
+
+    def test_importable_from_engine_package(self) -> None:
+        """load_tiers_settings is importable from admedi.engine."""
+        from admedi.engine import load_tiers_settings as lts
+
+        assert callable(lts)

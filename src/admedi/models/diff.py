@@ -45,8 +45,8 @@ class DiffAction(str, Enum):
     Members:
         CREATE: Group exists in template but not in remote -- needs creation.
         UPDATE: Group exists in both but fields differ -- needs update.
-        DELETE: Group exists in remote but not in template -- reserved for
-            future ``--delete-extra`` flag.
+        DELETE: Group exists in remote but not in template -- will be deleted
+            during sync.
         UNCHANGED: Group matches template -- no action needed.
         EXTRA: Group exists in remote but not in template -- flagged for
             awareness (no automatic action taken).

@@ -1,10 +1,10 @@
 """Admedi CLI commands for config-driven ad mediation management.
 
-Provides four typer commands that delegate to :class:`~admedi.engine.ConfigEngine`:
+Provides four typer commands:
 
+- ``admedi show``        -- Show live mediation settings and save raw snapshot + modular settings
 - ``admedi audit``       -- Compare template against live state
-- ``admedi sync-tiers``  -- Apply tier template changes
-- ``admedi snapshot``    -- Export a YAML snapshot of current groups
+- ``admedi sync``        -- Sync settings to live mediation configs
 - ``admedi status``      -- Show portfolio status overview
 
 Each command bridges synchronous typer to async engine methods via
@@ -13,14 +13,17 @@ Each command bridges synchronous typer to async engine methods via
 
 Example::
 
+    # Show live settings for an app (saves snapshot + settings)
+    admedi show --app ss-ios
+
     # Audit for drift
     admedi audit --config examples/shelf-sort-tiers.yaml
 
     # Sync tiers with dry-run
-    admedi sync-tiers --dry-run --config examples/shelf-sort-tiers.yaml
+    admedi sync --tiers hexar-ios --dry-run
 
-    # Take a snapshot of a single app
-    admedi snapshot --app abc123 --output snapshot.yaml
+    # Cross-app sync
+    admedi sync --tiers hexar-ios hexar-google --dry-run
 
     # Show portfolio status
     admedi status --config examples/shelf-sort-tiers.yaml
@@ -30,7 +33,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
 from enum import Enum
 from pathlib import Path
 from typing import Annotated
@@ -43,13 +45,16 @@ from admedi.cli.display import (
     display_apply_result,
     display_audit_table,
     display_show,
-    display_snapshot_info,
     display_status_table,
     display_sync_preview,
+    display_tier_warnings,
 )
+from admedi.engine.applier import Applier
+from admedi.engine.differ import compute_diff
 from admedi.engine.engine import ConfigEngine
-from admedi.engine.loader import load_template
+from admedi.engine.loader import load_tiers_settings
 from admedi.exceptions import AuthError, ConfigValidationError
+from admedi.models.diff import DiffAction, DiffReport
 from admedi.storage.local import LocalFileStorageAdapter
 
 app = typer.Typer(name="admedi", help="Config-driven ad mediation management")
@@ -157,19 +162,36 @@ def show(
                 typer.echo(f"Error: app key '{resolved_key}' not found.", err=True)
                 raise typer.Exit(code=2)
 
-            # Save modular snapshot (networks.yaml + per-app YAML)
-            from admedi.engine.snapshot import save_modular_snapshot
+            # Save raw snapshot and modular settings
+            from admedi.engine.snapshot import (
+                save_modular_snapshot,
+                save_raw_snapshot,
+            )
 
             # Use alias as filename if available, otherwise app key
             alias = app_key if app_key != resolved_key else resolved_key
+
+            # Raw snapshot always uses alias (not affected by --output flag)
+            snapshot_path = save_raw_snapshot(
+                groups, resolved_key, target_app.app_name,
+                alias=alias,
+                platform=target_app.platform,
+            )
+
+            # Modular settings (--output flag overrides filename)
             app_file = output or f"{alias}.yaml"
-            snapshot_path = save_modular_snapshot(
+            settings_path, warnings = save_modular_snapshot(
                 groups, resolved_key, target_app.app_name,
                 app_file=app_file,
                 platform=target_app.platform,
             )
 
-        display_show(target_app, groups, snapshot_path=snapshot_path)
+        display_show(
+            target_app, groups,
+            snapshot_path=snapshot_path,
+            settings_path=settings_path,
+        )
+        display_tier_warnings(warnings)
 
     asyncio.run(_show_async())
 
@@ -222,196 +244,157 @@ def audit(
     asyncio.run(_audit_async())
 
 
-@app.command(name="sync-tiers")
-def sync_tiers(
-    config: Annotated[
-        Path,
-        typer.Option("--config", help="Path to YAML tier template."),
-    ] = Path("admedi.yaml"),
-    app_key: Annotated[
+@app.command()
+def sync(
+    source: Annotated[
+        str,
+        typer.Argument(help="Source app alias (reads its settings files)."),
+    ],
+    destination: Annotated[
         str | None,
-        typer.Option("--app", help="Filter to a specific app key or profile alias."),
+        typer.Argument(help="Target app alias (defaults to source for self-sync)."),
     ] = None,
+    tiers: Annotated[
+        bool,
+        typer.Option("--tiers", help="Sync tier definitions."),
+    ] = False,
+    networks: Annotated[
+        bool,
+        typer.Option("--networks", help="Sync network configurations (not yet implemented)."),
+    ] = False,
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", help="Preview changes without applying."),
-    ] = False,
-    yes: Annotated[
-        bool,
-        typer.Option("--yes", "-y", help="Skip confirmation prompt."),
     ] = False,
     output_format: Annotated[
         OutputFormat,
         typer.Option("--format", help="Output format: text or json."),
     ] = OutputFormat.TEXT,
 ) -> None:
-    """Sync tier template changes to live LevelPlay mediation groups.
+    """Sync settings to live LevelPlay mediation groups.
 
-    Loads the template, computes diffs, shows a preview, and optionally
-    applies changes. Use --dry-run to preview without applying.
+    SOURCE is the app alias whose settings files are used as the desired
+    state. DESTINATION is the target app alias to sync against (defaults
+    to SOURCE for self-sync).
+
+    Use --tiers to sync tier definitions. Use --dry-run to preview
+    changes without applying.
 
     Exit codes: 0 = success (applied or no drift), 1 = drift detected
-    but not applied (dry-run or user declined), 2 = error.
+    (dry-run), 2 = error.
     """
+    # Validate scope flags
+    if networks:
+        typer.echo("Error: --networks sync is not yet implemented.", err=True)
+        raise typer.Exit(code=2)
+
+    # Default to --tiers when no scope flags provided
+    if not tiers and not networks:
+        tiers = True
+
+    source_alias = source
+    target_alias = destination or source
+
     cred = _load_credential()
-    resolved = _resolve_app_key(app_key) if app_key else None
-    app_keys = [resolved] if resolved else None
+    target_app_key = _resolve_app_key(target_alias)
+
+    # Load tiers from settings
+    try:
+        tier_list = load_tiers_settings(source_alias)
+    except FileNotFoundError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    except ConfigValidationError as exc:
+        _handle_template_error(exc)
 
     async def _sync_async() -> None:
         async with LevelPlayAdapter(cred) as adapter:
             storage = LocalFileStorageAdapter()
-            engine = ConfigEngine(adapter=adapter, storage=storage)
 
-            try:
-                diff_report = await engine.audit(config, app_keys=app_keys)
-            except (ConfigValidationError, FileNotFoundError) as exc:
-                _handle_template_error(exc)
+            # Fetch remote groups for target
+            remote_groups = await adapter.get_groups(target_app_key)
 
-        has_drift = diff_report.total_creates > 0 or diff_report.total_updates > 0
+            # Resolve target app_name via list_apps
+            apps = await adapter.list_apps()
+            target_app = None
+            for a in apps:
+                if a.app_key == target_app_key:
+                    target_app = a
+                    break
 
-        if not has_drift:
+            if target_app is None:
+                typer.echo(
+                    f"Error: app key '{target_app_key}' not found.",
+                    err=True,
+                )
+                raise typer.Exit(code=2)
+
+            # Compute diff
+            app_diff_report = compute_diff(
+                tier_list, remote_groups, target_app_key, target_app.app_name
+            )
+
+            # Post-process: convert EXTRA -> DELETE (sync means "make it match")
+            # The differ remains a pure function; the conversion is a CLI concern.
+            for diff in app_diff_report.group_diffs:
+                if diff.action == DiffAction.EXTRA:
+                    diff.action = DiffAction.DELETE
+
+            # Wrap in DiffReport
+            diff_report = DiffReport(app_reports=[app_diff_report])
+
+            # Check for drift (includes deletes so delete-only diffs trigger sync)
+            has_drift = (
+                diff_report.total_creates > 0
+                or diff_report.total_updates > 0
+                or diff_report.total_deletes > 0
+            )
+
+            if not has_drift:
+                if output_format == OutputFormat.JSON:
+                    result_data = {
+                        "diff_report": json.loads(
+                            diff_report.model_dump_json()
+                        ),
+                        "apply_result": None,
+                    }
+                    typer.echo(json.dumps(result_data, indent=2))
+                else:
+                    display_sync_preview(diff_report)
+                return  # Exit 0 -- no drift
+
+            if output_format != OutputFormat.JSON:
+                display_sync_preview(diff_report)
+
+            if dry_run:
+                if output_format == OutputFormat.JSON:
+                    result_data = {
+                        "diff_report": json.loads(
+                            diff_report.model_dump_json()
+                        ),
+                        "apply_result": None,
+                    }
+                    typer.echo(json.dumps(result_data, indent=2))
+                raise typer.Exit(code=1)
+
+            # Apply changes
+            applier = Applier(adapter=adapter, storage=storage)
+            apply_result = await applier.apply(diff_report, dry_run=False)
+
             if output_format == OutputFormat.JSON:
                 result_data = {
-                    "diff_report": json.loads(diff_report.model_dump_json()),
-                    "apply_result": None,
+                    "diff_report": json.loads(
+                        diff_report.model_dump_json()
+                    ),
+                    "apply_result": json.loads(
+                        apply_result.model_dump_json()
+                    ),
                 }
                 typer.echo(json.dumps(result_data, indent=2))
             else:
-                display_sync_preview(diff_report)
-            return  # Exit 0 -- no drift
-
-        if output_format != OutputFormat.JSON:
-            display_sync_preview(diff_report)
-
-        if dry_run:
-            if output_format == OutputFormat.JSON:
-                result_data = {
-                    "diff_report": json.loads(diff_report.model_dump_json()),
-                    "apply_result": None,
-                }
-                typer.echo(json.dumps(result_data, indent=2))
-            raise typer.Exit(code=1)
-
-        # Prompt for confirmation unless --yes
-        if not yes:
-            confirmed = typer.confirm("Apply these changes?")
-            if not confirmed:
-                raise typer.Exit(code=1)
-
-        # Apply changes
-        async with LevelPlayAdapter(cred) as adapter:
-            storage = LocalFileStorageAdapter()
-            engine = ConfigEngine(adapter=adapter, storage=storage)
-            _, apply_result = await engine.sync(
-                config, app_keys=app_keys, dry_run=False
-            )
-
-        if output_format == OutputFormat.JSON:
-            result_data = {
-                "diff_report": json.loads(diff_report.model_dump_json()),
-                "apply_result": json.loads(apply_result.model_dump_json()),
-            }
-            typer.echo(json.dumps(result_data, indent=2))
-        else:
-            display_apply_result(apply_result)
+                display_apply_result(apply_result)
 
     asyncio.run(_sync_async())
-
-
-@app.command()
-def snapshot(
-    app_key: Annotated[
-        str | None,
-        typer.Option("--app", help="App key or profile alias to snapshot."),
-    ] = None,
-    output: Annotated[
-        str | None,
-        typer.Option("--output", "-o", help="Output file path (or directory with --all)."),
-    ] = None,
-    all_apps: Annotated[
-        bool,
-        typer.Option("--all", help="Snapshot all portfolio apps (requires --config)."),
-    ] = False,
-    config: Annotated[
-        Path | None,
-        typer.Option("--config", help="Path to YAML tier template (required with --all)."),
-    ] = None,
-) -> None:
-    """Export a YAML snapshot of current mediation groups.
-
-    Use --app for a single app snapshot, or --all with --config for
-    all portfolio apps.
-
-    Exit codes: 0 = success, 2 = error.
-    """
-    # Validate mutual exclusivity
-    if app_key and all_apps:
-        typer.echo("Error: --app and --all are mutually exclusive.", err=True)
-        raise typer.Exit(code=2)
-
-    if not app_key and not all_apps:
-        typer.echo("Error: either --app or --all is required.", err=True)
-        raise typer.Exit(code=2)
-
-    if all_apps and not config:
-        typer.echo("Error: --config is required when using --all.", err=True)
-        raise typer.Exit(code=2)
-
-    cred = _load_credential()
-    resolved_app_key = _resolve_app_key(app_key) if app_key else None
-
-    if all_apps:
-        # --all flow: load template and snapshot each app
-        try:
-            portfolio_config = load_template(config)
-        except (ConfigValidationError, FileNotFoundError) as exc:
-            _handle_template_error(exc)
-
-        output_dir = Path(output) if output else Path(".")
-
-        errors: list[tuple[str, str]] = []
-
-        async def _snapshot_all_async() -> None:
-            async with LevelPlayAdapter(cred) as adapter:
-                storage = LocalFileStorageAdapter()
-                engine = ConfigEngine(adapter=adapter, storage=storage)
-
-                for portfolio_app in portfolio_config.portfolio:
-                    out_path = output_dir / f"{portfolio_app.app_key}_snapshot.yaml"
-                    try:
-                        await engine.snapshot(
-                            portfolio_app.app_key, output_path=str(out_path)
-                        )
-                        display_snapshot_info(
-                            str(out_path), portfolio_app.name
-                        )
-                    except Exception as exc:
-                        errors.append((portfolio_app.app_key, str(exc)))
-                        typer.echo(
-                            f"Error snapshotting {portfolio_app.app_key}: {exc}",
-                            err=True,
-                        )
-
-        asyncio.run(_snapshot_all_async())
-
-        if errors:
-            typer.echo(
-                f"\n{len(errors)} app(s) failed during snapshot.", err=True
-            )
-            raise typer.Exit(code=2)
-    else:
-        # Single app snapshot
-        async def _snapshot_async() -> None:
-            async with LevelPlayAdapter(cred) as adapter:
-                storage = LocalFileStorageAdapter()
-                engine = ConfigEngine(adapter=adapter, storage=storage)
-                await engine.snapshot(resolved_app_key, output_path=output)
-                display_snapshot_info(
-                    output or f"{resolved_app_key}_snapshot.yaml",
-                    resolved_app_key,
-                )
-
-        asyncio.run(_snapshot_async())
 
 
 @app.command()

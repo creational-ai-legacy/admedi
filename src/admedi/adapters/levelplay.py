@@ -412,7 +412,7 @@ class LevelPlayAdapter(MediationAdapter):
         url: str,
         *,
         params: dict[str, str] | None = None,
-        json_body: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | list[Any] | None = None,
         endpoint_key: str = "default",
     ) -> dict[str, Any] | list[Any] | str:
         """Execute an HTTP request with rate limiting, auth, and retry logic.
@@ -792,7 +792,7 @@ class LevelPlayAdapter(MediationAdapter):
         await self._request(
             "POST",
             f"{GROUPS_V4_URL}/{app_key}",
-            json_body=payload,
+            json_body=[payload],
             endpoint_key="groups",
         )
 
@@ -849,12 +849,13 @@ class LevelPlayAdapter(MediationAdapter):
                 "Use AdFormat.REWARDED ('rewarded') for Groups v4 API."
             )
 
-        # PUT uses prefixed field names; adFormat is omitted
+        # PUT v4 uses same field names as GET (not prefixed)
         payload: dict[str, Any] = {
             "groupId": group_id,
+            "adFormat": group.ad_format.value,
             "groupName": group.group_name,
-            "groupCountries": group.countries,
-            "groupPosition": group.position,
+            "countries": group.countries,
+            "position": group.position,
         }
 
         logger.info(
@@ -867,7 +868,7 @@ class LevelPlayAdapter(MediationAdapter):
         await self._request(
             "PUT",
             f"{GROUPS_V4_URL}/{app_key}",
-            json_body=payload,
+            json_body=[payload],
             endpoint_key="groups",
         )
 
