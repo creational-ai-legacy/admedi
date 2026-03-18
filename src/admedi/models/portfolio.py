@@ -123,6 +123,12 @@ class PortfolioTier(BaseModel):
 class PortfolioConfig(BaseModel):
     """Full parsed and validated tier template for a portfolio.
 
+    .. deprecated::
+        No longer exported from ``admedi.engine`` or imported by production
+        code.  Retained in source for reference only.  The three-layer
+        settings architecture (profiles + tiers.yaml + countries.yaml)
+        replaces the monolithic template that this model represented.
+
     This is the top-level model that the Loader produces from YAML and
     the Differ consumes to compare against live API state. Model validators
     enforce structural integrity across tiers, formats, and mediator

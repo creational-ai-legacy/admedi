@@ -1,4 +1,4 @@
-"""Tests for unified snapshot functions (save_raw_snapshot, load_snapshot, SnapshotData).
+"""Tests for snapshot functions (save_raw_snapshot, load_snapshot, generate_app_settings).
 
 Covers:
 - Step 1: save_raw_snapshot
@@ -27,20 +27,28 @@ Covers:
   - Round-trip with empty groups
   - Round-trip with multiple ad formats
 
-- Step 3: Unified show command and display updates
-  - CLI show command produces both snapshots/ and settings/ files
-  - display_show() with both paths shows both in footer
-  - display_show() with only snapshot_path shows only snapshot path
-  - display_show() with only settings_path shows only settings path
-  - display_show() with neither path shows no footer paths
+- Step 3: Display updates
+  - display_pull() with both paths shows both in footer
+  - display_pull() with only snapshot_path shows only snapshot path
+  - display_pull() with only settings_path shows only settings path
+  - display_pull() with neither path shows no footer paths
   - Empty-groups path also shows both paths when provided
-  - --output flag affects only settings filename, not snapshot filename
 
 - Step 4: Legacy code removal verification
   - generate_snapshot is no longer importable from admedi.engine or admedi.engine.snapshot
   - display_snapshot_info is no longer importable from admedi.cli.display
   - ConfigEngine no longer has a snapshot attribute
   - snapshot subcommand is not listed in CLI help output
+
+- Step 6: generate_app_settings and country matching
+  - Country matching: exact set match, catch-all match, auto-create
+  - Per-app settings generation in new format (alias + format -> tier list)
+  - Bootstrap: fresh portfolio creates countries.yaml, tiers.yaml, per-app settings
+  - Existing shared files reused when all groups match
+  - New entries appended to existing shared files
+  - Auto-naming: single country -> code, multi-country -> lowercased hyphenated name
+  - Public helpers: extract_network_presets, waterfall_signature, write_yaml_file
+  - Removed functions: save_modular_snapshot, _extract_tiers, _build_app_yaml, _build_network_lookup
 """
 
 from __future__ import annotations
@@ -54,14 +62,17 @@ from rich.console import Console
 from ruamel.yaml import YAML
 from typer.testing import CliRunner
 
-from admedi.cli.display import display_show
+from admedi.cli.display import display_pull
 from admedi.cli.main import app as cli_app
+from admedi.engine.loader import Profile, resolve_app_tiers
 from admedi.engine.snapshot import (
     SnapshotData,
-    _extract_tiers,
+    extract_network_presets,
+    generate_app_settings,
     load_snapshot,
-    save_modular_snapshot,
     save_raw_snapshot,
+    waterfall_signature,
+    write_yaml_file,
 )
 from admedi.models.app import App
 from admedi.models.enums import AdFormat, Mediator, Platform
@@ -237,7 +248,7 @@ class TestSaveRawSnapshotHeader:
     def test_header_contains_captured_by(
         self, tmp_path: Path, group_banner: Group
     ) -> None:
-        """YAML header contains '# Captured by admedi show'."""
+        """YAML header contains '# Captured by admedi pull'."""
         content = self._read_raw(
             tmp_path,
             groups=[group_banner],
@@ -245,7 +256,7 @@ class TestSaveRawSnapshotHeader:
             app_name="Test App",
             alias="test",
         )
-        assert "# Captured by admedi show" in content
+        assert "# Captured by admedi pull" in content
 
     def test_header_contains_app_info(
         self, tmp_path: Path, group_banner: Group
@@ -1015,21 +1026,21 @@ runner = CliRunner()
 
 
 # ---------------------------------------------------------------------------
-# Tests: display_show() footer with both paths
+# Tests: display_pull() footer with both paths
 # ---------------------------------------------------------------------------
 
 
-class TestDisplayShowBothPaths:
-    """Tests for display_show() rendering both snapshot and settings paths."""
+class TestDisplayPullBothPaths:
+    """Tests for display_pull() rendering both snapshot and settings paths."""
 
     def test_both_paths_shown_in_footer(
         self, group_banner: Group
     ) -> None:
-        """display_show() with both paths shows both in footer output."""
+        """display_pull() with both paths shows both in footer output."""
         console, buf = _make_console()
         app = _make_app()
 
-        display_show(
+        display_pull(
             app, [group_banner],
             snapshot_path="snapshots/ss-ios.yaml",
             settings_path="settings/ss-ios.yaml",
@@ -1045,11 +1056,11 @@ class TestDisplayShowBothPaths:
     def test_only_snapshot_path(
         self, group_banner: Group
     ) -> None:
-        """display_show() with only snapshot_path shows only snapshot path."""
+        """display_pull() with only snapshot_path shows only snapshot path."""
         console, buf = _make_console()
         app = _make_app()
 
-        display_show(
+        display_pull(
             app, [group_banner],
             snapshot_path="snapshots/ss-ios.yaml",
             console=console,
@@ -1063,11 +1074,11 @@ class TestDisplayShowBothPaths:
     def test_only_settings_path(
         self, group_banner: Group
     ) -> None:
-        """display_show() with only settings_path shows only settings path."""
+        """display_pull() with only settings_path shows only settings path."""
         console, buf = _make_console()
         app = _make_app()
 
-        display_show(
+        display_pull(
             app, [group_banner],
             settings_path="settings/ss-ios.yaml",
             console=console,
@@ -1081,11 +1092,11 @@ class TestDisplayShowBothPaths:
     def test_neither_path(
         self, group_banner: Group
     ) -> None:
-        """display_show() with neither path shows no footer paths."""
+        """display_pull() with neither path shows no footer paths."""
         console, buf = _make_console()
         app = _make_app()
 
-        display_show(
+        display_pull(
             app, [group_banner],
             console=console,
         )
@@ -1096,19 +1107,19 @@ class TestDisplayShowBothPaths:
 
 
 # ---------------------------------------------------------------------------
-# Tests: display_show() empty-groups path with both paths
+# Tests: display_pull() empty-groups path with both paths
 # ---------------------------------------------------------------------------
 
 
-class TestDisplayShowEmptyGroupsPaths:
-    """Tests for display_show() empty-groups path showing both paths."""
+class TestDisplayPullEmptyGroupsPaths:
+    """Tests for display_pull() empty-groups path showing both paths."""
 
     def test_empty_groups_both_paths(self) -> None:
         """Empty-groups path shows both paths when provided."""
         console, buf = _make_console()
         app = _make_app()
 
-        display_show(
+        display_pull(
             app, [],
             snapshot_path="snapshots/ss-ios.yaml",
             settings_path="settings/ss-ios.yaml",
@@ -1127,235 +1138,12 @@ class TestDisplayShowEmptyGroupsPaths:
         console, buf = _make_console()
         app = _make_app()
 
-        display_show(app, [], console=console)
+        display_pull(app, [], console=console)
         output = buf.getvalue()
 
         assert "No mediation groups configured" in output
         assert "Snapshot saved to:" not in output
         assert "Settings saved to:" not in output
-
-
-# ---------------------------------------------------------------------------
-# Tests: CLI show command produces both files
-# ---------------------------------------------------------------------------
-
-
-class TestShowCommandDualOutput:
-    """Tests for CLI show command producing both snapshot and settings files."""
-
-    @patch("admedi.cli.main.LevelPlayAdapter")
-    @patch("admedi.cli.main.load_credential_from_env")
-    def test_show_produces_both_files(
-        self,
-        mock_load_cred: MagicMock,
-        mock_adapter_cls: MagicMock,
-        tmp_path: Path,
-        group_banner: Group,
-    ) -> None:
-        """CLI show command produces both snapshots/{alias}.yaml and settings/{alias}.yaml."""
-        mock_load_cred.return_value = _mock_credential()
-
-        test_app = _make_app()
-        mock_adapter = AsyncMock()
-        mock_adapter.list_apps = AsyncMock(return_value=[test_app])
-        mock_adapter.get_groups = AsyncMock(return_value=[group_banner])
-        mock_adapter_cls.return_value.__aenter__ = AsyncMock(
-            return_value=mock_adapter
-        )
-        mock_adapter_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-
-        # Patch at the source module (imports are local inside _show_async)
-        with (
-            patch(
-                "admedi.engine.snapshot.save_raw_snapshot",
-                wraps=save_raw_snapshot,
-            ) as mock_raw,
-            patch(
-                "admedi.engine.snapshot.save_modular_snapshot",
-            ) as mock_modular,
-        ):
-            # Redirect saves to tmp_path
-            mock_raw.side_effect = lambda *args, **kwargs: save_raw_snapshot(
-                *args, **{**kwargs, "snapshots_dir": str(tmp_path / "snapshots")}
-            )
-            mock_modular.return_value = (str(tmp_path / "settings" / "abc123.yaml"), [])
-
-            result = runner.invoke(cli_app, ["show", "--app", "abc123"])
-
-        assert result.exit_code == 0
-        mock_raw.assert_called_once()
-        mock_modular.assert_called_once()
-
-    @patch("admedi.cli.main.LevelPlayAdapter")
-    @patch("admedi.cli.main.load_credential_from_env")
-    def test_show_output_flag_affects_only_settings(
-        self,
-        mock_load_cred: MagicMock,
-        mock_adapter_cls: MagicMock,
-        tmp_path: Path,
-        group_banner: Group,
-    ) -> None:
-        """--output flag affects only settings filename, not snapshot filename."""
-        mock_load_cred.return_value = _mock_credential()
-
-        test_app = _make_app()
-        mock_adapter = AsyncMock()
-        mock_adapter.list_apps = AsyncMock(return_value=[test_app])
-        mock_adapter.get_groups = AsyncMock(return_value=[group_banner])
-        mock_adapter_cls.return_value.__aenter__ = AsyncMock(
-            return_value=mock_adapter
-        )
-        mock_adapter_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-
-        raw_calls: list[dict] = []
-        modular_calls: list[dict] = []
-
-        def capture_raw(*args, **kwargs):
-            raw_calls.append(kwargs)
-            return str(tmp_path / "snapshots" / "abc123.yaml")
-
-        def capture_modular(*args, **kwargs):
-            modular_calls.append(kwargs)
-            return (str(tmp_path / "settings" / "custom-output.yaml"), [])
-
-        with (
-            patch("admedi.engine.snapshot.save_raw_snapshot", side_effect=capture_raw),
-            patch("admedi.engine.snapshot.save_modular_snapshot", side_effect=capture_modular),
-        ):
-            result = runner.invoke(
-                cli_app, ["show", "--app", "abc123", "--output", "custom-output.yaml"]
-            )
-
-        assert result.exit_code == 0
-
-        # Raw snapshot uses alias (abc123), NOT the --output value
-        assert raw_calls[0]["alias"] == "abc123"
-
-        # Modular settings uses the --output value
-        assert modular_calls[0]["app_file"] == "custom-output.yaml"
-
-    @patch("admedi.cli.main.LevelPlayAdapter")
-    @patch("admedi.cli.main.load_credential_from_env")
-    def test_show_with_profile_alias(
-        self,
-        mock_load_cred: MagicMock,
-        mock_adapter_cls: MagicMock,
-        tmp_path: Path,
-        group_banner: Group,
-    ) -> None:
-        """show command uses profile alias for both snapshot and settings filenames."""
-        mock_load_cred.return_value = _mock_credential()
-
-        test_app = _make_app()
-        mock_adapter = AsyncMock()
-        mock_adapter.list_apps = AsyncMock(return_value=[test_app])
-        mock_adapter.get_groups = AsyncMock(return_value=[group_banner])
-        mock_adapter_cls.return_value.__aenter__ = AsyncMock(
-            return_value=mock_adapter
-        )
-        mock_adapter_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-
-        raw_calls: list[dict] = []
-        modular_calls: list[dict] = []
-
-        def capture_raw(*args, **kwargs):
-            raw_calls.append(kwargs)
-            return str(tmp_path / "snapshots" / "ss-ios.yaml")
-
-        def capture_modular(*args, **kwargs):
-            modular_calls.append(kwargs)
-            return (str(tmp_path / "settings" / "ss-ios.yaml"), [])
-
-        with (
-            patch("admedi.engine.snapshot.save_raw_snapshot", side_effect=capture_raw),
-            patch("admedi.engine.snapshot.save_modular_snapshot", side_effect=capture_modular),
-            patch("admedi.cli.main._resolve_app_key", return_value="abc123"),
-        ):
-            result = runner.invoke(cli_app, ["show", "--app", "ss-ios"])
-
-        assert result.exit_code == 0
-
-        # Both use the alias "ss-ios" (not the resolved key "abc123")
-        assert raw_calls[0]["alias"] == "ss-ios"
-        assert modular_calls[0]["app_file"] == "ss-ios.yaml"
-
-    @patch("admedi.cli.main.LevelPlayAdapter")
-    @patch("admedi.cli.main.load_credential_from_env")
-    def test_show_displays_warnings_when_present(
-        self,
-        mock_load_cred: MagicMock,
-        mock_adapter_cls: MagicMock,
-        tmp_path: Path,
-        group_banner: Group,
-    ) -> None:
-        """show command displays tier warnings when save_modular_snapshot returns them."""
-        mock_load_cred.return_value = _mock_credential()
-
-        test_app = _make_app()
-        mock_adapter = AsyncMock()
-        mock_adapter.list_apps = AsyncMock(return_value=[test_app])
-        mock_adapter.get_groups = AsyncMock(return_value=[group_banner])
-        mock_adapter_cls.return_value.__aenter__ = AsyncMock(
-            return_value=mock_adapter
-        )
-        mock_adapter_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-
-        warning_text = (
-            "Tier 'Tier 2': countries differ across formats "
-            "(interstitial: [AU, NL], rewarded: [AU, NZ]) -- merged to union [AU, NL, NZ]"
-        )
-
-        with (
-            patch(
-                "admedi.engine.snapshot.save_raw_snapshot",
-                return_value=str(tmp_path / "snapshots" / "abc123.yaml"),
-            ),
-            patch(
-                "admedi.engine.snapshot.save_modular_snapshot",
-                return_value=(str(tmp_path / "settings" / "abc123.yaml"), [warning_text]),
-            ),
-        ):
-            result = runner.invoke(cli_app, ["show", "--app", "abc123"])
-
-        assert result.exit_code == 0
-        assert "Tier 2" in result.output
-        assert "countries differ" in result.output
-
-    @patch("admedi.cli.main.LevelPlayAdapter")
-    @patch("admedi.cli.main.load_credential_from_env")
-    def test_show_no_warnings_when_empty(
-        self,
-        mock_load_cred: MagicMock,
-        mock_adapter_cls: MagicMock,
-        tmp_path: Path,
-        group_banner: Group,
-    ) -> None:
-        """show command produces no warning panel when warnings list is empty."""
-        mock_load_cred.return_value = _mock_credential()
-
-        test_app = _make_app()
-        mock_adapter = AsyncMock()
-        mock_adapter.list_apps = AsyncMock(return_value=[test_app])
-        mock_adapter.get_groups = AsyncMock(return_value=[group_banner])
-        mock_adapter_cls.return_value.__aenter__ = AsyncMock(
-            return_value=mock_adapter
-        )
-        mock_adapter_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-
-        with (
-            patch(
-                "admedi.engine.snapshot.save_raw_snapshot",
-                return_value=str(tmp_path / "snapshots" / "abc123.yaml"),
-            ),
-            patch(
-                "admedi.engine.snapshot.save_modular_snapshot",
-                return_value=(str(tmp_path / "settings" / "abc123.yaml"), []),
-            ),
-        ):
-            result = runner.invoke(cli_app, ["show", "--app", "abc123"])
-
-        assert result.exit_code == 0
-        assert "Tier Warnings" not in result.output
 
 
 # ===========================================================================
@@ -1398,526 +1186,905 @@ class TestLegacyCodeRemoved:
 
 
 # ===========================================================================
-# Step 5: Per-app tiers and networks files
+# Step 6: Removed functions verification
 # ===========================================================================
 
 
-class TestPerAppTiersAndNetworks:
-    """Verify save_modular_snapshot writes per-app tiers/networks files."""
+class TestRemovedFunctions:
+    """Verify that save_modular_snapshot, _extract_tiers, _build_app_yaml, _build_network_lookup are removed."""
 
-    def test_per_app_tiers_file(
-        self, tmp_path: Path, group_banner: Group
+    def test_save_modular_snapshot_removed(self) -> None:
+        """save_modular_snapshot is no longer in snapshot module."""
+        import admedi.engine.snapshot as snap_mod
+
+        assert not hasattr(snap_mod, "save_modular_snapshot")
+
+    def test_extract_tiers_removed(self) -> None:
+        """_extract_tiers is no longer in snapshot module."""
+        import admedi.engine.snapshot as snap_mod
+
+        assert not hasattr(snap_mod, "_extract_tiers")
+
+    def test_build_app_yaml_removed(self) -> None:
+        """_build_app_yaml is no longer in snapshot module."""
+        import admedi.engine.snapshot as snap_mod
+
+        assert not hasattr(snap_mod, "_build_app_yaml")
+
+    def test_build_network_lookup_removed(self) -> None:
+        """_build_network_lookup is no longer in snapshot module."""
+        import admedi.engine.snapshot as snap_mod
+
+        assert not hasattr(snap_mod, "_build_network_lookup")
+
+
+# ===========================================================================
+# Step 6: Public helper tests (renamed from private)
+# ===========================================================================
+
+
+class TestWaterfallSignature:
+    """Verify waterfall_signature() is public and produces correct signatures."""
+
+    def test_importable(self) -> None:
+        """waterfall_signature is importable from snapshot module."""
+        from admedi.engine.snapshot import waterfall_signature as ws
+        assert callable(ws)
+
+    def test_signature_for_bidders_only(self, group_banner: Group) -> None:
+        """Groups with only bidders produce a tuple of (sorted_bidders, empty_manuals)."""
+        sig = waterfall_signature(group_banner)
+        assert isinstance(sig, tuple)
+        assert len(sig) == 2
+        bidders, manuals = sig
+        assert bidders == ("UnityAds", "ironSource")
+        assert manuals == ()
+
+    def test_signature_for_mixed_group(
+        self, group_interstitial_with_rates: Group
     ) -> None:
-        """Tiers written to {alias_stem}-tiers.yaml, not shared tiers.yaml."""
-        save_modular_snapshot(
-            [group_banner],
-            app_key="abc123",
-            app_name="Test App",
-            app_file="ss-ios.yaml",
-            settings_dir=str(tmp_path),
+        """Groups with both bidders and manuals produce correct signature."""
+        sig = waterfall_signature(group_interstitial_with_rates)
+        bidders, manuals = sig
+        assert bidders == ("Meta",)
+        assert manuals == (("AppLovin", 1.0),)
+
+
+class TestExtractNetworkPresets:
+    """Verify extract_network_presets() is public and works correctly."""
+
+    def test_importable(self) -> None:
+        """extract_network_presets is importable from snapshot module."""
+        from admedi.engine.snapshot import extract_network_presets as enp
+        assert callable(enp)
+
+    def test_extracts_unique_presets(self, group_banner: Group) -> None:
+        """Extracts unique network presets from groups."""
+        presets = extract_network_presets([group_banner])
+        assert isinstance(presets, dict)
+        assert len(presets) >= 1
+
+    def test_empty_groups_returns_empty_dict(self) -> None:
+        """Empty groups list returns empty presets dict."""
+        presets = extract_network_presets([])
+        assert presets == {}
+
+    def test_deduplicates_same_waterfall(self) -> None:
+        """Two groups with identical waterfalls produce one preset entry."""
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+                "instances": [
+                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
+                ],
+            }),
+            Group.model_validate({
+                "groupName": "Tier 2",
+                "adFormat": "interstitial",
+                "countries": ["GB"],
+                "position": 2,
+                "instances": [
+                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
+                ],
+            }),
+        ]
+        presets = extract_network_presets(groups)
+        assert len(presets) == 1
+
+
+class TestWriteYamlFile:
+    """Verify write_yaml_file() is public and writes correctly."""
+
+    def test_importable(self) -> None:
+        """write_yaml_file is importable from snapshot module."""
+        from admedi.engine.snapshot import write_yaml_file as wyf
+        assert callable(wyf)
+
+    def test_writes_file_with_header(self, tmp_path: Path) -> None:
+        """write_yaml_file writes a file with the header prepended."""
+        path = tmp_path / "test.yaml"
+        write_yaml_file(
+            path,
+            {"entry1": [{"key": "value"}]},
+            header="# Test header\n\n",
+        )
+        content = path.read_text()
+        assert content.startswith("# Test header")
+
+    def test_writes_under_root_key(self, tmp_path: Path) -> None:
+        """Data is written under the specified root key."""
+        path = tmp_path / "test.yaml"
+        write_yaml_file(
+            path,
+            {"entry1": [{"key": "value"}]},
+            header="# Test\n\n",
+            root_key="custom",
+        )
+        yaml = YAML()
+        data = yaml.load(path)
+        assert "custom" in data
+
+
+# ===========================================================================
+# Step 6: generate_app_settings tests
+# ===========================================================================
+
+
+def _make_profile(**overrides) -> Profile:
+    """Create a test Profile with defaults."""
+    defaults = {
+        "alias": "hexar-ios",
+        "app_key": "676996cd",
+        "app_name": "Hexar.io iOS",
+        "platform": Platform.IOS,
+    }
+    defaults.update(overrides)
+    return Profile(**defaults)
+
+
+def _write_shared_files(
+    project_root: Path,
+    countries: dict[str, list[str]] | None = None,
+    tiers: dict[str, str] | None = None,
+) -> None:
+    """Write countries.yaml to the project root.
+
+    Note: tiers parameter is accepted but ignored (legacy compat).
+    """
+    yaml = YAML()
+    yaml.default_flow_style = False
+
+    if countries is not None:
+        stream = StringIO()
+        yaml.dump(dict(countries), stream)
+        (project_root / "countries.yaml").write_text(
+            "# countries\n\n" + stream.getvalue(), encoding="utf-8"
         )
 
-        assert (tmp_path / "ss-ios-tiers.yaml").exists()
+
+class TestGenerateAppSettingsBootstrap:
+    """Verify generate_app_settings() bootstraps from scratch on fresh portfolio."""
+
+    def test_creates_countries_yaml_on_bootstrap(self, tmp_path: Path) -> None:
+        """Bootstrap creates countries.yaml when it doesn't exist."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        assert (tmp_path / "countries.yaml").exists()
+
+    def test_no_tiers_yaml_on_bootstrap(self, tmp_path: Path) -> None:
+        """Bootstrap does NOT create tiers.yaml (eliminated)."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
         assert not (tmp_path / "tiers.yaml").exists()
 
-    def test_per_app_networks_file(
-        self, tmp_path: Path, group_banner: Group
-    ) -> None:
-        """Networks written to {alias_stem}-networks.yaml, not shared networks.yaml."""
-        save_modular_snapshot(
-            [group_banner],
-            app_key="abc123",
-            app_name="Test App",
-            app_file="ss-ios.yaml",
-            settings_dir=str(tmp_path),
-        )
+    def test_creates_per_app_settings_on_bootstrap(self, tmp_path: Path) -> None:
+        """Bootstrap creates settings/{alias}.yaml."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
 
-        assert (tmp_path / "ss-ios-networks.yaml").exists()
-        assert not (tmp_path / "networks.yaml").exists()
-
-    def test_no_shared_files_created(
-        self, tmp_path: Path, group_banner: Group
-    ) -> None:
-        """Neither shared tiers.yaml nor networks.yaml is created."""
-        save_modular_snapshot(
-            [group_banner],
-            app_key="abc123",
-            app_name="Test App",
-            app_file="hexar-ios.yaml",
-            settings_dir=str(tmp_path),
-        )
-
-        assert not (tmp_path / "tiers.yaml").exists()
-        assert not (tmp_path / "networks.yaml").exists()
-
-    def test_two_apps_produce_independent_files(
-        self, tmp_path: Path
-    ) -> None:
-        """Two apps with different tiers produce independent files."""
-        # App 1: Shelf Sort with Tier 1 = US, Tier 2 = AU, CA, DE, GB, JP, KR, NL, TW
-        groups_ss = [
-            Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "interstitial",
-                "countries": ["US"],
-                "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-            Group.model_validate({
-                "groupName": "Tier 2",
-                "adFormat": "interstitial",
-                "countries": ["AU", "CA", "DE", "GB", "JP", "KR", "NL", "TW"],
-                "position": 2,
-                "instances": [
-                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-        ]
-
-        # App 2: Hexar with Tier 1 = US, Tier 2 = AU, CA, DE, GB, JP, NZ
-        groups_hexar = [
-            Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "interstitial",
-                "countries": ["US"],
-                "position": 1,
-                "instances": [
-                    {"id": 3, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-            Group.model_validate({
-                "groupName": "Tier 2",
-                "adFormat": "interstitial",
-                "countries": ["AU", "CA", "DE", "GB", "JP", "NZ"],
-                "position": 2,
-                "instances": [
-                    {"id": 4, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-        ]
-
-        save_modular_snapshot(
-            groups_ss,
-            app_key="ss123",
-            app_name="Shelf Sort",
-            app_file="ss-ios.yaml",
-            settings_dir=str(tmp_path),
-        )
-        save_modular_snapshot(
-            groups_hexar,
-            app_key="hex123",
-            app_name="Hexar",
-            app_file="hexar-ios.yaml",
-            settings_dir=str(tmp_path),
-        )
-
-        yaml = YAML()
-
-        # Shelf Sort tiers preserved
-        ss_tiers = yaml.load(tmp_path / "ss-ios-tiers.yaml")
-        assert ss_tiers["tiers"]["Tier 2"]["countries"] == [
-            "AU", "CA", "DE", "GB", "JP", "KR", "NL", "TW"
-        ]
-        assert ss_tiers["tiers"]["Tier 2"]["formats"] == ["interstitial"]
-
-        # Hexar tiers preserved independently
-        hexar_tiers = yaml.load(tmp_path / "hexar-ios-tiers.yaml")
-        assert hexar_tiers["tiers"]["Tier 2"]["countries"] == [
-            "AU", "CA", "DE", "GB", "JP", "NZ"
-        ]
-        assert hexar_tiers["tiers"]["Tier 2"]["formats"] == ["interstitial"]
-
-    def test_tiers_file_content_structure(
-        self, tmp_path: Path, group_interstitial_with_rates: Group
-    ) -> None:
-        """Per-app tiers file has correct YAML structure with header and formats."""
-        save_modular_snapshot(
-            [group_interstitial_with_rates],
-            app_key="abc123",
-            app_name="Test App",
-            app_file="ss-google.yaml",
-            settings_dir=str(tmp_path),
-        )
-
-        content = (tmp_path / "ss-google-tiers.yaml").read_text()
-        assert content.startswith("# Admedi tier definitions")
-
-        yaml = YAML()
-        data = yaml.load(tmp_path / "ss-google-tiers.yaml")
-        assert "tiers" in data
-        assert "Tier 1" in data["tiers"]
-        assert data["tiers"]["Tier 1"]["countries"] == ["US"]
-        assert data["tiers"]["Tier 1"]["formats"] == ["interstitial"]
-
-    def test_networks_file_content_structure(
-        self, tmp_path: Path, group_interstitial_with_rates: Group
-    ) -> None:
-        """Per-app networks file has correct YAML structure with header."""
-        save_modular_snapshot(
-            [group_interstitial_with_rates],
-            app_key="abc123",
-            app_name="Test App",
-            app_file="ss-google.yaml",
-            settings_dir=str(tmp_path),
-        )
-
-        content = (tmp_path / "ss-google-networks.yaml").read_text()
-        assert content.startswith("# Admedi network presets")
-
-        yaml = YAML()
-        data = yaml.load(tmp_path / "ss-google-networks.yaml")
-        assert "presets" in data
-
-    def test_overwrite_on_second_call(
-        self, tmp_path: Path
-    ) -> None:
-        """Second call overwrites per-app file (no stale merge)."""
-        groups_v1 = [
-            Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "interstitial",
-                "countries": ["US"],
-                "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-            Group.model_validate({
-                "groupName": "Tier 2",
-                "adFormat": "interstitial",
-                "countries": ["AU", "CA"],
-                "position": 2,
-                "instances": [
-                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-        ]
-        groups_v2 = [
-            Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "interstitial",
-                "countries": ["US", "GB"],
-                "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-        ]
-
-        save_modular_snapshot(
-            groups_v1,
-            app_key="abc123",
-            app_name="Test",
-            app_file="ss-ios.yaml",
-            settings_dir=str(tmp_path),
-        )
-        save_modular_snapshot(
-            groups_v2,
-            app_key="abc123",
-            app_name="Test",
-            app_file="ss-ios.yaml",
-            settings_dir=str(tmp_path),
-        )
-
-        yaml = YAML()
-        tiers = yaml.load(tmp_path / "ss-ios-tiers.yaml")
-
-        # Only Tier 1 from v2 — Tier 2 from v1 is gone (overwritten, not merged)
-        assert "Tier 1" in tiers["tiers"]
-        assert "Tier 2" not in tiers["tiers"]
-        assert tiers["tiers"]["Tier 1"]["countries"] == ["US", "GB"]
-        assert tiers["tiers"]["Tier 1"]["formats"] == ["interstitial"]
-
-
-# ---------------------------------------------------------------------------
-# Tests: _extract_tiers formats field and default-tier ordering
-# ---------------------------------------------------------------------------
-
-
-class TestExtractTiersFormats:
-    """Verify _extract_tiers() includes formats field and sorts default tiers last."""
-
-    def test_single_format_tier_has_single_element_formats_list(
-        self, tmp_path: Path
-    ) -> None:
-        """A tier appearing in only one format has a single-element formats list."""
-        groups = [
-            Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "banner",
-                "countries": ["US"],
-                "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-        ]
-        save_modular_snapshot(
-            groups,
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
-        )
-
-        yaml = YAML()
-        data = yaml.load(tmp_path / "test-tiers.yaml")
-        assert data["tiers"]["Tier 1"]["formats"] == ["banner"]
-
-    def test_multi_format_tier_collects_all_formats(
-        self, tmp_path: Path
-    ) -> None:
-        """A tier shared across interstitial and rewarded has both formats listed."""
         groups = [
             Group.model_validate({
                 "groupName": "Tier 1",
                 "adFormat": "interstitial",
                 "countries": ["US"],
                 "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-            Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "rewarded",
-                "countries": ["US"],
-                "position": 1,
-                "instances": [
-                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
             }),
         ]
-        save_modular_snapshot(
-            groups,
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
+        profile = _make_profile()
+
+        path, _messages = generate_app_settings(
+            groups, profile, settings_dir=str(settings_dir)
         )
 
-        yaml = YAML()
-        data = yaml.load(tmp_path / "test-tiers.yaml")
-        assert data["tiers"]["Tier 1"]["formats"] == ["interstitial", "rewarded"]
+        assert Path(path).exists()
+        assert "hexar-ios.yaml" in path
 
-    def test_three_format_tier_sorted_alphabetically(
-        self, tmp_path: Path
-    ) -> None:
-        """Formats list is sorted alphabetically regardless of group order."""
+    def test_bootstrap_single_country_group_name(self, tmp_path: Path) -> None:
+        """Auto-naming: single country -> country code (e.g., 'US')."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
         groups = [
-            Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "rewarded",
-                "countries": ["US"],
-                "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-            Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "banner",
-                "countries": ["US"],
-                "position": 1,
-                "instances": [
-                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
             Group.model_validate({
                 "groupName": "Tier 1",
                 "adFormat": "interstitial",
                 "countries": ["US"],
                 "position": 1,
-                "instances": [
-                    {"id": 3, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
             }),
         ]
-        save_modular_snapshot(
-            groups,
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
-        )
+        profile = _make_profile()
 
-        yaml = YAML()
-        data = yaml.load(tmp_path / "test-tiers.yaml")
-        assert data["tiers"]["Tier 1"]["formats"] == [
-            "banner", "interstitial", "rewarded"
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml = YAML(typ="safe")
+        countries = yaml.load(tmp_path / "countries.yaml")
+        assert "US" in countries
+
+    def test_bootstrap_multi_country_group_name(self, tmp_path: Path) -> None:
+        """Auto-naming: multi-country -> lowercased hyphenated group name."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 2",
+                "adFormat": "interstitial",
+                "countries": ["AU", "CA", "DE"],
+                "position": 1,
+            }),
         ]
+        profile = _make_profile()
 
-    def test_default_tier_sorted_last(
-        self, tmp_path: Path
-    ) -> None:
-        """Default tier (with '*' in countries) appears last in dict."""
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml = YAML(typ="safe")
+        countries = yaml.load(tmp_path / "countries.yaml")
+        assert "tier-2" in countries
+        assert sorted(countries["tier-2"]) == ["AU", "CA", "DE"]
+
+    def test_bootstrap_catch_all_group(self, tmp_path: Path) -> None:
+        """Bootstrap: catch-all group with ['*'] creates per-app entry with '*' ref."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
         groups = [
             Group.model_validate({
                 "groupName": "All Countries",
-                "adFormat": "banner",
+                "adFormat": "interstitial",
                 "countries": ["*"],
                 "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-            Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "banner",
-                "countries": ["US"],
-                "position": 2,
-                "instances": [
-                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
             }),
         ]
-        save_modular_snapshot(
-            groups,
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml = YAML(typ="safe")
+        app_data = yaml.load(settings_dir / "hexar-ios.yaml")
+        # Catch-all entry is {display_name: '*'}
+        assert len(app_data["interstitial"]) == 1
+        entry = app_data["interstitial"][0]
+        assert entry["All Countries"] == "*"
+
+    def test_bootstrap_returns_info_messages(self, tmp_path: Path) -> None:
+        """Bootstrap returns info messages about created country groups."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+        ]
+        profile = _make_profile()
+
+        _path, messages = generate_app_settings(
+            groups, profile, settings_dir=str(settings_dir)
         )
 
-        yaml = YAML()
-        data = yaml.load(tmp_path / "test-tiers.yaml")
-        tier_names = list(data["tiers"].keys())
-        assert tier_names[-1] == "All Countries"
-        assert tier_names[0] == "Tier 1"
+        assert len(messages) > 0
+        assert "Created" in messages[0]
+        assert "US" in messages[0]  # country group name for single-country
 
-    def test_default_tier_last_with_multiple_regular_tiers(
-        self, tmp_path: Path
-    ) -> None:
-        """Default tier is last even when there are multiple non-default tiers."""
+    def test_bootstrap_with_empty_groups(self, tmp_path: Path) -> None:
+        """Bootstrap with empty groups creates empty countries.yaml."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        profile = _make_profile()
+
+        path, messages = generate_app_settings([], profile, settings_dir=str(settings_dir))
+
+        assert Path(path).exists()
+        assert (tmp_path / "countries.yaml").exists()
+        assert not (tmp_path / "tiers.yaml").exists()
+        assert messages == []
+
+
+class TestGenerateAppSettingsCountryMatching:
+    """Verify country matching algorithm: exact set match, catch-all, auto-create."""
+
+    def test_exact_set_match_reuses_existing_group(self, tmp_path: Path) -> None:
+        """Group with country set matching existing group uses that group ref."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        _write_shared_files(
+            tmp_path,
+            countries={"US": ["US"]},
+        )
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+        ]
+        profile = _make_profile()
+
+        _path, messages = generate_app_settings(
+            groups, profile, settings_dir=str(settings_dir)
+        )
+
+        # No new entries created -- exact match
+        assert len(messages) == 0
+
+        # Per-app settings references the existing group
+        yaml = YAML(typ="safe")
+        app_data = yaml.load(settings_dir / "hexar-ios.yaml")
+        assert app_data["interstitial"] == [{"Tier 1": "US"}]
+
+    def test_set_match_is_order_independent(self, tmp_path: Path) -> None:
+        """Country order doesn't matter — set comparison matches regardless."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        # countries.yaml has alphabetical order
+        _write_shared_files(
+            tmp_path,
+            countries={"high-value": ["AU", "CA", "DE", "GB"]},
+        )
+
+        # Live group returns countries in reverse order
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 2",
+                "adFormat": "interstitial",
+                "countries": ["GB", "DE", "CA", "AU"],
+                "position": 1,
+            }),
+        ]
+        profile = _make_profile()
+
+        _path, messages = generate_app_settings(
+            groups, profile, settings_dir=str(settings_dir)
+        )
+
+        # Matched existing group despite different order — no new group created
+        assert len(messages) == 0
+
+        yaml = YAML(typ="safe")
+        app_data = yaml.load(settings_dir / "hexar-ios.yaml")
+        assert app_data["interstitial"] == [{"Tier 2": "high-value"}]
+
+    def test_catch_all_uses_star_ref(self, tmp_path: Path) -> None:
+        """Group with ['*'] gets '*' as group ref."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        _write_shared_files(
+            tmp_path,
+            countries={"US": ["US"]},
+        )
+
         groups = [
             Group.model_validate({
                 "groupName": "Default",
                 "adFormat": "interstitial",
                 "countries": ["*"],
                 "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
             }),
+        ]
+        profile = _make_profile()
+
+        _path, messages = generate_app_settings(
+            groups, profile, settings_dir=str(settings_dir)
+        )
+
+        # Catch-all is not a "created" entry -- just returns '*'
+        assert len(messages) == 0
+
+        yaml = YAML(typ="safe")
+        app_data = yaml.load(settings_dir / "hexar-ios.yaml")
+        assert app_data["interstitial"] == [{"Default": "*"}]
+
+    def test_no_match_auto_creates_country_group(self, tmp_path: Path) -> None:
+        """Group with unknown country set triggers auto-create of country group."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        _write_shared_files(
+            tmp_path,
+            countries={"US": ["US"]},
+        )
+
+        groups = [
             Group.model_validate({
                 "groupName": "Tier 1",
                 "adFormat": "interstitial",
                 "countries": ["US"],
+                "position": 1,
+            }),
+            Group.model_validate({
+                "groupName": "Tier 2",
+                "adFormat": "interstitial",
+                "countries": ["AU", "CA", "DE"],
                 "position": 2,
-                "instances": [
-                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
+            }),
+        ]
+        profile = _make_profile()
+
+        _path, messages = generate_app_settings(
+            groups, profile, settings_dir=str(settings_dir)
+        )
+
+        # One new country group created
+        assert len(messages) == 1
+        assert "tier-2" in messages[0]
+
+        # countries.yaml updated
+        yaml = YAML(typ="safe")
+        countries = yaml.load(tmp_path / "countries.yaml")
+        assert "tier-2" in countries
+        assert sorted(countries["tier-2"]) == ["AU", "CA", "DE"]
+
+        # No tiers.yaml created
+        assert not (tmp_path / "tiers.yaml").exists()
+
+    def test_existing_files_not_modified_when_all_match(self, tmp_path: Path) -> None:
+        """When all groups match, countries.yaml is NOT rewritten."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        _write_shared_files(
+            tmp_path,
+            countries={"US": ["US"], "high-value": ["AU", "CA", "DE"]},
+        )
+
+        # Record file timestamps
+        countries_mtime = (tmp_path / "countries.yaml").stat().st_mtime
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+            Group.model_validate({
+                "groupName": "Tier 2",
+                "adFormat": "interstitial",
+                "countries": ["AU", "CA", "DE"],
+                "position": 2,
+            }),
+            Group.model_validate({
+                "groupName": "All Countries",
+                "adFormat": "interstitial",
+                "countries": ["*"],
+                "position": 3,
+            }),
+        ]
+        profile = _make_profile()
+
+        _path, messages = generate_app_settings(
+            groups, profile, settings_dir=str(settings_dir)
+        )
+
+        assert len(messages) == 0
+
+        # countries.yaml should not have been modified
+        assert (tmp_path / "countries.yaml").stat().st_mtime == countries_mtime
+
+
+class TestGenerateAppSettingsPerAppFormat:
+    """Verify per-app settings file has correct format."""
+
+    def test_per_app_file_has_alias_field(self, tmp_path: Path) -> None:
+        """Per-app settings file has alias field matching the profile alias."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml = YAML(typ="safe")
+        data = yaml.load(settings_dir / "hexar-ios.yaml")
+        assert data["alias"] == "hexar-ios"
+
+    def test_per_app_file_has_format_sections(self, tmp_path: Path) -> None:
+        """Per-app settings file has format sections with tier lists."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+            Group.model_validate({
+                "groupName": "All Countries",
+                "adFormat": "interstitial",
+                "countries": ["*"],
+                "position": 2,
+            }),
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "rewarded",
+                "countries": ["US"],
+                "position": 1,
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml = YAML(typ="safe")
+        data = yaml.load(settings_dir / "hexar-ios.yaml")
+        assert "interstitial" in data
+        assert "rewarded" in data
+        assert isinstance(data["interstitial"], list)
+        assert isinstance(data["rewarded"], list)
+
+    def test_per_app_format_tier_order_by_position(self, tmp_path: Path) -> None:
+        """Tier list within each format is ordered by position."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+            Group.model_validate({
+                "groupName": "Tier 2",
+                "adFormat": "interstitial",
+                "countries": ["GB"],
+                "position": 2,
+            }),
+            Group.model_validate({
+                "groupName": "All Countries",
+                "adFormat": "interstitial",
+                "countries": ["*"],
+                "position": 3,
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml = YAML(typ="safe")
+        data = yaml.load(settings_dir / "hexar-ios.yaml")
+        # Each entry is a single-key dict: {display_name: group_ref}
+        display_names = [next(iter(e)) for e in data["interstitial"]]
+        assert display_names == ["Tier 1", "Tier 2", "All Countries"]
+
+    def test_only_formats_with_live_groups_appear(self, tmp_path: Path) -> None:
+        """Formats without live groups are omitted from per-app settings."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml = YAML(typ="safe")
+        data = yaml.load(settings_dir / "hexar-ios.yaml")
+        assert "interstitial" in data
+        assert "banner" not in data
+        assert "rewarded" not in data
+        assert "native" not in data
+
+    def test_returns_tuple_of_path_and_messages(self, tmp_path: Path) -> None:
+        """generate_app_settings returns (str, list[str])."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+        ]
+        profile = _make_profile()
+
+        result = generate_app_settings(
+            groups, profile, settings_dir=str(settings_dir)
+        )
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        path, messages = result
+        assert isinstance(path, str)
+        assert isinstance(messages, list)
+
+    def test_per_format_tier_differences(self, tmp_path: Path) -> None:
+        """Different formats can have different tier lists."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+            Group.model_validate({
+                "groupName": "Tier 2",
+                "adFormat": "interstitial",
+                "countries": ["GB"],
+                "position": 2,
+            }),
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "rewarded",
+                "countries": ["US"],
+                "position": 1,
+            }),
+            # rewarded has no Tier 2 -- different tier list
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml = YAML(typ="safe")
+        data = yaml.load(settings_dir / "hexar-ios.yaml")
+        int_names = [next(iter(e)) for e in data["interstitial"]]
+        rew_names = [next(iter(e)) for e in data["rewarded"]]
+        assert "Tier 2" in int_names
+        assert "Tier 2" not in rew_names
+
+
+class TestGenerateAppSettingsNewEntriesAppended:
+    """Verify new entries are appended to existing shared files."""
+
+    def test_new_entries_appended_to_countries(self, tmp_path: Path) -> None:
+        """New country groups are appended to existing countries.yaml."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        _write_shared_files(
+            tmp_path,
+            countries={"US": ["US"]},
+        )
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
             }),
             Group.model_validate({
                 "groupName": "Tier 2",
                 "adFormat": "interstitial",
                 "countries": ["GB", "DE"],
-                "position": 3,
-                "instances": [
-                    {"id": 3, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
+                "position": 2,
             }),
         ]
-        save_modular_snapshot(
-            groups,
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml = YAML(typ="safe")
+        countries = yaml.load(tmp_path / "countries.yaml")
+        # Original entry preserved
+        assert "US" in countries
+        assert countries["US"] == ["US"]
+        # New entry added
+        assert "tier-2" in countries
+        assert sorted(countries["tier-2"]) == ["DE", "GB"]
+
+    def test_no_tiers_yaml_written(self, tmp_path: Path) -> None:
+        """No tiers.yaml is written (eliminated from two-layer format)."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        _write_shared_files(
+            tmp_path,
+            countries={"US": ["US"]},
         )
 
-        yaml = YAML()
-        data = yaml.load(tmp_path / "test-tiers.yaml")
-        tier_names = list(data["tiers"].keys())
-        assert tier_names[-1] == "Default"
-        assert "Tier 1" in tier_names[:-1]
-        assert "Tier 2" in tier_names[:-1]
-
-    def test_formats_field_is_list_not_set(
-        self, tmp_path: Path
-    ) -> None:
-        """Formats field is serialized as a YAML list (not !!set)."""
         groups = [
             Group.model_validate({
                 "groupName": "Tier 1",
                 "adFormat": "interstitial",
                 "countries": ["US"],
                 "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
             }),
             Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "rewarded",
-                "countries": ["US"],
-                "position": 1,
-                "instances": [
-                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
+                "groupName": "Tier 2",
+                "adFormat": "interstitial",
+                "countries": ["GB"],
+                "position": 2,
             }),
         ]
-        save_modular_snapshot(
-            groups,
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
-        )
+        profile = _make_profile()
 
-        # Read raw text to ensure no !!set tag
-        content = (tmp_path / "test-tiers.yaml").read_text()
-        assert "!!set" not in content
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
 
-        yaml = YAML()
-        data = yaml.load(tmp_path / "test-tiers.yaml")
-        assert isinstance(data["tiers"]["Tier 1"]["formats"], list)
+        assert not (tmp_path / "tiers.yaml").exists()
 
-    def test_countries_preserved_with_formats(
-        self, tmp_path: Path
-    ) -> None:
-        """Countries data is preserved alongside the new formats field."""
-        groups = [
+
+class TestGenerateAppSettingsMultiApp:
+    """Verify shared files work correctly across multiple app pulls."""
+
+    def test_second_app_reuses_shared_tiers(self, tmp_path: Path) -> None:
+        """Second app pull reuses tiers created by the first."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups_app1 = [
             Group.model_validate({
                 "groupName": "Tier 1",
                 "adFormat": "interstitial",
-                "countries": ["US", "GB", "DE"],
+                "countries": ["US"],
                 "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
+            }),
+            Group.model_validate({
+                "groupName": "All Countries",
+                "adFormat": "interstitial",
+                "countries": ["*"],
+                "position": 2,
+            }),
+        ]
+        profile_app1 = _make_profile(alias="hexar-ios")
+
+        generate_app_settings(
+            groups_app1, profile_app1, settings_dir=str(settings_dir)
+        )
+
+        # Second app with same tier structure
+        groups_app2 = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+            Group.model_validate({
+                "groupName": "All Countries",
+                "adFormat": "interstitial",
+                "countries": ["*"],
+                "position": 2,
+            }),
+        ]
+        profile_app2 = _make_profile(alias="ss-ios", app_key="ss123")
+
+        _path, messages = generate_app_settings(
+            groups_app2, profile_app2, settings_dir=str(settings_dir)
+        )
+
+        # No new entries -- all matched existing
+        assert len(messages) == 0
+
+        # Both per-app files exist
+        assert (settings_dir / "hexar-ios.yaml").exists()
+        assert (settings_dir / "ss-ios.yaml").exists()
+
+    def test_second_app_adds_new_country_groups(self, tmp_path: Path) -> None:
+        """Second app with different country set adds new entries to countries.yaml."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups_app1 = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+        ]
+        profile_app1 = _make_profile(alias="hexar-ios")
+
+        generate_app_settings(
+            groups_app1, profile_app1, settings_dir=str(settings_dir)
+        )
+
+        groups_app2 = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
             }),
             Group.model_validate({
                 "groupName": "Tier 2",
                 "adFormat": "interstitial",
                 "countries": ["JP", "KR"],
                 "position": 2,
-                "instances": [
-                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
             }),
         ]
-        save_modular_snapshot(
-            groups,
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
+        profile_app2 = _make_profile(alias="ss-ios", app_key="ss123")
+
+        _path, messages = generate_app_settings(
+            groups_app2, profile_app2, settings_dir=str(settings_dir)
         )
 
-        yaml = YAML()
-        data = yaml.load(tmp_path / "test-tiers.yaml")
-        assert data["tiers"]["Tier 1"]["countries"] == ["US", "GB", "DE"]
-        assert data["tiers"]["Tier 1"]["formats"] == ["interstitial"]
-        assert data["tiers"]["Tier 2"]["countries"] == ["JP", "KR"]
-        assert data["tiers"]["Tier 2"]["formats"] == ["interstitial"]
+        # One new country group
+        assert len(messages) == 1
+        assert "tier-2" in messages[0]
 
-    def test_mixed_single_and_multi_format_tiers(
-        self, tmp_path: Path
-    ) -> None:
-        """Some tiers have one format, others have multiple."""
+        yaml = YAML(typ="safe")
+        countries = yaml.load(tmp_path / "countries.yaml")
+        assert "US" in countries
+        assert "tier-2" in countries
+
+
+class TestGenerateAppSettingsNetworkUnchanged:
+    """Verify generate_app_settings does NOT write the networks file."""
+
+    def test_no_networks_file_written(self, tmp_path: Path) -> None:
+        """generate_app_settings does not write any networks file."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
         groups = [
             Group.model_validate({
                 "groupName": "Tier 1",
@@ -1928,630 +2095,705 @@ class TestExtractTiersFormats:
                     {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
                 ],
             }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        # No networks file
+        assert not (settings_dir / "hexar-ios-networks.yaml").exists()
+        assert not (tmp_path / "networks.yaml").exists()
+
+
+class TestGenerateAppSettingsKeyValueFormat:
+    """Verify per-app settings use key-value format (display_name: group_ref)."""
+
+    def test_per_app_entries_are_single_key_dicts(self, tmp_path: Path) -> None:
+        """Each entry in a format section is a single-key dict."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+            Group.model_validate({
+                "groupName": "All Countries",
+                "adFormat": "interstitial",
+                "countries": ["*"],
+                "position": 2,
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml = YAML(typ="safe")
+        data = yaml.load(settings_dir / "hexar-ios.yaml")
+        for entry in data["interstitial"]:
+            assert isinstance(entry, dict)
+            assert len(entry) == 1
+
+    def test_display_name_is_levelplay_group_name(self, tmp_path: Path) -> None:
+        """Display name (dict key) matches the LevelPlay group name."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "My Custom Name",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml = YAML(typ="safe")
+        data = yaml.load(settings_dir / "hexar-ios.yaml")
+        entry = data["interstitial"][0]
+        assert "My Custom Name" in entry
+
+    def test_group_ref_is_country_group_key(self, tmp_path: Path) -> None:
+        """Group ref (dict value) is a valid countries.yaml key."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        _write_shared_files(
+            tmp_path,
+            countries={"high-value": ["AU", "CA", "DE"]},
+        )
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 2",
+                "adFormat": "interstitial",
+                "countries": ["AU", "CA", "DE"],
+                "position": 1,
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml = YAML(typ="safe")
+        data = yaml.load(settings_dir / "hexar-ios.yaml")
+        entry = data["interstitial"][0]
+        assert entry["Tier 2"] == "high-value"
+
+    def test_catch_all_ref_is_star(self, tmp_path: Path) -> None:
+        """Catch-all group gets '*' as group ref."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "All Countries",
+                "adFormat": "interstitial",
+                "countries": ["*"],
+                "position": 1,
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml = YAML(typ="safe")
+        data = yaml.load(settings_dir / "hexar-ios.yaml")
+        entry = data["interstitial"][0]
+        assert entry["All Countries"] == "*"
+
+    def test_catch_all_does_not_create_country_group(self, tmp_path: Path) -> None:
+        """Catch-all group does NOT create an entry in countries.yaml."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "All Countries",
+                "adFormat": "interstitial",
+                "countries": ["*"],
+                "position": 1,
+            }),
+        ]
+        profile = _make_profile()
+
+        _path, messages = generate_app_settings(
+            groups, profile, settings_dir=str(settings_dir)
+        )
+
+        # No country group created for catch-all
+        assert len(messages) == 0
+
+    def test_single_country_group_ref_is_country_code(self, tmp_path: Path) -> None:
+        """Auto-naming: single-country group gets country code as ref."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml = YAML(typ="safe")
+        data = yaml.load(settings_dir / "hexar-ios.yaml")
+        entry = data["interstitial"][0]
+        assert entry["Tier 1"] == "US"
+
+    def test_multi_country_group_ref_is_hyphenated_name(self, tmp_path: Path) -> None:
+        """Auto-naming: multi-country group gets lowercased hyphenated name."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 2",
+                "adFormat": "interstitial",
+                "countries": ["AU", "CA", "DE"],
+                "position": 1,
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml = YAML(typ="safe")
+        data = yaml.load(settings_dir / "hexar-ios.yaml")
+        entry = data["interstitial"][0]
+        assert entry["Tier 2"] == "tier-2"
+
+
+class TestResolveAppTiersMultiKeyDict:
+    """Verify resolve_app_tiers rejects multi-key dict entries."""
+
+    def test_multi_key_dict_raises_error(self, tmp_path: Path) -> None:
+        """Multi-key dict entry in format section raises ConfigValidationError."""
+        from admedi.exceptions import ConfigValidationError
+
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        countries_yaml = "US:\n  - US\n"
+        profiles_yaml = """\
+profiles:
+  hexar-ios:
+    app_key: 676996cd
+    app_name: Hexar.io iOS
+    platform: iOS
+"""
+        (tmp_path / "countries.yaml").write_text(countries_yaml)
+        (tmp_path / "profiles.yaml").write_text(profiles_yaml)
+
+        # Write a per-app file with a multi-key dict entry
+        app_content = """\
+alias: hexar-ios
+interstitial:
+  - Tier 1: US
+    Tier 2: high-value
+"""
+        (settings_dir / "hexar-ios.yaml").write_text(app_content)
+
+        with pytest.raises(ConfigValidationError, match="single-key mapping"):
+            resolve_app_tiers("hexar-ios", settings_dir=str(settings_dir))
+
+
+# ---------------------------------------------------------------------------
+# Step 8: Round-trip integration test (generate -> resolve -> verify)
+# ---------------------------------------------------------------------------
+
+
+def _write_profiles_yaml(project_root: Path) -> None:
+    """Write a standard profiles.yaml to the project root for integration tests."""
+    profiles_content = """\
+profiles:
+  hexar-ios:
+    app_key: 676996cd
+    app_name: Hexar.io iOS
+    platform: iOS
+"""
+    (project_root / "profiles.yaml").write_text(profiles_content, encoding="utf-8")
+
+
+class TestRoundTripIntegration:
+    """Integration test: generate_app_settings -> resolve_app_tiers -> verify.
+
+    Proves that the settings generation and three-layer resolution are
+    inverses: generate a per-app settings file from live groups, then
+    load it back via resolve_app_tiers(), and verify the returned
+    list[PortfolioTier] matches the original input.
+    """
+
+    def test_round_trip_single_format(self, tmp_path: Path) -> None:
+        """Round-trip with a single ad format preserves tier data."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+        _write_profiles_yaml(tmp_path)
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+            Group.model_validate({
+                "groupName": "All Countries",
+                "adFormat": "interstitial",
+                "countries": ["*"],
+                "position": 2,
+            }),
+        ]
+        profile = _make_profile()
+
+        # Generate settings files (bootstrap mode -- creates shared files)
+        settings_path, messages = generate_app_settings(
+            groups, profile, settings_dir=str(settings_dir)
+        )
+
+        # Resolve back through the three-layer chain
+        tiers = resolve_app_tiers("hexar-ios", settings_dir=str(settings_dir))
+
+        # Verify: 2 tiers, both for interstitial
+        assert len(tiers) == 2
+
+        tier_names = [t.name for t in tiers]
+        assert "Tier 1" in tier_names
+        assert "All Countries" in tier_names
+
+        # Verify positions
+        by_name = {t.name: t for t in tiers}
+        assert by_name["Tier 1"].position == 1
+        assert by_name["All Countries"].position == 2
+
+        # Verify countries
+        assert by_name["Tier 1"].countries == ["US"]
+        assert by_name["All Countries"].countries == ["*"]
+        assert by_name["All Countries"].is_default is True
+
+        # Verify ad formats
+        assert by_name["Tier 1"].ad_formats == [AdFormat.INTERSTITIAL]
+        assert by_name["All Countries"].ad_formats == [AdFormat.INTERSTITIAL]
+
+    def test_round_trip_multiple_formats(self, tmp_path: Path) -> None:
+        """Round-trip with multiple ad formats preserves per-format tiers."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+        _write_profiles_yaml(tmp_path)
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+            Group.model_validate({
+                "groupName": "All Countries",
+                "adFormat": "interstitial",
+                "countries": ["*"],
+                "position": 2,
+            }),
             Group.model_validate({
                 "groupName": "Tier 1",
                 "adFormat": "rewarded",
                 "countries": ["US"],
                 "position": 1,
-                "instances": [
-                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
+            }),
+            Group.model_validate({
+                "groupName": "All Countries",
+                "adFormat": "rewarded",
+                "countries": ["*"],
+                "position": 2,
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        tiers = resolve_app_tiers("hexar-ios", settings_dir=str(settings_dir))
+
+        # 2 tiers x 2 formats = 4 PortfolioTier objects (Option A)
+        assert len(tiers) == 4
+
+        # Group by format
+        interstitial = [t for t in tiers if AdFormat.INTERSTITIAL in t.ad_formats]
+        rewarded = [t for t in tiers if AdFormat.REWARDED in t.ad_formats]
+        assert len(interstitial) == 2
+        assert len(rewarded) == 2
+
+        # Each format has both tier names
+        int_names = {t.name for t in interstitial}
+        rew_names = {t.name for t in rewarded}
+        assert int_names == {"Tier 1", "All Countries"}
+        assert rew_names == {"Tier 1", "All Countries"}
+
+    def test_round_trip_per_format_tier_differences(self, tmp_path: Path) -> None:
+        """Round-trip preserves per-format tier differences."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+        _write_profiles_yaml(tmp_path)
+
+        # Interstitial has 3 tiers, rewarded has 2 tiers (different tier lists)
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
             }),
             Group.model_validate({
                 "groupName": "Tier 2",
-                "adFormat": "banner",
-                "countries": ["GB"],
+                "adFormat": "interstitial",
+                "countries": ["GB", "DE"],
                 "position": 2,
-                "instances": [
-                    {"id": 3, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
             }),
             Group.model_validate({
                 "groupName": "All Countries",
                 "adFormat": "interstitial",
                 "countries": ["*"],
                 "position": 3,
-                "instances": [
-                    {"id": 4, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
             }),
-        ]
-        save_modular_snapshot(
-            groups,
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
-        )
-
-        yaml = YAML()
-        data = yaml.load(tmp_path / "test-tiers.yaml")
-
-        # Tier 1: shared across interstitial + rewarded
-        assert data["tiers"]["Tier 1"]["formats"] == ["interstitial", "rewarded"]
-
-        # Tier 2: banner only
-        assert data["tiers"]["Tier 2"]["formats"] == ["banner"]
-
-        # All Countries (default): interstitial only, sorted last
-        assert data["tiers"]["All Countries"]["formats"] == ["interstitial"]
-        tier_names = list(data["tiers"].keys())
-        assert tier_names[-1] == "All Countries"
-
-    def test_every_tier_has_both_countries_and_formats(
-        self, tmp_path: Path
-    ) -> None:
-        """Every tier entry in the output has both countries and formats keys."""
-        groups = [
             Group.model_validate({
                 "groupName": "Tier 1",
-                "adFormat": "interstitial",
+                "adFormat": "rewarded",
                 "countries": ["US"],
                 "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
             }),
             Group.model_validate({
-                "groupName": "Default",
-                "adFormat": "banner",
+                "groupName": "All Countries",
+                "adFormat": "rewarded",
                 "countries": ["*"],
                 "position": 2,
-                "instances": [
-                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
             }),
         ]
-        save_modular_snapshot(
-            groups,
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
-        )
+        profile = _make_profile()
 
-        yaml = YAML()
-        data = yaml.load(tmp_path / "test-tiers.yaml")
-        for tier_name, tier_data in data["tiers"].items():
-            assert "countries" in tier_data, f"{tier_name} missing 'countries'"
-            assert "formats" in tier_data, f"{tier_name} missing 'formats'"
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
 
+        tiers = resolve_app_tiers("hexar-ios", settings_dir=str(settings_dir))
 
-# ---------------------------------------------------------------------------
-# Tests: _extract_tiers() per-format country variance (union + warnings)
-# ---------------------------------------------------------------------------
+        # 3 interstitial + 2 rewarded = 5 PortfolioTier objects
+        assert len(tiers) == 5
 
+        interstitial = [t for t in tiers if AdFormat.INTERSTITIAL in t.ad_formats]
+        rewarded = [t for t in tiers if AdFormat.REWARDED in t.ad_formats]
+        assert len(interstitial) == 3
+        assert len(rewarded) == 2
 
-class TestExtractTiersCountryVariance:
-    """Verify _extract_tiers() detects per-format country differences and returns union + warnings."""
+    def test_round_trip_multi_country_tier(self, tmp_path: Path) -> None:
+        """Round-trip preserves multi-country tier with exact country list."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+        _write_profiles_yaml(tmp_path)
 
-    def test_identical_countries_returns_empty_warnings(self) -> None:
-        """When all formats share the same countries for a tier, warnings list is empty."""
         groups = [
             Group.model_validate({
-                "groupName": "Tier 1",
+                "groupName": "EU Tier",
                 "adFormat": "interstitial",
-                "countries": ["US", "GB"],
+                "countries": ["DE", "FR", "GB", "NL"],
                 "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
             }),
             Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "rewarded",
-                "countries": ["US", "GB"],
-                "position": 1,
-                "instances": [
-                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-        ]
-        tiers, warnings = _extract_tiers(groups)
-        assert warnings == []
-        assert tiers["Tier 1"]["countries"] == ["US", "GB"]
-
-    def test_different_countries_returns_sorted_union(self) -> None:
-        """When countries differ across formats, the result is the sorted union."""
-        groups = [
-            Group.model_validate({
-                "groupName": "Tier 2",
+                "groupName": "All Countries",
                 "adFormat": "interstitial",
-                "countries": ["AU", "NL"],
-                "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-            Group.model_validate({
-                "groupName": "Tier 2",
-                "adFormat": "rewarded",
-                "countries": ["AU", "NZ"],
-                "position": 1,
-                "instances": [
-                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-        ]
-        tiers, warnings = _extract_tiers(groups)
-        assert tiers["Tier 2"]["countries"] == ["AU", "NL", "NZ"]
-
-    def test_different_countries_returns_warning_with_tier_name(self) -> None:
-        """Warning string contains the tier name when countries differ across formats."""
-        groups = [
-            Group.model_validate({
-                "groupName": "Tier 2",
-                "adFormat": "interstitial",
-                "countries": ["AU", "NL"],
-                "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-            Group.model_validate({
-                "groupName": "Tier 2",
-                "adFormat": "rewarded",
-                "countries": ["AU", "NZ"],
-                "position": 1,
-                "instances": [
-                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-        ]
-        tiers, warnings = _extract_tiers(groups)
-        assert len(warnings) == 1
-        assert "Tier 2" in warnings[0]
-        assert "interstitial" in warnings[0]
-        assert "rewarded" in warnings[0]
-        assert "merged to union" in warnings[0]
-
-    def test_single_format_no_warning(self) -> None:
-        """A tier with only one format never produces a warning."""
-        groups = [
-            Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "banner",
-                "countries": ["US"],
-                "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-        ]
-        tiers, warnings = _extract_tiers(groups)
-        assert warnings == []
-        assert tiers["Tier 1"]["countries"] == ["US"]
-
-    def test_three_formats_with_variance_produces_one_warning(self) -> None:
-        """Three formats with different countries produce one warning per tier."""
-        groups = [
-            Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "banner",
-                "countries": ["US"],
-                "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-            Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "interstitial",
-                "countries": ["US", "GB"],
-                "position": 1,
-                "instances": [
-                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-            Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "rewarded",
-                "countries": ["US", "DE"],
-                "position": 1,
-                "instances": [
-                    {"id": 3, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-        ]
-        tiers, warnings = _extract_tiers(groups)
-        assert tiers["Tier 1"]["countries"] == ["DE", "GB", "US"]
-        assert len(warnings) == 1
-        assert "Tier 1" in warnings[0]
-
-    def test_multiple_tiers_with_variance_produce_multiple_warnings(self) -> None:
-        """Each tier with country variance produces its own warning."""
-        groups = [
-            Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "interstitial",
-                "countries": ["US"],
-                "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-            Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "rewarded",
-                "countries": ["US", "GB"],
-                "position": 1,
-                "instances": [
-                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-            Group.model_validate({
-                "groupName": "Tier 2",
-                "adFormat": "interstitial",
-                "countries": ["JP"],
+                "countries": ["*"],
                 "position": 2,
-                "instances": [
-                    {"id": 3, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        tiers = resolve_app_tiers("hexar-ios", settings_dir=str(settings_dir))
+
+        eu_tier = [t for t in tiers if t.name == "EU Tier"]
+        assert len(eu_tier) == 1
+        # Country codes are preserved (may be in different order)
+        assert set(eu_tier[0].countries) == {"DE", "FR", "GB", "NL"}
+
+
+class TestSyncIntegration:
+    """Integration test: three-layer settings -> compute_diff -> zero drift.
+
+    Proves that settings generated from live groups, when compared against
+    those same groups via compute_diff(), produce zero drift.
+    """
+
+    def test_zero_drift_after_generate(self, tmp_path: Path) -> None:
+        """generate -> resolve -> compute_diff against same groups = zero drift."""
+        from admedi.engine.differ import compute_diff
+
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+        _write_profiles_yaml(tmp_path)
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
             }),
             Group.model_validate({
-                "groupName": "Tier 2",
-                "adFormat": "rewarded",
-                "countries": ["JP", "KR"],
+                "groupName": "All Countries",
+                "adFormat": "interstitial",
+                "countries": ["*"],
                 "position": 2,
-                "instances": [
-                    {"id": 4, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
             }),
         ]
-        tiers, warnings = _extract_tiers(groups)
-        assert len(warnings) == 2
-        warning_text = " ".join(warnings)
-        assert "Tier 1" in warning_text
-        assert "Tier 2" in warning_text
+        profile = _make_profile()
 
-    def test_return_type_is_tuple(self) -> None:
-        """_extract_tiers() returns a 2-tuple (dict, list)."""
-        groups = [
-            Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "banner",
-                "countries": ["US"],
-                "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-        ]
-        result = _extract_tiers(groups)
-        assert isinstance(result, tuple)
-        assert len(result) == 2
-        assert isinstance(result[0], dict)
-        assert isinstance(result[1], list)
+        # Step 1: Generate settings from live groups
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
 
+        # Step 2: Resolve settings back to tiers
+        tiers = resolve_app_tiers("hexar-ios", settings_dir=str(settings_dir))
 
-class TestSaveModularSnapshotWarnings:
-    """Verify save_modular_snapshot() returns (str, list[str]) tuple with warnings."""
+        # Step 3: Compute diff against the same groups
+        report = compute_diff(tiers, groups, "676996cd", "Hexar.io iOS")
 
-    def test_returns_tuple(self, tmp_path: Path) -> None:
-        """save_modular_snapshot() returns a 2-tuple (str, list[str])."""
-        groups = [
-            Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "banner",
-                "countries": ["US"],
-                "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-        ]
-        result = save_modular_snapshot(
-            groups,
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
-        )
-        assert isinstance(result, tuple)
-        assert len(result) == 2
-        path, warnings = result
-        assert isinstance(path, str)
-        assert isinstance(warnings, list)
+        # Zero drift: no creates, no updates
+        from admedi.models.diff import DiffAction
 
-    def test_no_variance_returns_empty_warnings(self, tmp_path: Path) -> None:
-        """When all formats agree on countries, warnings list is empty."""
+        creates = [d for d in report.group_diffs if d.action == DiffAction.CREATE]
+        updates = [d for d in report.group_diffs if d.action == DiffAction.UPDATE]
+        assert len(creates) == 0, f"Unexpected creates: {[c.group_name for c in creates]}"
+        assert len(updates) == 0, f"Unexpected updates: {[u.group_name for u in updates]}"
+
+    def test_zero_drift_multi_format(self, tmp_path: Path) -> None:
+        """Zero drift with multiple ad formats (interstitial + rewarded)."""
+        from admedi.engine.differ import compute_diff
+        from admedi.models.diff import DiffAction
+
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+        _write_profiles_yaml(tmp_path)
+
         groups = [
             Group.model_validate({
                 "groupName": "Tier 1",
                 "adFormat": "interstitial",
                 "countries": ["US"],
                 "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
+            }),
+            Group.model_validate({
+                "groupName": "All Countries",
+                "adFormat": "interstitial",
+                "countries": ["*"],
+                "position": 2,
             }),
             Group.model_validate({
                 "groupName": "Tier 1",
                 "adFormat": "rewarded",
                 "countries": ["US"],
                 "position": 1,
-                "instances": [
-                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
+            }),
+            Group.model_validate({
+                "groupName": "All Countries",
+                "adFormat": "rewarded",
+                "countries": ["*"],
+                "position": 2,
             }),
         ]
-        _path, warnings = save_modular_snapshot(
-            groups,
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
-        )
-        assert warnings == []
+        profile = _make_profile()
 
-    def test_variance_returns_nonempty_warnings(self, tmp_path: Path) -> None:
-        """When formats have different countries, warnings list is non-empty."""
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+        tiers = resolve_app_tiers("hexar-ios", settings_dir=str(settings_dir))
+        report = compute_diff(tiers, groups, "676996cd", "Hexar.io iOS")
+
+        creates = [d for d in report.group_diffs if d.action == DiffAction.CREATE]
+        updates = [d for d in report.group_diffs if d.action == DiffAction.UPDATE]
+        assert len(creates) == 0
+        assert len(updates) == 0
+
+    def test_zero_drift_with_multi_country_tiers(self, tmp_path: Path) -> None:
+        """Zero drift when tiers have multi-country groups."""
+        from admedi.engine.differ import compute_diff
+        from admedi.models.diff import DiffAction
+
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+        _write_profiles_yaml(tmp_path)
+
         groups = [
             Group.model_validate({
-                "groupName": "Tier 2",
+                "groupName": "US Only",
                 "adFormat": "interstitial",
-                "countries": ["AU", "NL"],
+                "countries": ["US"],
                 "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
             }),
             Group.model_validate({
-                "groupName": "Tier 2",
-                "adFormat": "rewarded",
-                "countries": ["AU", "NZ"],
-                "position": 1,
-                "instances": [
-                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
+                "groupName": "EU Markets",
+                "adFormat": "interstitial",
+                "countries": ["DE", "FR", "GB"],
+                "position": 2,
+            }),
+            Group.model_validate({
+                "groupName": "All Countries",
+                "adFormat": "interstitial",
+                "countries": ["*"],
+                "position": 3,
             }),
         ]
-        _path, warnings = save_modular_snapshot(
-            groups,
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
-        )
-        assert len(warnings) > 0
-        assert "Tier 2" in warnings[0]
+        profile = _make_profile()
 
-    def test_variance_tiers_file_has_union_countries(self, tmp_path: Path) -> None:
-        """Tiers file written by save_modular_snapshot uses the union countries."""
-        groups = [
-            Group.model_validate({
-                "groupName": "Tier 2",
-                "adFormat": "interstitial",
-                "countries": ["AU", "NL"],
-                "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-            Group.model_validate({
-                "groupName": "Tier 2",
-                "adFormat": "rewarded",
-                "countries": ["AU", "NZ"],
-                "position": 1,
-                "instances": [
-                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-        ]
-        save_modular_snapshot(
-            groups,
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
-        )
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+        tiers = resolve_app_tiers("hexar-ios", settings_dir=str(settings_dir))
+        report = compute_diff(tiers, groups, "676996cd", "Hexar.io iOS")
 
-        yaml = YAML()
-        data = yaml.load(tmp_path / "test-tiers.yaml")
-        assert data["tiers"]["Tier 2"]["countries"] == ["AU", "NL", "NZ"]
+        creates = [d for d in report.group_diffs if d.action == DiffAction.CREATE]
+        updates = [d for d in report.group_diffs if d.action == DiffAction.UPDATE]
+        assert len(creates) == 0
+        assert len(updates) == 0
 
 
 # ---------------------------------------------------------------------------
-# Tests: _build_app_yaml() waterfall section
+# Step 8: Dead code verification tests
 # ---------------------------------------------------------------------------
 
 
-class TestBuildAppYamlWaterfall:
-    """Verify _build_app_yaml() produces flat waterfall mapping instead of groups."""
+class TestDeadCodeRemoval:
+    """Verify dead code from prior steps was properly removed.
 
-    def test_app_file_has_waterfall_not_groups(
-        self, tmp_path: Path, group_banner: Group
-    ) -> None:
-        """App file has waterfall key, not groups key."""
-        save_modular_snapshot(
-            [group_banner],
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
-        )
+    These tests confirm that functions and exports removed in Steps 5-7
+    are no longer present in production code.
+    """
 
-        yaml = YAML()
-        data = yaml.load(tmp_path / "test.yaml")
-        assert "waterfall" in data
-        assert "groups" not in data
+    def test_extract_tiers_absent_from_snapshot(self) -> None:
+        """_extract_tiers() was removed from snapshot.py in Step 6."""
+        import admedi.engine.snapshot as snap_mod
 
-    def test_waterfall_has_all_four_levelplay_formats(
-        self, tmp_path: Path, group_banner: Group
-    ) -> None:
-        """Waterfall section has exactly 4 keys: banner, interstitial, native, rewarded."""
-        save_modular_snapshot(
-            [group_banner],
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
-        )
+        assert not hasattr(snap_mod, "_extract_tiers")
 
-        yaml = YAML()
-        data = yaml.load(tmp_path / "test.yaml")
-        waterfall = data["waterfall"]
-        assert set(waterfall.keys()) == {"banner", "interstitial", "native", "rewarded"}
+    def test_build_app_yaml_absent_from_snapshot(self) -> None:
+        """_build_app_yaml() was removed from snapshot.py in Step 6."""
+        import admedi.engine.snapshot as snap_mod
 
-    def test_format_with_no_groups_maps_to_none(
-        self, tmp_path: Path, group_banner: Group
-    ) -> None:
-        """Formats with no groups have value 'none'."""
-        save_modular_snapshot(
-            [group_banner],
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
-        )
+        assert not hasattr(snap_mod, "_build_app_yaml")
 
-        yaml = YAML()
-        data = yaml.load(tmp_path / "test.yaml")
-        # Only banner has groups; others should be "none"
-        assert data["waterfall"]["interstitial"] == "none"
-        assert data["waterfall"]["native"] == "none"
-        assert data["waterfall"]["rewarded"] == "none"
+    def test_build_network_lookup_absent_from_snapshot(self) -> None:
+        """_build_network_lookup() was removed from snapshot.py in Step 6."""
+        import admedi.engine.snapshot as snap_mod
 
-    def test_format_with_groups_maps_to_preset_name(
-        self, tmp_path: Path, group_interstitial_with_rates: Group
-    ) -> None:
-        """Formats with groups map to the resolved preset name."""
-        save_modular_snapshot(
-            [group_interstitial_with_rates],
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
-        )
+        assert not hasattr(snap_mod, "_build_network_lookup")
 
-        yaml = YAML()
-        data = yaml.load(tmp_path / "test.yaml")
-        # group_interstitial_with_rates has Meta (bidder) + AppLovin (manual)
-        # Expected preset name: "meta-applovin"
-        assert data["waterfall"]["interstitial"] != "none"
-        assert isinstance(data["waterfall"]["interstitial"], str)
+    def test_load_template_absent_from_engine_exports(self) -> None:
+        """load_template is not exported from admedi.engine (removed in Step 5)."""
+        import admedi.engine
 
-    def test_metadata_fields_preserved(
-        self, tmp_path: Path, group_banner: Group
-    ) -> None:
-        """app_key, app_name, and platform fields are preserved."""
-        save_modular_snapshot(
-            [group_banner],
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
-            platform=Platform.IOS,
-        )
+        assert "load_template" not in admedi.engine.__all__
 
-        yaml = YAML()
-        data = yaml.load(tmp_path / "test.yaml")
-        assert data["app_key"] == "abc123"
-        assert data["app_name"] == "Test App"
-        assert data["platform"] == "iOS"
+    def test_portfolio_config_absent_from_engine_exports(self) -> None:
+        """PortfolioConfig is not exported from admedi.engine (removed in Step 5)."""
+        import admedi.engine
 
-    def test_header_comments_preserved(
-        self, tmp_path: Path, group_banner: Group
-    ) -> None:
-        """Header comments (app name, captured timestamp) are present."""
-        save_modular_snapshot(
-            [group_banner],
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
-        )
+        assert "PortfolioConfig" not in admedi.engine.__all__
 
-        content = (tmp_path / "test.yaml").read_text()
-        assert content.startswith("# Generated by admedi show")
-        assert "# App: Test App (abc123)" in content
-        assert "# Captured:" in content
+    def test_load_template_absent_from_engine_engine(self) -> None:
+        """load_template import was removed from engine.py in Step 5."""
+        import admedi.engine.engine as engine_mod
 
-    def test_multiple_formats_with_groups(
-        self, tmp_path: Path
-    ) -> None:
-        """Multiple formats with groups each resolve to their preset name."""
-        groups = [
-            Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "interstitial",
-                "countries": ["US"],
-                "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-            Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "rewarded",
-                "countries": ["US"],
-                "position": 1,
-                "instances": [
-                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                ],
-            }),
-        ]
-        save_modular_snapshot(
-            groups,
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
-        )
+        assert not hasattr(engine_mod, "load_template")
 
-        yaml = YAML()
-        data = yaml.load(tmp_path / "test.yaml")
-        # Both interstitial and rewarded have groups with the same waterfall
-        assert data["waterfall"]["interstitial"] != "none"
-        assert data["waterfall"]["rewarded"] != "none"
-        # banner and native have no groups
-        assert data["waterfall"]["banner"] == "none"
-        assert data["waterfall"]["native"] == "none"
+    def test_resolve_app_key_absent_from_cli(self) -> None:
+        """_resolve_app_key() was removed from cli/main.py in Step 7."""
+        import admedi.cli.main as cli_mod
 
-    def test_waterfall_preset_name_matches_network_file(
-        self, tmp_path: Path
-    ) -> None:
-        """Waterfall preset name in app file matches a key in the networks file."""
-        groups = [
-            Group.model_validate({
-                "groupName": "Tier 1",
-                "adFormat": "interstitial",
-                "countries": ["US"],
-                "position": 1,
-                "instances": [
-                    {"id": 1, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
-                    {"id": 2, "name": "Bidding", "networkName": "UnityAds", "isBidder": True},
-                ],
-            }),
-        ]
-        save_modular_snapshot(
-            groups,
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
-        )
+        assert not hasattr(cli_mod, "_resolve_app_key")
 
-        yaml = YAML()
-        app_data = yaml.load(tmp_path / "test.yaml")
-        networks_data = yaml.load(tmp_path / "test-networks.yaml")
+    def test_display_show_absent_from_display(self) -> None:
+        """display_show() was removed from display.py in Step 7."""
+        import admedi.cli.display as disp_mod
 
-        preset_name = app_data["waterfall"]["interstitial"]
-        assert preset_name in networks_data["presets"]
+        assert not hasattr(disp_mod, "display_show")
 
-    def test_empty_groups_all_formats_none(
-        self, tmp_path: Path
-    ) -> None:
-        """When no groups are provided, all formats map to 'none'."""
-        save_modular_snapshot(
-            [],
-            app_key="abc123",
-            app_name="Test App",
-            app_file="test.yaml",
-            settings_dir=str(tmp_path),
-        )
+    def test_display_tier_warnings_absent_from_display(self) -> None:
+        """display_tier_warnings() was removed from display.py in Step 7."""
+        import admedi.cli.display as disp_mod
 
-        yaml = YAML()
-        data = yaml.load(tmp_path / "test.yaml")
-        for fmt_name, preset in data["waterfall"].items():
-            assert preset == "none", f"{fmt_name} should be 'none' with no groups"
+        assert not hasattr(disp_mod, "display_tier_warnings")
+
+    def test_no_admedi_show_in_cli_commands(self) -> None:
+        """'show' command is not registered in the CLI app."""
+        runner = CliRunner()
+        result = runner.invoke(cli_app, ["show", "--app", "hexar-ios"])
+        assert result.exit_code == 2  # typer usage error for unknown command
+
+    def test_admedi_pull_in_cli_commands(self) -> None:
+        """'pull' command is registered in the CLI app."""
+        runner = CliRunner()
+        result = runner.invoke(cli_app, ["--help"])
+        assert "pull" in result.output
+
+    def test_no_load_tiers_settings_in_engine_exports(self) -> None:
+        """load_tiers_settings is not exported from admedi.engine."""
+        import admedi.engine
+
+        assert "load_tiers_settings" not in admedi.engine.__all__
+
+
+class TestEngineExportsCorrectness:
+    """Verify engine/__init__.py exports are complete and correct."""
+
+    def test_engine_all_has_seven_entries(self) -> None:
+        """Engine __all__ has exactly 7 entries."""
+        import admedi.engine
+
+        assert len(admedi.engine.__all__) == 7
+
+    def test_engine_exports_all_expected_names(self) -> None:
+        """Engine __all__ contains all expected names."""
+        import admedi.engine
+
+        expected = {
+            "Applier",
+            "ConfigEngine",
+            "Profile",
+            "compute_diff",
+            "load_country_groups",
+            "load_profiles",
+            "resolve_app_tiers",
+        }
+        assert set(admedi.engine.__all__) == expected
+
+    def test_load_country_groups_importable_from_engine(self) -> None:
+        """load_country_groups is importable from admedi.engine."""
+        from admedi.engine import load_country_groups
+
+        assert callable(load_country_groups)
+
+    def test_load_tiers_definition_not_in_engine_all(self) -> None:
+        """load_tiers_definition is not exported from admedi.engine (removed)."""
+        import admedi.engine
+
+        assert "load_tiers_definition" not in admedi.engine.__all__
+
+    def test_load_profiles_importable_from_engine(self) -> None:
+        """load_profiles is importable from admedi.engine."""
+        from admedi.engine import load_profiles
+
+        assert callable(load_profiles)
+
+    def test_resolve_app_tiers_importable_from_engine(self) -> None:
+        """resolve_app_tiers is importable from admedi.engine."""
+        from admedi.engine import resolve_app_tiers
+
+        assert callable(resolve_app_tiers)
+
+    def test_profile_importable_from_engine(self) -> None:
+        """Profile is importable from admedi.engine."""
+        from admedi.engine import Profile
+
+        assert Profile is not None

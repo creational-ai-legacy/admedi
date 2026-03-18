@@ -45,3 +45,6 @@ docs-main
 
 # Reference repos (cloned externally)
 /references/
+
+# Runtime data (snapshots, logs from live API calls)
+.admedi/

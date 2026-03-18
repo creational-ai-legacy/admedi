@@ -1,21 +1,22 @@
 """Tests for the ConfigEngine orchestrator and Applier.
 
-Covers audit(), sync(), status() methods with mocked adapter and storage.
-Verifies template loading, concurrent group fetching, diff computation,
-applier delegation, app_keys filtering, group data caching, and correct
-model output structure. Also covers Applier deletion phase (Step 7).
+Covers audit(), sync(), status() methods with mocked adapter, storage,
+load_profiles, and resolve_app_tiers. Verifies profiles-based app
+discovery, three-layer settings resolution, concurrent group fetching,
+diff computation, applier delegation, alias filtering, group data caching,
+and correct model output structure. Also covers Applier deletion phase.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
 
 import pytest
 
 from admedi.engine.applier import Applier
 from admedi.engine.engine import ConfigEngine
+from admedi.engine.loader import Profile
 from admedi.models.apply_result import AppApplyResult, ApplyStatus, PortfolioStatus
 from admedi.models.diff import (
     AppDiffReport,
@@ -25,6 +26,7 @@ from admedi.models.diff import (
 )
 from admedi.models.enums import AdFormat, Mediator, Platform
 from admedi.models.group import Group
+from admedi.models.portfolio import PortfolioTier
 from admedi.models.sync_log import SyncLog
 
 
@@ -79,10 +81,42 @@ def _make_mocks() -> tuple[AsyncMock, AsyncMock]:
     return adapter, storage
 
 
-TEMPLATE_PATH = (
-    Path(__file__).resolve().parent.parent / "examples" / "shelf-sort-tiers.yaml"
-)
-"""Path to the real Shelf Sort template for integration-style tests."""
+# Two-profile setup used by audit/sync/status tests.
+_MOCK_PROFILES = {
+    "hexar-ios": Profile(
+        alias="hexar-ios", app_key="key-hexar-ios",
+        app_name="Hexar iOS", platform=Platform.IOS,
+    ),
+    "hexar-google": Profile(
+        alias="hexar-google", app_key="key-hexar-google",
+        app_name="Hexar Google", platform=Platform.ANDROID,
+    ),
+}
+
+_MOCK_TIERS = [
+    PortfolioTier(
+        name="Tier 1", countries=["US", "GB"], position=1,
+        is_default=False, ad_formats=[AdFormat.INTERSTITIAL],
+    ),
+    PortfolioTier(
+        name="All Countries", countries=["*"], position=2,
+        is_default=True, ad_formats=[AdFormat.INTERSTITIAL],
+    ),
+]
+
+
+def _patch_profiles_and_tiers():
+    """Return stacked patch context managers for load_profiles and resolve_app_tiers."""
+    return (
+        patch(
+            "admedi.engine.engine.load_profiles",
+            return_value=dict(_MOCK_PROFILES),
+        ),
+        patch(
+            "admedi.engine.engine.resolve_app_tiers",
+            return_value=list(_MOCK_TIERS),
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -91,85 +125,155 @@ TEMPLATE_PATH = (
 
 
 class TestAudit:
-    """Tests for ConfigEngine.audit()."""
+    """Tests for ConfigEngine.audit() with profiles-based app discovery."""
 
     @pytest.mark.asyncio
     async def test_audit_returns_diff_report(self) -> None:
-        """audit() loads template and returns a DiffReport."""
+        """audit() loads profiles and returns a DiffReport."""
         adapter, storage = _make_mocks()
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        report = await engine.audit(TEMPLATE_PATH)
+        p1, p2 = _patch_profiles_and_tiers()
+        with p1, p2:
+            report = await engine.audit()
 
         assert isinstance(report, DiffReport)
 
     @pytest.mark.asyncio
     async def test_audit_report_has_correct_app_count(self) -> None:
-        """audit() returns DiffReport with one AppDiffReport per portfolio app."""
+        """audit() returns DiffReport with one AppDiffReport per profile."""
         adapter, storage = _make_mocks()
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        report = await engine.audit(TEMPLATE_PATH)
+        p1, p2 = _patch_profiles_and_tiers()
+        with p1, p2:
+            report = await engine.audit()
 
-        # The Shelf Sort template has 6 apps
-        assert len(report.app_reports) == 6
+        assert len(report.app_reports) == 2
 
     @pytest.mark.asyncio
     async def test_audit_calls_get_groups_per_app(self) -> None:
-        """audit() calls adapter.get_groups() once per portfolio app."""
+        """audit() calls adapter.get_groups() once per profile app."""
         adapter, storage = _make_mocks()
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        await engine.audit(TEMPLATE_PATH)
+        p1, p2 = _patch_profiles_and_tiers()
+        with p1, p2:
+            await engine.audit()
 
-        # 6 apps in the Shelf Sort template
-        assert adapter.get_groups.call_count == 6
+        assert adapter.get_groups.call_count == 2
 
     @pytest.mark.asyncio
     async def test_audit_passes_cached_groups_to_differ(self) -> None:
         """audit() passes cached group data to compute_diff, not re-fetching."""
         adapter, storage = _make_mocks()
-
         remote_group = _make_group("Tier 1", group_id=100)
         adapter.get_groups.return_value = [remote_group]
 
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        report = await engine.audit(TEMPLATE_PATH)
+        p1, p2 = _patch_profiles_and_tiers()
+        with p1, p2:
+            report = await engine.audit()
 
-        # get_groups called only once per app (6 apps), not twice
-        assert adapter.get_groups.call_count == 6
+        # get_groups called only once per app (2 profiles), not twice
+        assert adapter.get_groups.call_count == 2
         # Each app report should have computed diffs against the returned groups
         for app_report in report.app_reports:
             assert len(app_report.group_diffs) > 0
 
     @pytest.mark.asyncio
-    async def test_audit_app_keys_filters_apps(self) -> None:
-        """audit(app_keys=[...]) only processes specified apps."""
+    async def test_audit_aliases_filters_apps(self) -> None:
+        """audit(aliases=[...]) only processes specified aliases."""
         adapter, storage = _make_mocks()
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        # Pick the first app_key from the template
-        from admedi.engine.loader import load_template as _load
-
-        template = _load(TEMPLATE_PATH)
-        first_key = template.portfolio[0].app_key
-
-        report = await engine.audit(TEMPLATE_PATH, app_keys=[first_key])
+        p1, p2 = _patch_profiles_and_tiers()
+        with p1, p2:
+            report = await engine.audit(aliases=["hexar-ios"])
 
         assert len(report.app_reports) == 1
-        assert report.app_reports[0].app_key == first_key
+        assert report.app_reports[0].app_key == "key-hexar-ios"
         assert adapter.get_groups.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_audit_app_keys_none_processes_all(self) -> None:
-        """audit(app_keys=None) processes all portfolio apps."""
+    async def test_audit_aliases_none_processes_all(self) -> None:
+        """audit(aliases=None) processes all profile apps."""
         adapter, storage = _make_mocks()
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        report = await engine.audit(TEMPLATE_PATH, app_keys=None)
+        p1, p2 = _patch_profiles_and_tiers()
+        with p1, p2:
+            report = await engine.audit(aliases=None)
 
-        assert len(report.app_reports) == 6
+        assert len(report.app_reports) == 2
+
+    @pytest.mark.asyncio
+    async def test_audit_skips_missing_settings_in_all_mode(self) -> None:
+        """audit() with aliases=None skips aliases without settings files."""
+        adapter, storage = _make_mocks()
+        engine = ConfigEngine(adapter=adapter, storage=storage)
+
+        with patch(
+            "admedi.engine.engine.load_profiles",
+            return_value=dict(_MOCK_PROFILES),
+        ), patch(
+            "admedi.engine.engine.resolve_app_tiers",
+            side_effect=[
+                list(_MOCK_TIERS),  # hexar-ios succeeds
+                FileNotFoundError("settings/hexar-google.yaml not found"),
+            ],
+        ):
+            report = await engine.audit()
+
+        # Only hexar-ios should be in the report (hexar-google was skipped)
+        assert len(report.app_reports) == 1
+        assert report.app_reports[0].app_key == "key-hexar-ios"
+
+    @pytest.mark.asyncio
+    async def test_audit_raises_for_missing_settings_in_explicit_mode(self) -> None:
+        """audit(aliases=[...]) raises FileNotFoundError for missing settings."""
+        adapter, storage = _make_mocks()
+        engine = ConfigEngine(adapter=adapter, storage=storage)
+
+        with patch(
+            "admedi.engine.engine.load_profiles",
+            return_value=dict(_MOCK_PROFILES),
+        ), patch(
+            "admedi.engine.engine.resolve_app_tiers",
+            side_effect=FileNotFoundError("settings/hexar-ios.yaml not found"),
+        ):
+            with pytest.raises(FileNotFoundError):
+                await engine.audit(aliases=["hexar-ios"])
+
+    @pytest.mark.asyncio
+    async def test_audit_unknown_alias_raises_config_error(self) -> None:
+        """audit(aliases=['unknown']) raises ConfigValidationError."""
+        from admedi.exceptions import ConfigValidationError
+
+        adapter, storage = _make_mocks()
+        engine = ConfigEngine(adapter=adapter, storage=storage)
+
+        with patch(
+            "admedi.engine.engine.load_profiles",
+            return_value=dict(_MOCK_PROFILES),
+        ):
+            with pytest.raises(ConfigValidationError, match="Unknown profile alias"):
+                await engine.audit(aliases=["unknown-alias"])
+
+    @pytest.mark.asyncio
+    async def test_audit_empty_profiles_returns_empty_report(self) -> None:
+        """audit() with no profiles returns empty DiffReport."""
+        adapter, storage = _make_mocks()
+        engine = ConfigEngine(adapter=adapter, storage=storage)
+
+        with patch(
+            "admedi.engine.engine.load_profiles",
+            return_value={},
+        ):
+            report = await engine.audit()
+
+        assert len(report.app_reports) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +282,7 @@ class TestAudit:
 
 
 class TestSync:
-    """Tests for ConfigEngine.sync()."""
+    """Tests for ConfigEngine.sync() with profiles-based approach."""
 
     @pytest.mark.asyncio
     async def test_sync_dry_run_returns_tuple(self) -> None:
@@ -186,7 +290,9 @@ class TestSync:
         adapter, storage = _make_mocks()
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        result = await engine.sync(TEMPLATE_PATH, dry_run=True)
+        p1, p2 = _patch_profiles_and_tiers()
+        with p1, p2:
+            result = await engine.sync(dry_run=True)
 
         assert isinstance(result, tuple)
         assert len(result) == 2
@@ -199,7 +305,9 @@ class TestSync:
         adapter, storage = _make_mocks()
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        _report, apply_result = await engine.sync(TEMPLATE_PATH, dry_run=True)
+        p1, p2 = _patch_profiles_and_tiers()
+        with p1, p2:
+            _report, apply_result = await engine.sync(dry_run=True)
 
         assert apply_result.was_dry_run is True
 
@@ -209,7 +317,9 @@ class TestSync:
         adapter, storage = _make_mocks()
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        _report, apply_result = await engine.sync(TEMPLATE_PATH, dry_run=True)
+        p1, p2 = _patch_profiles_and_tiers()
+        with p1, p2:
+            _report, apply_result = await engine.sync(dry_run=True)
 
         for app_result in apply_result.app_results:
             assert app_result.status == ApplyStatus.DRY_RUN
@@ -220,7 +330,9 @@ class TestSync:
         adapter, storage = _make_mocks()
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        await engine.sync(TEMPLATE_PATH, dry_run=True)
+        p1, p2 = _patch_profiles_and_tiers()
+        with p1, p2:
+            await engine.sync(dry_run=True)
 
         adapter.create_group.assert_not_called()
         adapter.update_group.assert_not_called()
@@ -234,26 +346,23 @@ class TestSync:
         adapter, storage = _make_mocks()
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        _report, apply_result = await engine.sync(
-            TEMPLATE_PATH, dry_run=False
-        )
+        p1, p2 = _patch_profiles_and_tiers()
+        with p1, p2:
+            _report, apply_result = await engine.sync(dry_run=False)
 
         assert apply_result.was_dry_run is False
 
     @pytest.mark.asyncio
-    async def test_sync_app_keys_filters_apps(self) -> None:
-        """sync(app_keys=[...]) only processes specified apps."""
+    async def test_sync_aliases_filters_apps(self) -> None:
+        """sync(aliases=[...]) only processes specified aliases."""
         adapter, storage = _make_mocks()
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        from admedi.engine.loader import load_template as _load
-
-        template = _load(TEMPLATE_PATH)
-        first_key = template.portfolio[0].app_key
-
-        report, result = await engine.sync(
-            TEMPLATE_PATH, app_keys=[first_key], dry_run=True
-        )
+        p1, p2 = _patch_profiles_and_tiers()
+        with p1, p2:
+            report, result = await engine.sync(
+                aliases=["hexar-ios"], dry_run=True,
+            )
 
         assert len(report.app_reports) == 1
         assert len(result.app_results) == 1
@@ -265,7 +374,7 @@ class TestSync:
 
 
 class TestStatus:
-    """Tests for ConfigEngine.status()."""
+    """Tests for ConfigEngine.status() with profiles-based app discovery."""
 
     @pytest.mark.asyncio
     async def test_status_returns_portfolio_status(self) -> None:
@@ -273,28 +382,39 @@ class TestStatus:
         adapter, storage = _make_mocks()
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        result = await engine.status(TEMPLATE_PATH)
+        with patch(
+            "admedi.engine.engine.load_profiles",
+            return_value=dict(_MOCK_PROFILES),
+        ):
+            result = await engine.status()
 
         assert isinstance(result, PortfolioStatus)
 
     @pytest.mark.asyncio
-    async def test_status_has_one_app_status_per_portfolio_app(self) -> None:
-        """status() returns one AppStatus per portfolio app."""
+    async def test_status_has_one_app_status_per_profile(self) -> None:
+        """status() returns one AppStatus per profile."""
         adapter, storage = _make_mocks()
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        result = await engine.status(TEMPLATE_PATH)
+        with patch(
+            "admedi.engine.engine.load_profiles",
+            return_value=dict(_MOCK_PROFILES),
+        ):
+            result = await engine.status()
 
-        # Shelf Sort template has 6 apps
-        assert len(result.apps) == 6
+        assert len(result.apps) == 2
 
     @pytest.mark.asyncio
-    async def test_status_mediator_matches_template(self) -> None:
-        """status() PortfolioStatus.mediator matches the template."""
+    async def test_status_mediator_is_levelplay(self) -> None:
+        """status() PortfolioStatus.mediator is hardcoded to LEVELPLAY."""
         adapter, storage = _make_mocks()
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        result = await engine.status(TEMPLATE_PATH)
+        with patch(
+            "admedi.engine.engine.load_profiles",
+            return_value=dict(_MOCK_PROFILES),
+        ):
+            result = await engine.status()
 
         assert result.mediator == Mediator.LEVELPLAY
 
@@ -302,8 +422,6 @@ class TestStatus:
     async def test_status_group_count_reflects_remote_groups(self) -> None:
         """status() AppStatus.group_count reflects remote get_groups() count."""
         adapter, storage = _make_mocks()
-
-        # Return 3 groups for every app
         adapter.get_groups.return_value = [
             _make_group("Tier 1", group_id=1),
             _make_group("Tier 2", group_id=2, position=2),
@@ -312,7 +430,11 @@ class TestStatus:
 
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        result = await engine.status(TEMPLATE_PATH)
+        with patch(
+            "admedi.engine.engine.load_profiles",
+            return_value=dict(_MOCK_PROFILES),
+        ):
+            result = await engine.status()
 
         for app_status in result.apps:
             assert app_status.group_count == 3
@@ -321,7 +443,6 @@ class TestStatus:
     async def test_status_last_sync_from_most_recent_log(self) -> None:
         """status() extracts last_sync from most recent SyncLog timestamp."""
         adapter, storage = _make_mocks()
-
         sync_time = datetime(2026, 3, 12, 10, 0, 0, tzinfo=timezone.utc)
         storage.list_sync_history.return_value = [
             _make_sync_log(timestamp=sync_time),
@@ -329,7 +450,11 @@ class TestStatus:
 
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        result = await engine.status(TEMPLATE_PATH)
+        with patch(
+            "admedi.engine.engine.load_profiles",
+            return_value=dict(_MOCK_PROFILES),
+        ):
+            result = await engine.status()
 
         for app_status in result.apps:
             assert app_status.last_sync == sync_time
@@ -342,54 +467,62 @@ class TestStatus:
 
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        result = await engine.status(TEMPLATE_PATH)
+        with patch(
+            "admedi.engine.engine.load_profiles",
+            return_value=dict(_MOCK_PROFILES),
+        ):
+            result = await engine.status()
 
         for app_status in result.apps:
             assert app_status.last_sync is None
 
     @pytest.mark.asyncio
-    async def test_status_app_name_from_template(self) -> None:
-        """status() uses app name from the template portfolio."""
+    async def test_status_app_name_from_profiles(self) -> None:
+        """status() uses app name from profiles."""
         adapter, storage = _make_mocks()
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        from admedi.engine.loader import load_template as _load
+        with patch(
+            "admedi.engine.engine.load_profiles",
+            return_value=dict(_MOCK_PROFILES),
+        ):
+            result = await engine.status()
 
-        template = _load(TEMPLATE_PATH)
-
-        result = await engine.status(TEMPLATE_PATH)
-
-        expected_names = {app.name for app in template.portfolio}
+        expected_names = {p.app_name for p in _MOCK_PROFILES.values()}
         actual_names = {app.app_name for app in result.apps}
         assert actual_names == expected_names
 
     @pytest.mark.asyncio
-    async def test_status_platform_from_template(self) -> None:
-        """status() uses platform from the template portfolio."""
+    async def test_status_platform_from_profiles(self) -> None:
+        """status() uses platform from profiles."""
         adapter, storage = _make_mocks()
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        from admedi.engine.loader import load_template as _load
+        with patch(
+            "admedi.engine.engine.load_profiles",
+            return_value=dict(_MOCK_PROFILES),
+        ):
+            result = await engine.status()
 
-        template = _load(TEMPLATE_PATH)
-
-        result = await engine.status(TEMPLATE_PATH)
-
-        expected_platforms = {app.platform for app in template.portfolio}
+        expected_platforms = {p.platform for p in _MOCK_PROFILES.values()}
         actual_platforms = {app.platform for app in result.apps}
         assert actual_platforms == expected_platforms
 
     @pytest.mark.asyncio
     async def test_status_concurrent_group_and_history_fetches(self) -> None:
-        """status() calls get_groups() and list_sync_history() per app."""
+        """status() calls get_groups() and list_sync_history() per profile."""
         adapter, storage = _make_mocks()
         engine = ConfigEngine(adapter=adapter, storage=storage)
 
-        await engine.status(TEMPLATE_PATH)
+        with patch(
+            "admedi.engine.engine.load_profiles",
+            return_value=dict(_MOCK_PROFILES),
+        ):
+            await engine.status()
 
-        # 6 apps: 6 get_groups calls + 6 list_sync_history calls
-        assert adapter.get_groups.call_count == 6
-        assert storage.list_sync_history.call_count == 6
+        # 2 profiles: 2 get_groups calls + 2 list_sync_history calls
+        assert adapter.get_groups.call_count == 2
+        assert storage.list_sync_history.call_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -412,11 +545,17 @@ class TestImportExport:
 
         assert "ConfigEngine" in admedi.engine.__all__
 
-    def test_engine_all_has_five_entries(self) -> None:
-        """Engine __all__ has 5 entries (Applier, ConfigEngine, compute_diff, load_template, load_tiers_settings)."""
+    def test_engine_all_has_seven_entries(self) -> None:
+        """Engine __all__ has 7 entries (Applier, ConfigEngine, Profile, compute_diff, load_country_groups, load_profiles, resolve_app_tiers)."""
         import admedi.engine
 
-        assert len(admedi.engine.__all__) == 5
+        assert len(admedi.engine.__all__) == 7
+
+    def test_load_template_not_in_engine_all(self) -> None:
+        """load_template is no longer exported from admedi.engine (retired)."""
+        import admedi.engine
+
+        assert "load_template" not in admedi.engine.__all__
 
 
 # ---------------------------------------------------------------------------

@@ -18,9 +18,9 @@ from typer.testing import CliRunner
 from admedi.cli.display import (
     display_apply_result,
     display_audit_table,
+    display_pull,
     display_status_table,
     display_sync_preview,
-    display_tier_warnings,
 )
 from admedi.cli.main import app as cli_app
 from admedi.models.apply_result import (
@@ -924,65 +924,6 @@ class TestDisplayStatusTable:
         assert "App Two" in output
 
 
-# ===========================================================================
-# display_tier_warnings
-# ===========================================================================
-
-
-class TestDisplayTierWarnings:
-    """Tests for display_tier_warnings()."""
-
-    def test_non_empty_warnings_produces_output(self) -> None:
-        """Non-empty warnings list renders a panel with warning text."""
-        console, buf = _make_console()
-        warnings = [
-            "Tier 'Tier 2': countries differ across formats "
-            "(interstitial: [AU, NL], rewarded: [AU, NZ]) -- merged to union [AU, NL, NZ]"
-        ]
-
-        display_tier_warnings(warnings, console=console)
-        output = buf.getvalue()
-
-        assert "Tier 2" in output
-        assert "countries differ" in output
-        assert "Tier Warnings" in output
-
-    def test_empty_warnings_produces_no_output(self) -> None:
-        """Empty warnings list produces no console output."""
-        console, buf = _make_console()
-
-        display_tier_warnings([], console=console)
-        output = buf.getvalue()
-
-        assert output == ""
-
-    def test_multiple_warnings_all_shown(self) -> None:
-        """Multiple warning strings each appear in the output."""
-        console, buf = _make_console()
-        warnings = [
-            "Tier 'Tier 2': countries differ across formats "
-            "(interstitial: [AU, NL], rewarded: [AU, NZ]) -- merged to union [AU, NL, NZ]",
-            "Tier 'Tier 3': countries differ across formats "
-            "(banner: [JP], rewarded: [JP, KR]) -- merged to union [JP, KR]",
-        ]
-
-        display_tier_warnings(warnings, console=console)
-        output = buf.getvalue()
-
-        assert "Tier 2" in output
-        assert "Tier 3" in output
-        assert "merged to union" in output
-
-    def test_warning_panel_has_yellow_styling(self) -> None:
-        """Warning panel title contains 'Tier Warnings'."""
-        console, buf = _make_console()
-        warnings = ["Tier 'Test': some warning"]
-
-        display_tier_warnings(warnings, console=console)
-        output = buf.getvalue()
-
-        assert "Tier Warnings" in output
-
 
 # ===========================================================================
 # Step 12: CLI Command Tests
@@ -1080,8 +1021,454 @@ def _mock_credential() -> MagicMock:
     return cred
 
 
+# ---------------------------------------------------------------------------
+# _resolve_profile() tests
+# ---------------------------------------------------------------------------
+
+
+class TestResolveProfile:
+    """Tests for _resolve_profile() in CLI."""
+
+    @patch("admedi.cli.main.load_profiles")
+    def test_returns_profile_for_known_alias(self, mock_load: MagicMock) -> None:
+        """_resolve_profile() returns a Profile object for a known alias."""
+        from admedi.cli.main import _resolve_profile
+        from admedi.engine.loader import Profile
+
+        mock_load.return_value = {
+            "hexar-ios": Profile(
+                alias="hexar-ios", app_key="676996cd",
+                app_name="Hexar.io iOS", platform=Platform.IOS,
+            ),
+        }
+
+        result = _resolve_profile("hexar-ios")
+        assert isinstance(result, Profile)
+        assert result.app_key == "676996cd"
+        assert result.platform == Platform.IOS
+
+    @patch("admedi.cli.main.load_profiles")
+    def test_raises_for_unknown_alias(self, mock_load: MagicMock) -> None:
+        """_resolve_profile() raises ConfigValidationError for unknown alias."""
+        from admedi.cli.main import _resolve_profile
+        from admedi.engine.loader import Profile
+        from admedi.exceptions import ConfigValidationError
+
+        mock_load.return_value = {
+            "hexar-ios": Profile(
+                alias="hexar-ios", app_key="676996cd",
+                app_name="Hexar.io iOS", platform=Platform.IOS,
+            ),
+        }
+
+        with pytest.raises(ConfigValidationError, match="Unknown profile alias 'bad-alias'"):
+            _resolve_profile("bad-alias")
+
+    @patch("admedi.cli.main.load_profiles")
+    def test_error_lists_available_profiles(self, mock_load: MagicMock) -> None:
+        """Error message from _resolve_profile() lists available profile aliases."""
+        from admedi.cli.main import _resolve_profile
+        from admedi.engine.loader import Profile
+        from admedi.exceptions import ConfigValidationError
+
+        mock_load.return_value = {
+            "hexar-ios": Profile(
+                alias="hexar-ios", app_key="676996cd",
+                app_name="Hexar.io iOS", platform=Platform.IOS,
+            ),
+            "ss-ios": Profile(
+                alias="ss-ios", app_key="1f93a90ad",
+                app_name="Shelf Sort iOS", platform=Platform.IOS,
+            ),
+        }
+
+        with pytest.raises(ConfigValidationError) as exc_info:
+            _resolve_profile("nonexistent")
+        assert "hexar-ios" in exc_info.value.message
+        assert "ss-ios" in exc_info.value.message
+
+    @patch("admedi.cli.main.load_profiles")
+    def test_callers_access_app_key(self, mock_load: MagicMock) -> None:
+        """Callers can access profile.app_key for backward compat."""
+        from admedi.cli.main import _resolve_profile
+        from admedi.engine.loader import Profile
+
+        mock_load.return_value = {
+            "hexar-ios": Profile(
+                alias="hexar-ios", app_key="676996cd",
+                app_name="Hexar.io iOS", platform=Platform.IOS,
+            ),
+        }
+
+        profile = _resolve_profile("hexar-ios")
+        # This is the pattern used by sync/audit after Step 3
+        app_key = profile.app_key
+        assert app_key == "676996cd"
+
+
+# ---------------------------------------------------------------------------
+# Pull command tests
+# ---------------------------------------------------------------------------
+
+
+class TestPullCommand:
+    """Tests for the 'admedi pull' CLI command."""
+
+    @patch("admedi.cli.main.save_raw_snapshot")
+    @patch("admedi.cli.main.write_yaml_file")
+    @patch("admedi.cli.main.extract_network_presets")
+    @patch("admedi.cli.main.generate_app_settings")
+    @patch("admedi.cli.main.LevelPlayAdapter")
+    @patch("admedi.cli.main._resolve_profile")
+    @patch("admedi.cli.main.load_credential_from_env")
+    def test_pull_invokes_correct_flow(
+        self, mock_load_cred: MagicMock, mock_resolve_profile: MagicMock,
+        mock_adapter_cls: MagicMock, mock_gen_settings: MagicMock,
+        mock_extract_presets: MagicMock, mock_write_yaml: MagicMock,
+        mock_save_raw: MagicMock,
+    ) -> None:
+        """pull --app hexar-ios invokes the full pull flow."""
+        from admedi.engine.loader import Profile
+        from admedi.models.app import App
+
+        mock_load_cred.return_value = _mock_credential()
+        mock_resolve_profile.return_value = Profile(
+            alias="hexar-ios", app_key="676996cd",
+            app_name="Hexar.io iOS", platform=Platform.IOS,
+        )
+
+        mock_adapter = AsyncMock()
+        mock_adapter_cls.return_value.__aenter__ = AsyncMock(return_value=mock_adapter)
+        mock_adapter_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_adapter.get_groups.return_value = []
+        mock_adapter.list_apps.return_value = [
+            App(app_key="676996cd", app_name="Hexar.io iOS", platform=Platform.IOS),
+        ]
+
+        mock_gen_settings.return_value = ("settings/hexar-ios.yaml", [])
+        mock_extract_presets.return_value = {}
+        mock_save_raw.return_value = "snapshots/hexar-ios.yaml"
+
+        result = runner.invoke(cli_app, ["pull", "--app", "hexar-ios"])
+
+        assert result.exit_code == 0
+        mock_resolve_profile.assert_called_once_with("hexar-ios")
+        mock_adapter.get_groups.assert_awaited_once_with("676996cd")
+        mock_gen_settings.assert_called_once()
+        mock_save_raw.assert_called_once()
+
+    @patch("admedi.cli.main._resolve_profile")
+    @patch("admedi.cli.main.load_credential_from_env")
+    def test_pull_unknown_alias_exits_2(
+        self, mock_load_cred: MagicMock, mock_resolve_profile: MagicMock,
+    ) -> None:
+        """pull --app unknown-alias exits 2 with error message."""
+        from admedi.exceptions import ConfigValidationError
+
+        mock_load_cred.return_value = _mock_credential()
+        mock_resolve_profile.side_effect = ConfigValidationError(
+            "Unknown profile alias 'unknown-alias'. Available profiles: hexar-ios, ss-ios"
+        )
+
+        result = runner.invoke(cli_app, ["pull", "--app", "unknown-alias"])
+
+        assert result.exit_code == 2
+        assert "Unknown profile alias" in result.output
+
+    @patch("admedi.cli.main.save_raw_snapshot")
+    @patch("admedi.cli.main.write_yaml_file")
+    @patch("admedi.cli.main.extract_network_presets")
+    @patch("admedi.cli.main.generate_app_settings")
+    @patch("admedi.cli.main.LevelPlayAdapter")
+    @patch("admedi.cli.main._resolve_profile")
+    @patch("admedi.cli.main.load_credential_from_env")
+    def test_pull_metadata_drift_warning(
+        self, mock_load_cred: MagicMock, mock_resolve_profile: MagicMock,
+        mock_adapter_cls: MagicMock, mock_gen_settings: MagicMock,
+        mock_extract_presets: MagicMock, mock_write_yaml: MagicMock,
+        mock_save_raw: MagicMock,
+    ) -> None:
+        """Profile metadata drift warning appears when API returns different app_name."""
+        from admedi.engine.loader import Profile
+        from admedi.models.app import App
+
+        mock_load_cred.return_value = _mock_credential()
+        mock_resolve_profile.return_value = Profile(
+            alias="hexar-ios", app_key="676996cd",
+            app_name="Old Name", platform=Platform.IOS,
+        )
+
+        mock_adapter = AsyncMock()
+        mock_adapter_cls.return_value.__aenter__ = AsyncMock(return_value=mock_adapter)
+        mock_adapter_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_adapter.get_groups.return_value = []
+        mock_adapter.list_apps.return_value = [
+            App(app_key="676996cd", app_name="New Name", platform=Platform.IOS),
+        ]
+
+        mock_gen_settings.return_value = ("settings/hexar-ios.yaml", [])
+        mock_extract_presets.return_value = {}
+        mock_save_raw.return_value = "snapshots/hexar-ios.yaml"
+
+        result = runner.invoke(cli_app, ["pull", "--app", "hexar-ios"])
+
+        assert result.exit_code == 0
+        assert "Warning" in result.output
+        assert "Old Name" in result.output
+        assert "New Name" in result.output
+
+    @patch("admedi.cli.main.save_raw_snapshot")
+    @patch("admedi.cli.main.write_yaml_file")
+    @patch("admedi.cli.main.extract_network_presets")
+    @patch("admedi.cli.main.generate_app_settings")
+    @patch("admedi.cli.main.LevelPlayAdapter")
+    @patch("admedi.cli.main._resolve_profile")
+    @patch("admedi.cli.main.load_credential_from_env")
+    def test_pull_writes_networks_file_when_presets_exist(
+        self, mock_load_cred: MagicMock, mock_resolve_profile: MagicMock,
+        mock_adapter_cls: MagicMock, mock_gen_settings: MagicMock,
+        mock_extract_presets: MagicMock, mock_write_yaml: MagicMock,
+        mock_save_raw: MagicMock,
+    ) -> None:
+        """Pull writes networks file when extract_network_presets returns presets."""
+        from admedi.engine.loader import Profile
+        from admedi.models.app import App
+
+        mock_load_cred.return_value = _mock_credential()
+        mock_resolve_profile.return_value = Profile(
+            alias="hexar-ios", app_key="676996cd",
+            app_name="Hexar.io iOS", platform=Platform.IOS,
+        )
+
+        mock_adapter = AsyncMock()
+        mock_adapter_cls.return_value.__aenter__ = AsyncMock(return_value=mock_adapter)
+        mock_adapter_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_adapter.get_groups.return_value = []
+        mock_adapter.list_apps.return_value = [
+            App(app_key="676996cd", app_name="Hexar.io iOS", platform=Platform.IOS),
+        ]
+
+        mock_gen_settings.return_value = ("settings/hexar-ios.yaml", [])
+        mock_extract_presets.return_value = {"bidding": [{"network": "Meta", "bidder": True}]}
+        mock_save_raw.return_value = "snapshots/hexar-ios.yaml"
+
+        result = runner.invoke(cli_app, ["pull", "--app", "hexar-ios"])
+
+        assert result.exit_code == 0
+        mock_write_yaml.assert_called_once()
+        call_args = mock_write_yaml.call_args
+        assert "hexar-ios-networks.yaml" in str(call_args.args[0])
+
+    @patch("admedi.cli.main.save_raw_snapshot")
+    @patch("admedi.cli.main.write_yaml_file")
+    @patch("admedi.cli.main.extract_network_presets")
+    @patch("admedi.cli.main.generate_app_settings")
+    @patch("admedi.cli.main.LevelPlayAdapter")
+    @patch("admedi.cli.main._resolve_profile")
+    @patch("admedi.cli.main.load_credential_from_env")
+    def test_pull_skips_networks_file_when_no_presets(
+        self, mock_load_cred: MagicMock, mock_resolve_profile: MagicMock,
+        mock_adapter_cls: MagicMock, mock_gen_settings: MagicMock,
+        mock_extract_presets: MagicMock, mock_write_yaml: MagicMock,
+        mock_save_raw: MagicMock,
+    ) -> None:
+        """Pull does not write networks file when extract_network_presets returns empty."""
+        from admedi.engine.loader import Profile
+        from admedi.models.app import App
+
+        mock_load_cred.return_value = _mock_credential()
+        mock_resolve_profile.return_value = Profile(
+            alias="hexar-ios", app_key="676996cd",
+            app_name="Hexar.io iOS", platform=Platform.IOS,
+        )
+
+        mock_adapter = AsyncMock()
+        mock_adapter_cls.return_value.__aenter__ = AsyncMock(return_value=mock_adapter)
+        mock_adapter_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_adapter.get_groups.return_value = []
+        mock_adapter.list_apps.return_value = [
+            App(app_key="676996cd", app_name="Hexar.io iOS", platform=Platform.IOS),
+        ]
+
+        mock_gen_settings.return_value = ("settings/hexar-ios.yaml", [])
+        mock_extract_presets.return_value = {}
+        mock_save_raw.return_value = "snapshots/hexar-ios.yaml"
+
+        result = runner.invoke(cli_app, ["pull", "--app", "hexar-ios"])
+
+        assert result.exit_code == 0
+        mock_write_yaml.assert_not_called()
+
+    @patch("admedi.cli.main.save_raw_snapshot")
+    @patch("admedi.cli.main.write_yaml_file")
+    @patch("admedi.cli.main.extract_network_presets")
+    @patch("admedi.cli.main.generate_app_settings")
+    @patch("admedi.cli.main.LevelPlayAdapter")
+    @patch("admedi.cli.main._resolve_profile")
+    @patch("admedi.cli.main.load_credential_from_env")
+    def test_pull_saves_raw_snapshot(
+        self, mock_load_cred: MagicMock, mock_resolve_profile: MagicMock,
+        mock_adapter_cls: MagicMock, mock_gen_settings: MagicMock,
+        mock_extract_presets: MagicMock, mock_write_yaml: MagicMock,
+        mock_save_raw: MagicMock,
+    ) -> None:
+        """Pull saves raw snapshot to snapshots/{alias}.yaml."""
+        from admedi.engine.loader import Profile
+        from admedi.models.app import App
+
+        mock_load_cred.return_value = _mock_credential()
+        mock_resolve_profile.return_value = Profile(
+            alias="hexar-ios", app_key="676996cd",
+            app_name="Hexar.io iOS", platform=Platform.IOS,
+        )
+
+        mock_adapter = AsyncMock()
+        mock_adapter_cls.return_value.__aenter__ = AsyncMock(return_value=mock_adapter)
+        mock_adapter_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_adapter.get_groups.return_value = []
+        mock_adapter.list_apps.return_value = [
+            App(app_key="676996cd", app_name="Hexar.io iOS", platform=Platform.IOS),
+        ]
+
+        mock_gen_settings.return_value = ("settings/hexar-ios.yaml", [])
+        mock_extract_presets.return_value = {}
+        mock_save_raw.return_value = "snapshots/hexar-ios.yaml"
+
+        result = runner.invoke(cli_app, ["pull", "--app", "hexar-ios"])
+
+        assert result.exit_code == 0
+        mock_save_raw.assert_called_once()
+        call_kwargs = mock_save_raw.call_args
+        assert call_kwargs.kwargs["alias"] == "hexar-ios"
+
+    @patch("admedi.cli.main.load_credential_from_env")
+    def test_pull_missing_credentials_exits_2(
+        self, mock_load_cred: MagicMock,
+    ) -> None:
+        """Missing credentials on pull produce exit code 2."""
+        from admedi.exceptions import AuthError
+
+        mock_load_cred.side_effect = AuthError(
+            "Missing required environment variable(s): LEVELPLAY_SECRET_KEY"
+        )
+
+        result = runner.invoke(cli_app, ["pull", "--app", "hexar-ios"])
+
+        assert result.exit_code == 2
+        assert "LEVELPLAY_SECRET_KEY" in result.output
+
+
+# ---------------------------------------------------------------------------
+# CLI registration and dead code tests
+# ---------------------------------------------------------------------------
+
+
+class TestCliRegistration:
+    """Tests for CLI command registration and dead code removal."""
+
+    def test_show_command_not_registered(self) -> None:
+        """'admedi show' is no longer a valid command."""
+        result = runner.invoke(cli_app, ["show", "--app", "hexar-ios"])
+        assert result.exit_code == 2  # typer usage error
+
+    def test_pull_command_registered(self) -> None:
+        """'admedi pull' is a registered command."""
+        result = runner.invoke(cli_app, ["pull", "--help"])
+        assert result.exit_code == 0
+        assert "pull" in result.output.lower()
+
+    def test_resolve_app_key_removed(self) -> None:
+        """_resolve_app_key() no longer exists in cli/main.py."""
+        import admedi.cli.main as main_module
+        assert not hasattr(main_module, "_resolve_app_key")
+
+    def test_display_tier_warnings_removed(self) -> None:
+        """display_tier_warnings() no longer exists in cli/display.py."""
+        import admedi.cli.display as display_module
+        assert not hasattr(display_module, "display_tier_warnings")
+
+    def test_display_show_removed(self) -> None:
+        """display_show() no longer exists in cli/display.py."""
+        import admedi.cli.display as display_module
+        assert not hasattr(display_module, "display_show")
+
+    def test_display_pull_exists(self) -> None:
+        """display_pull() exists in cli/display.py."""
+        import admedi.cli.display as display_module
+        assert hasattr(display_module, "display_pull")
+
+
+# ---------------------------------------------------------------------------
+# display_pull() direct tests
+# ---------------------------------------------------------------------------
+
+
+class TestDisplayPull:
+    """Tests for display_pull() rendering."""
+
+    def test_display_pull_shows_app_metadata(self) -> None:
+        """display_pull() shows app name, platform, and key in header."""
+        from admedi.models.app import App
+
+        console, buf = _make_console()
+        app = App(app_key="abc123", app_name="Test App", platform=Platform.IOS)
+
+        display_pull(app, [], console=console)
+        output = buf.getvalue()
+
+        assert "Test App" in output
+        assert "iOS" in output
+        assert "abc123" in output
+
+    def test_display_pull_shows_networks_path(self) -> None:
+        """display_pull() shows networks path in footer when provided."""
+        from admedi.models.app import App
+
+        console, buf = _make_console()
+        app = App(app_key="abc123", app_name="Test App", platform=Platform.IOS)
+
+        display_pull(
+            app, [],
+            networks_path="settings/test-networks.yaml",
+            console=console,
+        )
+        output = buf.getvalue()
+
+        assert "Networks saved to:" in output
+        assert "test-networks.yaml" in output
+
+    def test_display_pull_shows_info_messages(self) -> None:
+        """display_pull() renders info messages from settings generation."""
+        from admedi.models.app import App
+
+        console, buf = _make_console()
+        app = App(app_key="abc123", app_name="Test App", platform=Platform.IOS)
+
+        display_pull(
+            app, [],
+            info_messages=["Created tier 'Tier 1' -> country group 'US'"],
+            console=console,
+        )
+        output = buf.getvalue()
+
+        assert "Created tier" in output
+        assert "Tier 1" in output
+
+    def test_display_pull_no_info_messages_when_none(self) -> None:
+        """display_pull() does not render info section when messages is None."""
+        from admedi.models.app import App
+
+        console, buf = _make_console()
+        app = App(app_key="abc123", app_name="Test App", platform=Platform.IOS)
+
+        display_pull(app, [], console=console)
+        output = buf.getvalue()
+
+        assert "Created tier" not in output
+
+
 class TestAuditCommand:
-    """Tests for the 'admedi audit' CLI command."""
+    """Tests for the 'admedi audit' CLI command (profiles-based, no --config)."""
 
     @patch("admedi.cli.main.ConfigEngine")
     @patch("admedi.cli.main.LevelPlayAdapter")
@@ -1100,7 +1487,7 @@ class TestAuditCommand:
         mock_engine.audit = AsyncMock(return_value=_make_no_drift_report())
         mock_engine_cls.return_value = mock_engine
 
-        result = runner.invoke(cli_app, ["audit", "--config", "fake.yaml"])
+        result = runner.invoke(cli_app, ["audit"])
 
         assert result.exit_code == 0
 
@@ -1121,7 +1508,7 @@ class TestAuditCommand:
         mock_engine.audit = AsyncMock(return_value=_make_drift_report())
         mock_engine_cls.return_value = mock_engine
 
-        result = runner.invoke(cli_app, ["audit", "--config", "fake.yaml"])
+        result = runner.invoke(cli_app, ["audit"])
 
         assert result.exit_code == 1
 
@@ -1143,37 +1530,45 @@ class TestAuditCommand:
         mock_engine_cls.return_value = mock_engine
 
         result = runner.invoke(
-            cli_app, ["audit", "--config", "fake.yaml", "--format", "json"]
+            cli_app, ["audit", "--format", "json"]
         )
 
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert "app_reports" in data
 
+    @patch("admedi.cli.main._resolve_profile")
     @patch("admedi.cli.main.ConfigEngine")
     @patch("admedi.cli.main.LevelPlayAdapter")
     @patch("admedi.cli.main.load_credential_from_env")
     def test_audit_with_app_filter(
         self, mock_load_cred: MagicMock, mock_adapter_cls: MagicMock,
-        mock_engine_cls: MagicMock,
+        mock_engine_cls: MagicMock, mock_resolve_profile: MagicMock,
     ) -> None:
-        """--app flag passes app_keys to engine.audit()."""
+        """--app flag passes aliases to engine.audit()."""
+        from admedi.engine.loader import Profile
+
         mock_load_cred.return_value = _mock_credential()
         mock_adapter = AsyncMock()
         mock_adapter_cls.return_value.__aenter__ = AsyncMock(return_value=mock_adapter)
         mock_adapter_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        mock_resolve_profile.return_value = Profile(
+            alias="hexar-ios", app_key="abc123",
+            app_name="Hexar iOS", platform=Platform.IOS,
+        )
 
         mock_engine = MagicMock()
         mock_engine.audit = AsyncMock(return_value=_make_no_drift_report())
         mock_engine_cls.return_value = mock_engine
 
         runner.invoke(
-            cli_app, ["audit", "--config", "fake.yaml", "--app", "abc123"]
+            cli_app, ["audit", "--app", "hexar-ios"]
         )
 
         mock_engine.audit.assert_awaited_once()
         call_kwargs = mock_engine.audit.call_args
-        assert call_kwargs.kwargs["app_keys"] == ["abc123"]
+        assert call_kwargs.kwargs["aliases"] == ["hexar-ios"]
 
     @patch("admedi.cli.main.load_credential_from_env")
     def test_audit_missing_credentials_exits_2(
@@ -1186,7 +1581,7 @@ class TestAuditCommand:
             "Missing required environment variable(s): LEVELPLAY_SECRET_KEY"
         )
 
-        result = runner.invoke(cli_app, ["audit", "--config", "fake.yaml"])
+        result = runner.invoke(cli_app, ["audit"])
 
         assert result.exit_code == 2
         assert "LEVELPLAY_SECRET_KEY" in result.output
@@ -1210,13 +1605,17 @@ class TestSyncCommand:
         Returns:
             Tuple of (mock_adapter, mock_compute_diff) for further configuration.
         """
+        from admedi.engine.loader import Profile
         from admedi.models.app import App
         from admedi.models.portfolio import PortfolioTier
 
         mock_load_cred.return_value = _mock_credential()
 
-        # _resolve_app_key returns the alias as-is (no profiles.yaml lookup)
-        mock_resolve.side_effect = lambda v: v
+        # _resolve_profile returns a Profile with app_key matching alias
+        mock_resolve.side_effect = lambda v: Profile(
+            alias=v, app_key=v,
+            app_name=f"Mock {v}", platform=Platform.IOS,
+        )
 
         mock_adapter = AsyncMock()
         mock_adapter_cls.return_value.__aenter__ = AsyncMock(return_value=mock_adapter)
@@ -1237,7 +1636,7 @@ class TestSyncCommand:
         ]
         mock_adapter.get_groups.return_value = []
 
-        # Mock load_tiers_settings to return test tiers
+        # Mock resolve_app_tiers to return test tiers
         mock_load_tiers.return_value = [
             PortfolioTier(
                 name="Tier 1",
@@ -1257,9 +1656,9 @@ class TestSyncCommand:
         return mock_adapter, mock_compute_diff
 
     @patch("admedi.cli.main.compute_diff")
-    @patch("admedi.cli.main.load_tiers_settings")
+    @patch("admedi.cli.main.resolve_app_tiers")
     @patch("admedi.cli.main.LevelPlayAdapter")
-    @patch("admedi.cli.main._resolve_app_key")
+    @patch("admedi.cli.main._resolve_profile")
     @patch("admedi.cli.main.load_credential_from_env")
     def test_sync_tiers_self_no_drift_exits_0(
         self, mock_load_cred: MagicMock, mock_resolve: MagicMock,
@@ -1279,9 +1678,9 @@ class TestSyncCommand:
         assert result.exit_code == 0
 
     @patch("admedi.cli.main.compute_diff")
-    @patch("admedi.cli.main.load_tiers_settings")
+    @patch("admedi.cli.main.resolve_app_tiers")
     @patch("admedi.cli.main.LevelPlayAdapter")
-    @patch("admedi.cli.main._resolve_app_key")
+    @patch("admedi.cli.main._resolve_profile")
     @patch("admedi.cli.main.load_credential_from_env")
     def test_sync_tiers_dry_run_exits_1_when_drift(
         self, mock_load_cred: MagicMock, mock_resolve: MagicMock,
@@ -1302,9 +1701,9 @@ class TestSyncCommand:
 
     @patch("admedi.cli.main.Applier")
     @patch("admedi.cli.main.compute_diff")
-    @patch("admedi.cli.main.load_tiers_settings")
+    @patch("admedi.cli.main.resolve_app_tiers")
     @patch("admedi.cli.main.LevelPlayAdapter")
-    @patch("admedi.cli.main._resolve_app_key")
+    @patch("admedi.cli.main._resolve_profile")
     @patch("admedi.cli.main.load_credential_from_env")
     def test_sync_tiers_applies_changes_without_dry_run(
         self, mock_load_cred: MagicMock, mock_resolve: MagicMock,
@@ -1330,9 +1729,9 @@ class TestSyncCommand:
         mock_applier.apply.assert_awaited_once()
 
     @patch("admedi.cli.main.compute_diff")
-    @patch("admedi.cli.main.load_tiers_settings")
+    @patch("admedi.cli.main.resolve_app_tiers")
     @patch("admedi.cli.main.LevelPlayAdapter")
-    @patch("admedi.cli.main._resolve_app_key")
+    @patch("admedi.cli.main._resolve_profile")
     @patch("admedi.cli.main.load_credential_from_env")
     def test_sync_tiers_cross_app_positional_args(
         self, mock_load_cred: MagicMock, mock_resolve: MagicMock,
@@ -1350,13 +1749,13 @@ class TestSyncCommand:
         )
 
         assert result.exit_code == 0
-        # Verify load_tiers_settings was called with source alias
+        # Verify resolve_app_tiers was called with source alias
         mock_load_tiers.assert_called_once_with("hexar-ios")
 
     @patch("admedi.cli.main.compute_diff")
-    @patch("admedi.cli.main.load_tiers_settings")
+    @patch("admedi.cli.main.resolve_app_tiers")
     @patch("admedi.cli.main.LevelPlayAdapter")
-    @patch("admedi.cli.main._resolve_app_key")
+    @patch("admedi.cli.main._resolve_profile")
     @patch("admedi.cli.main.load_credential_from_env")
     def test_sync_no_scope_defaults_to_tiers(
         self, mock_load_cred: MagicMock, mock_resolve: MagicMock,
@@ -1374,7 +1773,7 @@ class TestSyncCommand:
         )
 
         assert result.exit_code == 0
-        # load_tiers_settings should be called since --tiers is defaulted
+        # resolve_app_tiers should be called since --tiers is defaulted
         mock_load_tiers.assert_called_once()
 
     @patch("admedi.cli.main.load_credential_from_env")
@@ -1392,9 +1791,9 @@ class TestSyncCommand:
         assert "not yet implemented" in result.output.lower()
 
     @patch("admedi.cli.main.compute_diff")
-    @patch("admedi.cli.main.load_tiers_settings")
+    @patch("admedi.cli.main.resolve_app_tiers")
     @patch("admedi.cli.main.LevelPlayAdapter")
-    @patch("admedi.cli.main._resolve_app_key")
+    @patch("admedi.cli.main._resolve_profile")
     @patch("admedi.cli.main.load_credential_from_env")
     def test_sync_tiers_format_json_produces_valid_json(
         self, mock_load_cred: MagicMock, mock_resolve: MagicMock,
@@ -1427,7 +1826,7 @@ class TestSyncCommand:
 
 
 class TestStatusCommand:
-    """Tests for the 'admedi status' CLI command."""
+    """Tests for the 'admedi status' CLI command (profiles-based, no --config)."""
 
     @patch("admedi.cli.main.ConfigEngine")
     @patch("admedi.cli.main.LevelPlayAdapter")
@@ -1446,7 +1845,7 @@ class TestStatusCommand:
         mock_engine.status = AsyncMock(return_value=_make_portfolio_status())
         mock_engine_cls.return_value = mock_engine
 
-        result = runner.invoke(cli_app, ["status", "--config", "fake.yaml"])
+        result = runner.invoke(cli_app, ["status"])
 
         assert result.exit_code == 0
 
@@ -1468,7 +1867,7 @@ class TestStatusCommand:
         mock_engine_cls.return_value = mock_engine
 
         result = runner.invoke(
-            cli_app, ["status", "--config", "fake.yaml", "--format", "json"]
+            cli_app, ["status", "--format", "json"]
         )
 
         assert result.exit_code == 0
@@ -1487,7 +1886,7 @@ class TestStatusCommand:
             "Missing required environment variable(s): LEVELPLAY_REFRESH_TOKEN"
         )
 
-        result = runner.invoke(cli_app, ["status", "--config", "fake.yaml"])
+        result = runner.invoke(cli_app, ["status"])
 
         assert result.exit_code == 2
         assert "LEVELPLAY_REFRESH_TOKEN" in result.output
@@ -1509,9 +1908,10 @@ class TestCliCredentialErrors:
         )
 
         for cmd_args in [
-            ["audit", "--config", "fake.yaml"],
+            ["pull", "--app", "fake"],
+            ["audit"],
             ["sync", "--tiers", "fake"],
-            ["status", "--config", "fake.yaml"],
+            ["status"],
         ]:
             result = runner.invoke(cli_app, cmd_args)
             assert result.exit_code == 2, f"Failed for: {cmd_args}"
@@ -1817,9 +2217,9 @@ class TestSyncExtraToDeletePostProcessing:
     """
 
     @patch("admedi.cli.main.compute_diff")
-    @patch("admedi.cli.main.load_tiers_settings")
+    @patch("admedi.cli.main.resolve_app_tiers")
     @patch("admedi.cli.main.LevelPlayAdapter")
-    @patch("admedi.cli.main._resolve_app_key")
+    @patch("admedi.cli.main._resolve_profile")
     @patch("admedi.cli.main.load_credential_from_env")
     def test_sync_converts_extra_to_delete_in_dry_run(
         self, mock_load_cred: MagicMock, mock_resolve: MagicMock,
@@ -1827,11 +2227,14 @@ class TestSyncExtraToDeletePostProcessing:
         mock_load_tiers: MagicMock, mock_compute_diff: MagicMock,
     ) -> None:
         """EXTRA groups are converted to DELETE before display in dry-run JSON output."""
+        from admedi.engine.loader import Profile
         from admedi.models.portfolio import PortfolioTier
         from admedi.models.app import App
 
         mock_load_cred.return_value = _mock_credential()
-        mock_resolve.side_effect = lambda v: v
+        mock_resolve.side_effect = lambda v: Profile(
+            alias=v, app_key=v, app_name=f"Mock {v}", platform=Platform.IOS,
+        )
 
         mock_adapter = AsyncMock()
         mock_adapter_cls.return_value.__aenter__ = AsyncMock(return_value=mock_adapter)
@@ -1876,9 +2279,9 @@ class TestSyncExtraToDeletePostProcessing:
         assert "delete" in actions
 
     @patch("admedi.cli.main.compute_diff")
-    @patch("admedi.cli.main.load_tiers_settings")
+    @patch("admedi.cli.main.resolve_app_tiers")
     @patch("admedi.cli.main.LevelPlayAdapter")
-    @patch("admedi.cli.main._resolve_app_key")
+    @patch("admedi.cli.main._resolve_profile")
     @patch("admedi.cli.main.load_credential_from_env")
     def test_sync_only_deletes_triggers_drift(
         self, mock_load_cred: MagicMock, mock_resolve: MagicMock,
@@ -1886,11 +2289,14 @@ class TestSyncExtraToDeletePostProcessing:
         mock_load_tiers: MagicMock, mock_compute_diff: MagicMock,
     ) -> None:
         """Sync with only EXTRA diffs (converted to DELETE) triggers drift and exits 1 on dry-run."""
+        from admedi.engine.loader import Profile
         from admedi.models.portfolio import PortfolioTier
         from admedi.models.app import App
 
         mock_load_cred.return_value = _mock_credential()
-        mock_resolve.side_effect = lambda v: v
+        mock_resolve.side_effect = lambda v: Profile(
+            alias=v, app_key=v, app_name=f"Mock {v}", platform=Platform.IOS,
+        )
 
         mock_adapter = AsyncMock()
         mock_adapter_cls.return_value.__aenter__ = AsyncMock(return_value=mock_adapter)
@@ -1920,9 +2326,9 @@ class TestSyncExtraToDeletePostProcessing:
 
     @patch("admedi.cli.main.Applier")
     @patch("admedi.cli.main.compute_diff")
-    @patch("admedi.cli.main.load_tiers_settings")
+    @patch("admedi.cli.main.resolve_app_tiers")
     @patch("admedi.cli.main.LevelPlayAdapter")
-    @patch("admedi.cli.main._resolve_app_key")
+    @patch("admedi.cli.main._resolve_profile")
     @patch("admedi.cli.main.load_credential_from_env")
     def test_sync_only_deletes_applies_when_not_dry_run(
         self, mock_load_cred: MagicMock, mock_resolve: MagicMock,
@@ -1931,11 +2337,14 @@ class TestSyncExtraToDeletePostProcessing:
         mock_applier_cls: MagicMock,
     ) -> None:
         """Sync with only DELETE diffs (from EXTRA conversion) applies changes when not dry-run."""
+        from admedi.engine.loader import Profile
         from admedi.models.portfolio import PortfolioTier
         from admedi.models.app import App
 
         mock_load_cred.return_value = _mock_credential()
-        mock_resolve.side_effect = lambda v: v
+        mock_resolve.side_effect = lambda v: Profile(
+            alias=v, app_key=v, app_name=f"Mock {v}", platform=Platform.IOS,
+        )
 
         mock_adapter = AsyncMock()
         mock_adapter_cls.return_value.__aenter__ = AsyncMock(return_value=mock_adapter)
@@ -1999,9 +2408,9 @@ class TestSyncExtraToDeletePostProcessing:
         assert has_drift is True
 
     @patch("admedi.cli.main.compute_diff")
-    @patch("admedi.cli.main.load_tiers_settings")
+    @patch("admedi.cli.main.resolve_app_tiers")
     @patch("admedi.cli.main.LevelPlayAdapter")
-    @patch("admedi.cli.main._resolve_app_key")
+    @patch("admedi.cli.main._resolve_profile")
     @patch("admedi.cli.main.load_credential_from_env")
     def test_sync_dry_run_with_delete_shows_preview_exits_1(
         self, mock_load_cred: MagicMock, mock_resolve: MagicMock,
@@ -2009,11 +2418,14 @@ class TestSyncExtraToDeletePostProcessing:
         mock_load_tiers: MagicMock, mock_compute_diff: MagicMock,
     ) -> None:
         """Dry-run with DELETE diffs shows preview and exits 1."""
+        from admedi.engine.loader import Profile
         from admedi.models.portfolio import PortfolioTier
         from admedi.models.app import App
 
         mock_load_cred.return_value = _mock_credential()
-        mock_resolve.side_effect = lambda v: v
+        mock_resolve.side_effect = lambda v: Profile(
+            alias=v, app_key=v, app_name=f"Mock {v}", platform=Platform.IOS,
+        )
 
         mock_adapter = AsyncMock()
         mock_adapter_cls.return_value.__aenter__ = AsyncMock(return_value=mock_adapter)

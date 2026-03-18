@@ -1,10 +1,10 @@
 # Project State: Admedi
 
-> **Last Updated**: 2026-03-17T01:50:02-0700
+> **Last Updated**: 2026-03-17T18:06:41-0700
 
 **Admedi** is a config-driven ad mediation management tool that replaces manual dashboard clicking with config-as-code: define country tiers in YAML, diff against live mediation configs via platform APIs, and sync across an entire app portfolio.
 
-**Current Status**: Core milestone nearing completion -- Foundation, Auth-Reads, Config-Engine, Snapshot-Unify, Unified-Settings, and Sync-UX tasks complete. Sync command now handles convergent round-trips, simplified apply flow, app names in results, and structural mismatch deletion. 1232 tests passing. Next: Dogfood on Shelf Sort portfolio.
+**Current Status**: Core milestone nearing completion -- Foundation, Auth-Reads, Config-Engine, Snapshot-Unify, Unified-Settings, Sync-UX, and Settings-Redesign tasks complete. Three-layer settings architecture operational (countries.yaml, tiers.yaml, per-app settings). Smart `pull` command with country-content matching. `admedi.yaml` retired. 1392 tests passing. Next: Dogfood on Shelf Sort portfolio.
 
 ---
 
@@ -20,11 +20,12 @@
 | snapshot-unify | Unify snapshot and show into single capture + derived view | refactor | ✅ Complete | 60 passing | `core-snapshot-unify-*.md` |
 | unified-settings | Unified settings format for pull-edit-push round-trip | refactor | ✅ Complete | 253 passing | `core-unified-settings-*.md` |
 | sync-ux | Sync command UX improvements | refactor | ✅ Complete | 242 passing | `core-sync-ux-*.md` |
+| settings-redesign | Three-layer settings architecture | refactor | ✅ Complete | 469 passing | `core-settings-redesign-*.md` |
 | dogfood | Shelf Sort Dogfood | validation | ⬜ Pending | -- | -- |
 
 **Post-Core (deferred)**: Instance CRUD, placement ops, reporting API, MCP server, `admedi revenue`, `admedi manage-instances`
 
-**Total Tests**: 1232 passing (2 pre-existing failures in test_config_engine_writes.py), 10 deselected (integration markers)
+**Total Tests**: 1392 passing (2 pre-existing failures in test_config_engine_writes.py), 10 deselected (integration markers)
 
 ---
 
@@ -49,62 +50,69 @@
 | 2026-03-17 | Remove `--yes` flag, two-mode sync (dry-run / apply) | `--dry-run` is the safety gate; `--yes` was redundant. Matches kubectl/rsync pattern. |
 | 2026-03-17 | Sync deletes EXTRA groups by default (no opt-in flag) | Sync means "make it match"; `--dry-run` is the safety gate for deletion too |
 | 2026-03-17 | EXTRA->DELETE conversion in CLI, not differ | Differ stays pure (describes what exists); CLI decides what to do about it |
+| 2026-03-17 | Three-layer settings: countries.yaml + tiers.yaml + per-app | Eliminates country duplication, enables per-format tier differences, single resolution chain to `list[PortfolioTier]` |
+| 2026-03-17 | Smart `pull` matches by country content, not names | Local tier naming is authoritative; `pull` reads by content, `sync` writes by name |
+| 2026-03-17 | Retire `admedi.yaml` monolithic template | Replaced by `profiles.yaml` + three-layer settings; `audit`/`status` use profiles-based app discovery |
+| 2026-03-17 | Rename `show` to `pull` | Clear directionality: `pull` = fetch live, `sync` = push local |
 
 ---
 
 ## What's Next
 
 **Recommended Next Steps**:
-1. Run integration tests with real credentials to validate adapter + write operations against live LevelPlay API
-2. Portfolio Dogfood -- real Shelf Sort validation for 2+ weeks with `admedi sync-tiers`
-3. After dogfood: open-source packaging, MCP server, extended operations
+1. Run `admedi pull --app hexar-ios` against live API to verify end-to-end with new settings format
+2. Migrate: pull all apps, rename auto-generated groups, delete old files (`admedi.yaml`, `*-tiers.yaml`)
+3. Portfolio Dogfood -- real Shelf Sort validation with `admedi sync`
+4. After dogfood: open-source packaging, MCP server, extended operations
 
-**System Status**: ✅ **Sync UX Complete**
-- Full config-as-code pipeline: YAML -> Loader -> Differ -> Applier -> CLI
-- 4 CLI commands: show (dual output), audit, sync (unified), status
-- Pull-edit-push round-trip: `show` writes settings, `sync` reads settings
-- Convergent round-trip: per-format country variance resolved via union + warning
-- Two-mode sync: `--dry-run` (preview) or apply (default), no `--yes` flag
-- Sync deletes EXTRA groups by default (EXTRA->DELETE in CLI, differ stays pure)
-- App names in apply results with fallback to app key
+**System Status**: ✅ **Settings Redesign Complete**
+- Three-layer resolution: per-app -> tiers.yaml -> countries.yaml -> `list[PortfolioTier]`
+- 4 CLI commands: pull (smart matching), audit, sync (unified), status
+- Pull-edit-sync workflow: `pull` writes settings, user edits, `sync` reads settings
+- Smart pull: country-content matching, bootstrap from live API, auto-create tiers/groups
+- Per-format tier differences via different tier names (no convergence hack)
+- Profiles-based app discovery: expanded `profiles.yaml` as single identity source
+- `admedi.yaml` retired from all commands
 - Group write operations: create, update, delete via LevelPlay v4 API
 - Local file storage: JSONL sync logs, per-snapshot JSON files in .admedi/
 - Safety: dry-run default, pre-write snapshots, A/B test detection, post-write verification, per-app error isolation
-- 1232 tests passing
+- 1392 tests passing
 
 ---
 
 ## Latest Health Check
 
-### 2026-03-17 - Sync-UX Task Finalization
+### 2026-03-17 - Settings-Redesign Task Finalization
 **Status**: ✅ On Track
 
 **Context**:
-Sync-UX task completed -- a refactor task in the Core milestone. Four sync command pain points fixed: convergent round-trip (union of per-format country differences + warning), simplified apply flow (removed --yes flag), app names in apply results, and sync deletes extra groups by default.
+Settings-Redesign task completed -- a refactor task in the Core milestone. Replaced monolithic `admedi.yaml` and per-app tiers files with a three-layer architecture: `countries.yaml` (portfolio-wide country groups), `tiers.yaml` (tier-to-group mapping), and per-app settings (format -> tier list). Smart `pull` command with country-content matching replaces dumb `show`.
 
 **Findings**:
-- ✅ Work aligns with Core milestone goals -- sync UX improvements make the tool reliable for real portfolio operations before dogfood
-- ✅ Architecture clean: differ stays pure (EXTRA), CLI converts (DELETE), applier executes -- separation of concerns maintained
-- ✅ No scope drift -- all 11 steps implemented per plan, one documented deviation (stale test in 4th file)
-- ✅ Complexity proportionate -- model additions use defaults for backward compat, EXTRA->DELETE is a 3-line loop, no unnecessary abstractions
-- ✅ 1232 tests passing, 10 integration tests deselected
-- ⚠️ 2 pre-existing test failures in test_config_engine_writes.py (payload format changes in levelplay.py, unrelated to sync-ux)
+- ✅ Work directly aligned with Core milestone -- three-layer settings is the last architecture piece before dogfood
+- ✅ Architecture clean: three-layer resolution chain produces the same `list[PortfolioTier]` type, downstream pipeline (`compute_diff`, `Applier`) unchanged
+- ✅ No scope drift -- all 8 steps (plus Step 0 baseline) implemented per plan specification, zero deviations except one YAML parser behavior correction (bare `*` is alias syntax)
+- ✅ Complexity proportionate -- no unnecessary abstractions, each layer is a single YAML file with a clear loader function
+- ✅ Production integration solid -- `pull` bootstraps from live API, `sync` round-trips through three layers, `audit`/`status` use profiles
+- ✅ 1392 tests passing (up from 1232), 10 integration tests deselected
+- ⚠️ 2 pre-existing test failures in test_config_engine_writes.py remain (payload format, unrelated)
 
 **Challenges**:
-- Full suite run caught a stale test (`test_delete_not_processed`) in `test_config_engine_applier.py` that contradicted the new DELETE behavior. Fixed by updating the test to verify correct behavior.
-- Pre-existing failures in test_config_engine_writes.py from uncommitted levelplay.py payload format changes. Documented but not fixed to maintain scope discipline.
+- ruamel.yaml's safe loader treats bare `*` as YAML alias syntax, not a plain scalar. Plan assumed it would parse as a string. Resolved by always quoting wildcards as `'*'` and updating tests.
+- Old test classes for removed functions (`save_modular_snapshot`, `_extract_tiers`, `_build_app_yaml`) had to be deleted. Test count dropped mid-task before new tests replaced them.
 
 **Results**:
-- ✅ Convergent round-trip: `_extract_tiers()` takes union of per-format countries, emits warning
-- ✅ Simplified apply: `--yes` flag removed, two-mode sync (dry-run / apply)
-- ✅ App names: `AppApplyResult.app_name` threaded through all 6 construction sites, displayed with fallback
-- ✅ Deletion: EXTRA->DELETE in CLI, applier executes before creates/updates, groups_deleted tracking
-- ✅ Documentation updated: README.md and agents.md have zero --yes references
-- ✅ 242 sync-ux-related tests passing across 4 test files
+- ✅ Three-layer resolution: per-app -> tiers.yaml -> countries.yaml -> `list[PortfolioTier]`
+- ✅ Smart `pull` with country-content matching, bootstrap, and auto-create
+- ✅ `admedi.yaml` fully retired from audit, status, and sync
+- ✅ Expanded `profiles.yaml` as single identity source
+- ✅ Per-format tier differences via different tier names (convergence hack eliminated)
+- ✅ Round-trip and zero-drift integration tests prove pipeline correctness
+- ✅ 469 affected tests passing across 5 test files
 
 **Lessons Learned**:
-- EXTRA->DELETE conversion belongs in CLI (not differ) to keep the differ as a pure function
-- Full suite validation catches cross-file regressions outside the plan's affected file list
-- Pydantic defaults enable additive model changes without touching existing construction sites
+- Country-content matching decouples inbound naming from local naming -- `pull` reads by content, `sync` writes by name
+- Round-trip + zero-drift integration tests are the strongest validation for multi-layer resolution pipelines
+- Skip-with-warning vs error-on-explicit is a clean pattern for partial portfolio setups
 
-**Next**: Fix pre-existing test_config_engine_writes.py failures, then proceed to Portfolio Dogfood (Shelf Sort validation with live LevelPlay API)
+**Next**: Run `admedi pull --app hexar-ios` against live API, migrate all apps, then proceed to Portfolio Dogfood

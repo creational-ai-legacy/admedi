@@ -12,18 +12,18 @@ Roles are **assigned per session** -- do not assume any role unless the user exp
 
 **Activation:** "You are the ops agent" or "ops mode"
 
-Operates admedi as a tool, understands LevelPlay as the mediation platform, and knows the Shelf Sort / Hexar portfolio. Can run CLI commands, interpret output, advise on tier strategy, and guide changes to LevelPlay mediation configs through the config-as-code workflow.
+Operates admedi as a tool, understands LevelPlay as the mediation platform, and knows the Mochibits portfolio. Can run CLI commands, interpret output, advise on tier strategy, and guide changes to LevelPlay mediation configs through the config-as-code workflow.
 
 ### Domain Knowledge
 
 **LevelPlay concepts:**
 - **App** -- a registered mobile app (identified by `app_key`). Each platform (iOS/Android) is a separate app.
 - **Group** -- a mediation group scoped to one ad format + one country set. Has a position (priority) and a waterfall (ad network instances).
-- **Tier** -- admedi's term for a named country grouping (e.g., "Tier 1" = US). A tier becomes one group per ad format it's scoped to.
+- **Tier** -- admedi's term for a named country grouping (e.g., "Tier 1" = US). In settings files, each tier is a `display_name: group_ref` pair. The display name is what appears in LevelPlay; the group ref resolves to a country list in `countries.yaml`.
 - **Ad formats** -- `banner`, `interstitial`, `rewarded`, `native`. Legacy `rewardedVideo` is excluded.
 - **Waterfall** -- ordered list of ad network instances within a group. Contains bidding instances (real-time auction) and manual instances (fixed CPM).
 - **Position** -- group priority (1 = highest, checked first by SDK). First matching group by country serves the ad.
-- **Default tier** -- catch-all group with `'*'` in countries. Always last. Catches unassigned countries.
+- **Default tier** -- catch-all group with `'*'` as group ref. Always last. Catches unassigned countries.
 
 **The portfolio:**
 
@@ -32,7 +32,9 @@ Operates admedi as a tool, understands LevelPlay as the mediation platform, and 
 | `ss-ios` | `1f93a90ad` | Shelf Sort - Organize & Match | iOS |
 | `ss-google` | `1f93aca35` | Shelf Sort - Organize & Match | Android |
 | `hexar-ios` | `676996cd` | Hexar.io - #1 in IO Games | iOS |
-| `hexar-google` | `67695d45` | Hexar.io - #1 in IO Games | Android |
+| `hexar-google` | `67695d45` | Hexar.io | Android |
+| `ws-ios` | `1e8106425` | Word Search iOS | iOS |
+| `ws-google` | `1e8109dad` | Word Search Play | Android |
 
 **Tier strategy principles:**
 - Group countries by eCPM performance -- high-eCPM countries get their own tier to protect floor prices
@@ -44,30 +46,56 @@ Operates admedi as a tool, understands LevelPlay as the mediation platform, and 
 ### File Structure
 
 ```
+countries.yaml               # Portfolio-wide named country groups (e.g., US: [US], tier-2: [AU, CA, ...])
+profiles.yaml                # Single source of truth for app identity: alias -> {app_key, app_name, platform}
 settings/
-  {alias}.yaml              # App metadata + waterfall mapping (which preset per format)
-  {alias}-tiers.yaml         # Tier definitions: name -> countries + formats
+  {alias}.yaml               # Per-app: alias + ad format -> display_name: group_ref list
   {alias}-networks.yaml      # Waterfall preset definitions (network instances + ordering)
 snapshots/
   {alias}.yaml               # Full-fidelity raw snapshot (Pydantic model_dump, lossless)
-profiles.yaml                # Alias -> app_key mapping for --app flag
 ```
 
-Settings files are the source of truth for sync. The `show` command writes them; the `sync` command reads them. Edit settings, then sync to push live.
+**Two-layer resolution chain:** Per-app settings contain `display_name: group_ref` mappings → `countries.yaml` defines the actual country codes for each group ref.
+
+Example per-app file:
+```yaml
+alias: hexar-ios
+interstitial:
+- Tier 1: US
+- Tier 2: tier-2
+- All Countries: '*'
+rewarded:
+- Tier 1: US
+- Tier 2: tier-2
+- All Countries: '*'
+```
+
+- **Key** (display name) = the LevelPlay group name, pushed to LevelPlay during sync
+- **Value** (group ref) = a key in `countries.yaml`, or `'*'` for catch-all
+- The same display name can map to different group refs across formats (per-format tier differences)
+
+Change a country group in `countries.yaml` once, all apps referencing it pick it up. Each app independently controls which group ref its tiers point to.
 
 ### How to Operate
 
 **The workflow is always: pull -> edit -> dry-run -> apply.**
 
-1. **Pull latest** -- `admedi show --app <alias>` before any edit. The user may have changed things directly in the LevelPlay dashboard, so local settings can be stale.
-2. **Edit settings** -- modify the tiers file.
-3. **Dry-run** -- `admedi sync --tiers <alias> --dry-run` to preview changes.
-4. **Apply** -- `admedi sync --tiers <alias>` to push live. No confirmation prompt -- sync applies directly.
+1. **Pull latest** -- `admedi pull --app <alias>` before any edit. The user may have changed things directly in the LevelPlay dashboard, so local settings can be stale. On first pull, `countries.yaml` is bootstrapped automatically.
+2. **Edit settings** -- modify the per-app settings file (`settings/{alias}.yaml`), or `countries.yaml` for portfolio-wide country group changes. Per-app files contain `display_name: group_ref` entries that resolve against `countries.yaml`.
+3. **Dry-run** -- `admedi sync <alias> --dry-run` to preview changes.
+4. **Apply** -- `admedi sync <alias>` to push live. No confirmation prompt -- sync applies directly.
 
 Cross-app sync (push one app's tiers to another):
 ```bash
-admedi sync --tiers hexar-ios hexar-google --dry-run   # Preview
-admedi sync --tiers hexar-ios hexar-google               # Apply
+admedi sync hexar-ios hexar-google --dry-run   # Preview
+admedi sync hexar-ios hexar-google               # Apply
+```
+
+**Other commands:**
+```bash
+admedi audit                     # Audit all apps for drift (skips unpulled apps with warning)
+admedi audit --app hexar-ios     # Audit one app
+admedi status                    # Portfolio overview (group counts, last sync times)
 ```
 
 **Sync behavior:**
@@ -76,15 +104,24 @@ admedi sync --tiers hexar-ios hexar-google               # Apply
 - Apply Results show app name (e.g., "Hexar.io"), not raw app key.
 - Summary includes create, update, and delete counts.
 
-**Convergent round-trip:**
-- If a tier has different countries per ad format in LevelPlay (e.g., NL in interstitial but NZ in rewarded), `show` takes the union and emits a warning.
-- The first sync converges both formats to the union set. The second `show` -> `sync` round-trip produces zero drift.
+**Per-format tier differences:**
+- The same LevelPlay group name (e.g., "Tier 2") can have different countries in interstitial vs rewarded. `pull` handles this automatically -- each format section gets its own group ref.
+- Example: ws-ios has `Tier 2: tier-2-2` in interstitial but `Tier 2: tier-2-3` in rewarded because the country sets differ.
+- When editing manually, you can use either different display names or different group refs to achieve per-format differences.
+
+**How `pull` matching works:**
+- `pull` matches live LevelPlay groups to country groups by **country content** (frozenset comparison), not by group name. Order of countries does not matter.
+- Matching is per (group_name, country_set) pair -- the same group name with different countries across formats gets different group refs.
+- If a live group's countries match an existing country group's set, that group ref is reused.
+- If no match, `pull` auto-creates a new country group (single country → country code as name, multi-country → lowercased hyphenated LevelPlay group name, e.g., "Tier 2" → `tier-2`).
+- Name collisions are resolved with a numeric suffix (e.g., `tier-2`, `tier-2-2`, `tier-2-3`).
+- Subsequent pulls for other apps reuse existing `countries.yaml` entries when country sets match.
 
 **Operational constraints:**
-- Always use `--tiers` when syncing. Apps have different waterfall/network setups. The `--tiers` flag ensures only country tiers are touched.
 - Run CLI commands one at a time, never in parallel. They hit the LevelPlay API; parallel calls cause cancellations.
 - Use profile aliases (`ss-ios`, `hexar-google`), not raw app keys.
-- Never hand-create settings files. Always pull with `show` first, then edit.
+- Never hand-create settings files. Always pull first, then edit.
+- `audit` and `status` read from `profiles.yaml` automatically -- no `--config` flag needed.
 
 **Safety features:**
 - `--dry-run` is the safety gate -- previews all changes (including deletions) without applying
@@ -96,9 +133,10 @@ admedi sync --tiers hexar-ios hexar-google               # Apply
 ### Scope
 
 **Supported:**
-- All 4 CLI commands: `show`, `audit`, `sync --tiers`, `status`
+- All 4 CLI commands: `pull`, `audit`, `sync`, `status`
+- Two-layer settings management (per-app settings + `countries.yaml`)
 - Tier strategy advice grounded in eCPM data
-- Settings file edits for tier changes and country reassignments
+- Settings file edits for tier changes, country reassignments, and per-format tier differences
 - LevelPlay concepts and debugging (credentials, rate limits, A/B test blocks, drift)
 - Reading and explaining any part of the admedi codebase
 
@@ -113,8 +151,9 @@ admedi sync --tiers hexar-ios hexar-google               # Apply
 
 - Editing snapshots (they're read-only captures -- edit settings instead)
 - Syncing without pulling first (settings may be stale)
-- Syncing without `--tiers` flag (risks unintended scope when `--networks` is implemented)
-- Confusing self-sync (`sync --tiers ss-ios`) with cross-app sync (`sync --tiers ss-ios ss-google`) -- cross-app deletes groups on the destination that don't exist in the source
+- Editing `countries.yaml` without understanding that changes affect all apps referencing that group
+- Confusing self-sync (`sync ss-ios`) with cross-app sync (`sync ss-ios ss-google`) -- cross-app deletes groups on the destination that don't exist in the source
 - Putting bid floor rates in tier definitions (tiers control country groupings; bid floors live in waterfall/instance config)
 - Overlapping countries across tiers (the differ flags this as drift)
+- Using plain string entries in per-app files (old format) -- must be `display_name: group_ref` mappings
 - Credential issues: check `.env` has `LEVELPLAY_SECRET_KEY` and `LEVELPLAY_REFRESH_TOKEN`

@@ -205,12 +205,12 @@ class TestCreateGroup:
         post_method, post_url, post_payload = request_calls[0]
         assert post_method == "POST"
         assert post_url == f"{GROUPS_V4_URL}/app123"
-        assert post_payload == {
+        assert post_payload == [{
             "groupName": "US Tier 1",
             "adFormat": "interstitial",
             "countries": ["US"],
             "position": 1,
-        }
+        }]
 
         # Verify result
         assert result.group_id == 999
@@ -286,8 +286,8 @@ class TestCreateGroup:
 class TestUpdateGroup:
     """Tests for update_group() PUT operation."""
 
-    async def test_update_group_sends_put_with_prefixed_fields(self) -> None:
-        """update_group() should PUT with groupId, groupName, groupCountries, groupPosition."""
+    async def test_update_group_sends_put_with_correct_fields(self) -> None:
+        """update_group() should PUT with list-wrapped payload using GET-style field names."""
         adapter = _make_adapter()
         group = _make_group(
             name="Updated Tier", ad_format="interstitial", countries=["US", "CA"], position=2
@@ -317,15 +317,13 @@ class TestUpdateGroup:
         put_method, put_url, put_payload = request_calls[0]
         assert put_method == "PUT"
         assert put_url == f"{GROUPS_V4_URL}/app123"
-        assert put_payload == {
+        assert put_payload == [{
             "groupId": 555,
+            "adFormat": "interstitial",
             "groupName": "Updated Tier",
-            "groupCountries": ["US", "CA"],
-            "groupPosition": 2,
-        }
-
-        # adFormat must NOT be in PUT payload
-        assert "adFormat" not in put_payload
+            "countries": ["US", "CA"],
+            "position": 2,
+        }]
 
         # Verify result
         assert result.group_id == 555

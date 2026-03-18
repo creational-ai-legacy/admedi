@@ -5,8 +5,12 @@ that the CLI commands delegate to. Each public method corresponds to a
 CLI command:
 
 - ``audit()``   -> ``admedi audit``
-- ``sync()``    -> ``admedi sync-tiers``
+- ``sync()``    -> ``admedi sync``
 - ``status()``  -> ``admedi status``
+
+All methods use profiles-based app discovery (``load_profiles()``) and
+three-layer settings resolution (``resolve_app_tiers()``). The monolithic
+``admedi.yaml`` template is no longer used.
 
 Group data caching strategy: within a single ``audit()`` or ``sync()``
 call, the initial ``get_groups()`` result per app is cached and passed to
@@ -17,24 +21,26 @@ before writing).
 Examples:
     >>> from admedi.engine.engine import ConfigEngine
     >>> # engine = ConfigEngine(adapter=adapter, storage=storage)
-    >>> # report = await engine.audit("examples/shelf-sort-tiers.yaml")
-    >>> # report, result = await engine.sync("config.yaml", dry_run=True)
+    >>> # report = await engine.audit()
+    >>> # report, result = await engine.sync(dry_run=True)
 """
 
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
+import logging
 
 from admedi.adapters.mediation import MediationAdapter
 from admedi.adapters.storage import StorageAdapter
 from admedi.engine.applier import Applier
 from admedi.engine.differ import compute_diff
-from admedi.engine.loader import load_template
+from admedi.engine.loader import Profile, load_profiles, resolve_app_tiers
 from admedi.models.apply_result import AppStatus, ApplyResult, PortfolioStatus
 from admedi.models.diff import DiffReport
+from admedi.models.enums import Mediator
 from admedi.models.group import Group
-from admedi.models.portfolio import PortfolioConfig
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigEngine:
@@ -42,8 +48,9 @@ class ConfigEngine:
 
     Provides three async methods corresponding to CLI commands: audit,
     sync, and status. Each method manages the full lifecycle of its
-    operation: loading templates, fetching remote state, computing
-    diffs, and applying changes.
+    operation: loading profiles, resolving per-app settings through
+    the three-layer chain, fetching remote state, computing diffs,
+    and applying changes.
 
     Attributes:
         _adapter: Mediation adapter for API calls.
@@ -66,67 +73,104 @@ class ConfigEngine:
 
     async def audit(
         self,
-        template_path: str | Path,
         *,
-        app_keys: list[str] | None = None,
+        aliases: list[str] | None = None,
     ) -> DiffReport:
-        """Audit the portfolio by comparing template against live state.
+        """Audit the portfolio by comparing per-app settings against live state.
 
-        Loads the YAML template, fetches remote groups concurrently for
-        each portfolio app, and computes diffs. Group data from the
-        initial read is cached and passed directly to the Differ (no
-        redundant API calls for ``compute_diff()``).
+        Loads profiles from ``profiles.yaml``, resolves per-app settings
+        through the three-layer chain (per-app file -> ``tiers.yaml`` ->
+        ``countries.yaml``), fetches remote groups concurrently, and
+        computes diffs.
+
+        When iterating all profiles, aliases without a
+        ``settings/{alias}.yaml`` file are skipped with a warning. When
+        a specific alias is requested via the ``aliases`` parameter, a
+        missing settings file raises ``FileNotFoundError``.
 
         Args:
-            template_path: Path to the YAML tier template.
-            app_keys: Optional list of app keys to audit. If ``None``,
-                all portfolio apps are audited.
+            aliases: Optional list of profile aliases to audit. If ``None``,
+                all profiles in ``profiles.yaml`` are audited.
 
         Returns:
             A ``DiffReport`` with per-app diff results.
 
         Raises:
-            FileNotFoundError: If the template file does not exist.
-            ConfigValidationError: If the template is invalid.
+            FileNotFoundError: If a specifically-requested alias has no
+                settings file, or if ``profiles.yaml`` does not exist.
+            ConfigValidationError: If settings are invalid.
         """
-        template = load_template(template_path)
-        apps = self._filter_apps(template, app_keys)
+        profiles = load_profiles()
+        explicit_filter = aliases is not None
+
+        if explicit_filter:
+            target_aliases = aliases
+        else:
+            target_aliases = list(profiles.keys())
+
+        # Resolve per-app tiers and collect profiles to audit
+        resolved: list[tuple[Profile, list]] = []
+        for alias in target_aliases:
+            profile = profiles.get(alias)
+            if profile is None:
+                from admedi.exceptions import ConfigValidationError
+
+                available = ", ".join(sorted(profiles.keys()))
+                raise ConfigValidationError(
+                    f"Unknown profile alias '{alias}'. "
+                    f"Available profiles: {available}"
+                )
+
+            try:
+                tiers = resolve_app_tiers(alias)
+            except FileNotFoundError:
+                if explicit_filter:
+                    raise
+                logger.warning(
+                    "Skipping %s: no settings file found. "
+                    "Run `admedi pull --app %s` first.",
+                    alias, alias,
+                )
+                continue
+
+            resolved.append((profile, tiers))
+
+        if not resolved:
+            return DiffReport(app_reports=[])
 
         # Concurrent fetch of remote groups per app
-        groups_by_app = await self._fetch_groups_concurrent(
-            [app.app_key for app in apps]
+        groups_by_key = await self._fetch_groups_concurrent(
+            [p.app_key for p, _ in resolved]
         )
 
         # Compute diff per app using cached group data
         app_reports = [
             compute_diff(
-                template.tiers,
-                groups_by_app[app.app_key],
-                app.app_key,
-                app.name,
+                tiers,
+                groups_by_key[profile.app_key],
+                profile.app_key,
+                profile.app_name,
             )
-            for app in apps
+            for profile, tiers in resolved
         ]
 
         return DiffReport(app_reports=app_reports)
 
     async def sync(
         self,
-        template_path: str | Path,
         *,
-        app_keys: list[str] | None = None,
+        aliases: list[str] | None = None,
         dry_run: bool = True,
     ) -> tuple[DiffReport, ApplyResult]:
         """Sync the portfolio by computing and applying diffs.
 
-        Loads the template, computes diffs (same as audit), then applies
+        Loads profiles, resolves settings (same as audit), then applies
         changes via the Applier. The Applier fetches fresh group data
         for its own pre-write snapshot independently.
 
         Args:
-            template_path: Path to the YAML tier template.
-            app_keys: Optional list of app keys to sync. If ``None``,
-                all portfolio apps are synced.
+            aliases: Optional list of profile aliases to sync. If ``None``,
+                all profiles are synced.
             dry_run: If ``True`` (default), compute diffs and return
                 results without making any write API calls. If ``False``,
                 execute write operations.
@@ -137,43 +181,38 @@ class ConfigEngine:
             and all entries have ``status=DRY_RUN``.
 
         Raises:
-            FileNotFoundError: If the template file does not exist.
-            ConfigValidationError: If the template is invalid.
+            FileNotFoundError: If profiles or settings files do not exist.
+            ConfigValidationError: If settings are invalid.
         """
-        diff_report = await self.audit(template_path, app_keys=app_keys)
+        diff_report = await self.audit(aliases=aliases)
         apply_result = await self._applier.apply(
             diff_report, dry_run=dry_run
         )
         return diff_report, apply_result
 
-    async def status(
-        self,
-        template_path: str | Path,
-    ) -> PortfolioStatus:
+    async def status(self) -> PortfolioStatus:
         """Get the current portfolio status.
 
-        Loads the template, fetches group counts and sync history
-        concurrently for each portfolio app.
-
-        Args:
-            template_path: Path to the YAML tier template.
+        Loads profiles from ``profiles.yaml``, fetches group counts and
+        sync history concurrently for each profile app. The mediator is
+        hardcoded to ``Mediator.LEVELPLAY`` (the only supported mediator).
 
         Returns:
-            A ``PortfolioStatus`` with one ``AppStatus`` per portfolio app.
+            A ``PortfolioStatus`` with one ``AppStatus`` per profile app.
 
         Raises:
-            FileNotFoundError: If the template file does not exist.
-            ConfigValidationError: If the template is invalid.
+            FileNotFoundError: If ``profiles.yaml`` does not exist.
+            ConfigValidationError: If profiles are invalid.
         """
-        template = load_template(template_path)
-        apps = template.portfolio
+        profiles = load_profiles()
+        profile_list = list(profiles.values())
 
         # Concurrent fetch of groups and sync history per app
         group_tasks = [
-            self._adapter.get_groups(app.app_key) for app in apps
+            self._adapter.get_groups(p.app_key) for p in profile_list
         ]
         history_tasks = [
-            self._storage.list_sync_history(app.app_key) for app in apps
+            self._storage.list_sync_history(p.app_key) for p in profile_list
         ]
 
         all_results = await asyncio.gather(
@@ -181,12 +220,12 @@ class ConfigEngine:
         )
 
         # Split results: first N are groups, next N are histories
-        n_apps = len(apps)
+        n_apps = len(profile_list)
         groups_results: list[list[Group]] = list(all_results[:n_apps])
         history_results = list(all_results[n_apps:])
 
         app_statuses: list[AppStatus] = []
-        for i, app in enumerate(apps):
+        for i, profile in enumerate(profile_list):
             groups: list[Group] = groups_results[i]
             history = history_results[i]
 
@@ -197,38 +236,18 @@ class ConfigEngine:
 
             app_statuses.append(
                 AppStatus(
-                    app_key=app.app_key,
-                    app_name=app.name,
-                    platform=app.platform,
+                    app_key=profile.app_key,
+                    app_name=profile.app_name,
+                    platform=profile.platform,
                     group_count=len(groups),
                     last_sync=last_sync,
                 )
             )
 
         return PortfolioStatus(
-            mediator=template.mediator,
+            mediator=Mediator.LEVELPLAY,
             apps=app_statuses,
         )
-
-    @staticmethod
-    def _filter_apps(
-        template: PortfolioConfig,
-        app_keys: list[str] | None,
-    ) -> list:
-        """Filter portfolio apps by the optional app_keys list.
-
-        Args:
-            template: The loaded portfolio config.
-            app_keys: Optional list of app keys to include. If ``None``,
-                all portfolio apps are returned.
-
-        Returns:
-            Filtered list of ``PortfolioApp`` entries.
-        """
-        if app_keys is None:
-            return list(template.portfolio)
-        key_set = set(app_keys)
-        return [app for app in template.portfolio if app.app_key in key_set]
 
     async def _fetch_groups_concurrent(
         self,

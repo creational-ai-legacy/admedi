@@ -7,10 +7,10 @@ When ``None``, a default ``Console()`` is created. For tests, inject a
 Examples:
     >>> from io import StringIO
     >>> from rich.console import Console
-    >>> from admedi.cli.display import display_show
+    >>> from admedi.cli.display import display_pull
     >>> buf = StringIO()
     >>> console = Console(file=buf, highlight=False)
-    >>> # display_show(app, groups, snapshot_path="...", console=console)
+    >>> # display_pull(app, groups, snapshot_path="...", console=console)
 """
 
 from __future__ import annotations
@@ -316,24 +316,29 @@ def display_status_table(
     con.print(table)
 
 
-def display_show(
+def display_pull(
     app: App,
     groups: list[Group],
     snapshot_path: str | None = None,
     settings_path: str | None = None,
+    networks_path: str | None = None,
+    info_messages: list[str] | None = None,
     console: Console | None = None,
 ) -> None:
-    """Render a Rich view of an app's live mediation settings.
+    """Render a Rich view of an app's live mediation settings after a pull.
 
     Shows a header panel with app metadata, then one table per ad format
     with group tiers, country targeting, and waterfall details (bidding
-    networks and manual instances with rates).
+    networks and manual instances with rates). Displays saved file paths
+    and any info messages from the settings generation process.
 
     Args:
         app: The App model with name, platform, and key.
         groups: List of Group models from the live API.
         snapshot_path: If provided, shown as a footer line for the raw snapshot.
-        settings_path: If provided, shown as a footer line for the modular settings.
+        settings_path: If provided, shown as a footer line for per-app settings.
+        networks_path: If provided, shown as a footer line for the networks file.
+        info_messages: If provided, rendered as info lines (e.g., new tiers created).
         console: Optional console for output capture in tests.
     """
     con = _get_console(console)
@@ -351,11 +356,7 @@ def display_show(
 
     if not groups:
         con.print("[dim]No mediation groups configured.[/dim]")
-        if snapshot_path:
-            con.print(f"\n[dim]Snapshot saved to:[/dim] [cyan]{snapshot_path}[/cyan]")
-        if settings_path:
-            con.print(f"[dim]Settings saved to:[/dim] [cyan]{settings_path}[/cyan]")
-        con.print()
+        _print_pull_footer(con, snapshot_path, settings_path, networks_path, info_messages)
         return
 
     # Organize by ad format, sorted by position within each
@@ -393,49 +394,38 @@ def display_show(
 
         con.print(table)
 
+    _print_pull_footer(con, snapshot_path, settings_path, networks_path, info_messages)
+
+
+def _print_pull_footer(
+    con: Console,
+    snapshot_path: str | None,
+    settings_path: str | None,
+    networks_path: str | None,
+    info_messages: list[str] | None,
+) -> None:
+    """Print the footer section for the pull command output.
+
+    Shows saved file paths and any info messages from settings generation.
+
+    Args:
+        con: Console instance to print to.
+        snapshot_path: Path to the raw snapshot file.
+        settings_path: Path to the per-app settings file.
+        networks_path: Path to the networks file.
+        info_messages: Info messages from ``generate_app_settings()``.
+    """
     if snapshot_path:
         con.print(f"\n[dim]Snapshot saved to:[/dim] [cyan]{snapshot_path}[/cyan]")
     if settings_path:
         con.print(f"[dim]Settings saved to:[/dim] [cyan]{settings_path}[/cyan]")
+    if networks_path:
+        con.print(f"[dim]Networks saved to:[/dim] [cyan]{networks_path}[/cyan]")
+    if info_messages:
+        con.print()
+        for msg in info_messages:
+            con.print(f"[dim]  {msg}[/dim]")
     con.print()
-
-
-def display_tier_warnings(
-    warnings: list[str],
-    console: Console | None = None,
-) -> None:
-    """Render per-format country variance warnings as a Rich panel.
-
-    When ``_extract_tiers()`` detects that the same tier name has different
-    country lists across ad formats, it emits human-readable warning strings.
-    This function displays them in a yellow-bordered panel after the show
-    command output.
-
-    If *warnings* is empty, nothing is printed.
-
-    Args:
-        warnings: List of warning strings from ``_extract_tiers()``.
-        console: Optional console for output capture in tests.
-
-    Example::
-
-        >>> from io import StringIO
-        >>> from rich.console import Console
-        >>> from admedi.cli.display import display_tier_warnings
-        >>> buf = StringIO()
-        >>> console = Console(file=buf, highlight=False)
-        >>> display_tier_warnings(["Tier 2: countries differ..."], console=console)
-    """
-    if not warnings:
-        return
-
-    con = _get_console(console)
-    warning_lines = "\n".join(f"[yellow]  {w}[/yellow]" for w in warnings)
-    con.print(Panel(
-        warning_lines,
-        title="[bold yellow]Tier Warnings[/bold yellow]",
-        border_style="yellow",
-    ))
 
 
 def _format_waterfall(group: Group) -> Text:
