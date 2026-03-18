@@ -369,6 +369,103 @@ class TestSync:
 
 
 # ---------------------------------------------------------------------------
+# Test Classes: audit/sync scope parameter (Step 8)
+# ---------------------------------------------------------------------------
+
+
+class TestAuditScope:
+    """Tests for ConfigEngine.audit() with scope parameter."""
+
+    @pytest.mark.asyncio
+    async def test_audit_scope_none_is_backward_compatible(self) -> None:
+        """audit(scope=None) works the same as before (no scope parameter)."""
+        adapter, storage = _make_mocks()
+        engine = ConfigEngine(adapter=adapter, storage=storage)
+
+        p1, p2 = _patch_profiles_and_tiers()
+        with p1, p2:
+            report = await engine.audit(scope=None)
+
+        assert isinstance(report, DiffReport)
+        assert len(report.app_reports) == 2
+
+    @pytest.mark.asyncio
+    async def test_audit_scope_networks_loads_presets(self) -> None:
+        """audit(scope=SyncScope(networks=True)) loads network presets."""
+        from admedi.models.portfolio import SyncScope
+
+        adapter, storage = _make_mocks()
+        engine = ConfigEngine(adapter=adapter, storage=storage)
+
+        scope = SyncScope(tiers=True, networks=True)
+
+        p1, p2 = _patch_profiles_and_tiers()
+        with p1, p2, patch(
+            "admedi.engine.engine.load_network_presets",
+            return_value={"bidding-1": [{"network": "Meta", "bidder": True}]},
+        ) as mock_presets:
+            report = await engine.audit(scope=scope)
+
+        mock_presets.assert_called_once()
+        assert isinstance(report, DiffReport)
+
+    @pytest.mark.asyncio
+    async def test_audit_scope_tiers_only_skips_presets(self) -> None:
+        """audit(scope=SyncScope(tiers=True, networks=False)) does not load presets."""
+        from admedi.models.portfolio import SyncScope
+
+        adapter, storage = _make_mocks()
+        engine = ConfigEngine(adapter=adapter, storage=storage)
+
+        scope = SyncScope(tiers=True, networks=False)
+
+        p1, p2 = _patch_profiles_and_tiers()
+        with p1, p2, patch(
+            "admedi.engine.engine.load_network_presets",
+        ) as mock_presets:
+            report = await engine.audit(scope=scope)
+
+        mock_presets.assert_not_called()
+        assert isinstance(report, DiffReport)
+
+
+class TestSyncScope:
+    """Tests for ConfigEngine.sync() with scope parameter."""
+
+    @pytest.mark.asyncio
+    async def test_sync_scope_none_is_backward_compatible(self) -> None:
+        """sync(scope=None) works the same as before (no scope parameter)."""
+        adapter, storage = _make_mocks()
+        engine = ConfigEngine(adapter=adapter, storage=storage)
+
+        p1, p2 = _patch_profiles_and_tiers()
+        with p1, p2:
+            report, result = await engine.sync(dry_run=True, scope=None)
+
+        assert isinstance(report, DiffReport)
+        assert result.was_dry_run is True
+
+    @pytest.mark.asyncio
+    async def test_sync_scope_networks_loads_presets(self) -> None:
+        """sync(scope=SyncScope(networks=True)) loads network presets."""
+        from admedi.models.portfolio import SyncScope
+
+        adapter, storage = _make_mocks()
+        engine = ConfigEngine(adapter=adapter, storage=storage)
+
+        scope = SyncScope(tiers=True, networks=True)
+
+        p1, p2 = _patch_profiles_and_tiers()
+        with p1, p2, patch(
+            "admedi.engine.engine.load_network_presets",
+            return_value={},
+        ) as mock_presets:
+            report, result = await engine.sync(dry_run=True, scope=scope)
+
+        mock_presets.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # Test Classes: status()
 # ---------------------------------------------------------------------------
 
@@ -545,11 +642,11 @@ class TestImportExport:
 
         assert "ConfigEngine" in admedi.engine.__all__
 
-    def test_engine_all_has_seven_entries(self) -> None:
-        """Engine __all__ has 7 entries (Applier, ConfigEngine, Profile, compute_diff, load_country_groups, load_profiles, resolve_app_tiers)."""
+    def test_engine_all_has_nine_entries(self) -> None:
+        """Engine __all__ has 9 entries (Applier, ConfigEngine, Profile, SyncScope, compute_diff, load_country_groups, load_network_presets, load_profiles, resolve_app_tiers)."""
         import admedi.engine
 
-        assert len(admedi.engine.__all__) == 7
+        assert len(admedi.engine.__all__) == 9
 
     def test_load_template_not_in_engine_all(self) -> None:
         """load_template is no longer exported from admedi.engine (retired)."""

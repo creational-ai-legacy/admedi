@@ -3,16 +3,17 @@
 Covers dry-run behavior, idempotency guard, A/B test skipping,
 CREATE/UPDATE execution, DELETE/EXTRA skipping, pre-write snapshots,
 post-write verification, sync log recording, per-app error isolation,
-and pre-write A/B test re-check.
+pre-write A/B test re-check, and build_waterfall_payload() resolution.
 """
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from admedi.engine.applier import Applier
+from admedi.engine.applier import Applier, build_waterfall_payload
 from admedi.models.apply_result import ApplyStatus
 from admedi.models.diff import (
     AppDiffReport,
@@ -23,6 +24,7 @@ from admedi.models.diff import (
 )
 from admedi.models.enums import AdFormat
 from admedi.models.group import Group
+from admedi.models.instance import Instance
 
 
 # ---------------------------------------------------------------------------
@@ -480,7 +482,10 @@ class TestUpdateExecution:
 
         await applier.apply(report, dry_run=False)
 
-        adapter.update_group.assert_called_once_with("app1", 42, desired)
+        adapter.update_group.assert_called_once_with(
+            "app1", 42, desired,
+            include_tier_fields=True, waterfall_payload=None,
+        )
 
     @pytest.mark.asyncio
     async def test_updates_execute_after_creates(self) -> None:
@@ -495,7 +500,7 @@ class TestUpdateExecution:
             return group
 
         async def mock_update(
-            app_key: str, group_id: int, group: Group
+            app_key: str, group_id: int, group: Group, **kwargs: Any
         ) -> Group:
             call_order.append(f"update:{group.group_name}")
             return group
@@ -1038,3 +1043,271 @@ class TestImportExport:
         import admedi.engine
 
         assert "Applier" in admedi.engine.__all__
+
+
+# ---------------------------------------------------------------------------
+# Helpers for build_waterfall_payload tests
+# ---------------------------------------------------------------------------
+
+
+def _make_instance(
+    instance_id: int,
+    name: str,
+    network: str,
+    is_bidder: bool = False,
+    group_rate: float | None = None,
+) -> Instance:
+    """Create an Instance model for testing."""
+    data = {
+        "id": instance_id,
+        "name": name,
+        "networkName": network,
+        "isBidder": is_bidder,
+    }
+    if group_rate is not None:
+        data["groupRate"] = group_rate
+    return Instance.model_validate(data)
+
+
+# ---------------------------------------------------------------------------
+# Tests: build_waterfall_payload()
+# ---------------------------------------------------------------------------
+
+
+class TestBuildWaterfallPayloadResolved:
+    """Tests for build_waterfall_payload() when all entries resolve successfully."""
+
+    def test_all_entries_resolved_with_bidder_and_manual_separation(self) -> None:
+        """Returns valid payload with bidders in 'bidding' tier and manuals in 'tier1'."""
+        preset = [
+            {"network": "Meta", "bidder": True},
+            {"network": "AppLovin", "bidder": False, "rate": 10.0},
+        ]
+        live = [
+            _make_instance(101, "Meta Default", "Meta", is_bidder=True),
+            _make_instance(201, "AppLovin Default", "AppLovin", is_bidder=False),
+        ]
+
+        payload, warnings = build_waterfall_payload(preset, live)
+
+        assert payload is not None
+        assert warnings == []
+        # Check bidding tier
+        assert "bidding" in payload
+        assert payload["bidding"]["tierType"] == "bidding"
+        assert len(payload["bidding"]["instances"]) == 1
+        assert payload["bidding"]["instances"][0]["providerName"] == "Meta"
+        assert payload["bidding"]["instances"][0]["instanceId"] == 101
+        # Check manual tier
+        assert "tier1" in payload
+        assert payload["tier1"]["tierType"] == "sortByCpm"
+        assert len(payload["tier1"]["instances"]) == 1
+        assert payload["tier1"]["instances"][0]["providerName"] == "AppLovin"
+        assert payload["tier1"]["instances"][0]["instanceId"] == 201
+        assert payload["tier1"]["instances"][0]["rate"] == 10.0
+
+    def test_rate_included_only_for_manual_instances(self) -> None:
+        """Rate is included for manual instances with rate, but not for bidders."""
+        preset = [
+            {"network": "Meta", "bidder": True, "rate": 5.0},
+            {"network": "AppLovin", "bidder": False, "rate": 10.0},
+        ]
+        live = [
+            _make_instance(101, "Meta Default", "Meta", is_bidder=True),
+            _make_instance(201, "AppLovin Default", "AppLovin", is_bidder=False),
+        ]
+
+        payload, warnings = build_waterfall_payload(preset, live)
+
+        assert payload is not None
+        # Bidder should NOT have rate (even if preset specifies one)
+        assert "rate" not in payload["bidding"]["instances"][0]
+        # Manual should have rate
+        assert payload["tier1"]["instances"][0]["rate"] == 10.0
+
+    def test_bidders_only_payload(self) -> None:
+        """Payload with only bidders has 'bidding' key but no 'tier1'."""
+        preset = [
+            {"network": "Meta", "bidder": True},
+            {"network": "Pangle", "bidder": True},
+        ]
+        live = [
+            _make_instance(101, "Meta Default", "Meta", is_bidder=True),
+            _make_instance(102, "Pangle Default", "Pangle", is_bidder=True),
+        ]
+
+        payload, warnings = build_waterfall_payload(preset, live)
+
+        assert payload is not None
+        assert "bidding" in payload
+        assert "tier1" not in payload
+        assert len(payload["bidding"]["instances"]) == 2
+
+
+class TestBuildWaterfallPayloadMissing:
+    """Tests for build_waterfall_payload() with missing networks (rule 4)."""
+
+    def test_missing_network_skipped_with_warning(self) -> None:
+        """Missing network produces warning but payload is still valid."""
+        preset = [
+            {"network": "Meta", "bidder": True},
+            {"network": "NonExistent", "bidder": True},
+        ]
+        live = [
+            _make_instance(101, "Meta Default", "Meta", is_bidder=True),
+        ]
+
+        payload, warnings = build_waterfall_payload(preset, live)
+
+        assert payload is not None
+        assert len(warnings) == 1
+        assert "NonExistent" in warnings[0]
+        assert "not found" in warnings[0]
+        # Payload contains only the resolved entry
+        assert len(payload["bidding"]["instances"]) == 1
+        assert payload["bidding"]["instances"][0]["instanceId"] == 101
+
+    def test_all_missing_returns_none_payload(self) -> None:
+        """When all entries are missing (skipped), returns None payload."""
+        preset = [
+            {"network": "NonExistent1", "bidder": True},
+            {"network": "NonExistent2", "bidder": False},
+        ]
+        live = [
+            _make_instance(101, "Meta Default", "Meta", is_bidder=True),
+        ]
+
+        payload, warnings = build_waterfall_payload(preset, live)
+
+        assert payload is None
+        assert len(warnings) == 2
+
+
+class TestBuildWaterfallPayloadAmbiguous:
+    """Tests for build_waterfall_payload() with ambiguous matches (rule 3)."""
+
+    def test_ambiguous_match_returns_none_payload(self) -> None:
+        """Multiple instances for same network+bidder without name aborts."""
+        preset = [
+            {"network": "AppLovin", "bidder": False},
+        ]
+        live = [
+            _make_instance(201, "AppLovin High", "AppLovin", is_bidder=False),
+            _make_instance(202, "AppLovin Low", "AppLovin", is_bidder=False),
+        ]
+
+        payload, warnings = build_waterfall_payload(preset, live)
+
+        assert payload is None
+        assert len(warnings) == 1
+        assert "cannot resolve" in warnings[0].lower()
+        assert "AppLovin" in warnings[0]
+
+
+class TestBuildWaterfallPayloadNameMatch:
+    """Tests for build_waterfall_payload() with name-based matching (rules 1/5)."""
+
+    def test_name_match_resolves_correctly(self) -> None:
+        """Preset with name resolves to the matching instance."""
+        preset = [
+            {"network": "AppLovin", "bidder": False, "name": "AppLovin High", "rate": 15.0},
+        ]
+        live = [
+            _make_instance(201, "AppLovin High", "AppLovin", is_bidder=False),
+            _make_instance(202, "AppLovin Low", "AppLovin", is_bidder=False),
+        ]
+
+        payload, warnings = build_waterfall_payload(preset, live)
+
+        assert payload is not None
+        assert warnings == []
+        assert payload["tier1"]["instances"][0]["instanceId"] == 201
+
+    def test_name_not_found_aborts(self) -> None:
+        """Preset with name that matches no instance aborts (rule 5)."""
+        preset = [
+            {"network": "AppLovin", "bidder": False, "name": "AppLovin Premium"},
+        ]
+        live = [
+            _make_instance(201, "AppLovin High", "AppLovin", is_bidder=False),
+            _make_instance(202, "AppLovin Low", "AppLovin", is_bidder=False),
+        ]
+
+        payload, warnings = build_waterfall_payload(preset, live)
+
+        assert payload is None
+        assert len(warnings) == 1
+        assert "AppLovin Premium" in warnings[0]
+        assert "aborting" in warnings[0].lower()
+
+
+class TestBuildWaterfallPayloadEmpty:
+    """Tests for build_waterfall_payload() with empty preset."""
+
+    def test_empty_preset_returns_none_and_no_warnings(self) -> None:
+        """Empty preset returns None payload and no warnings."""
+        payload, warnings = build_waterfall_payload([], [])
+
+        assert payload is None
+        assert warnings == []
+
+    def test_empty_preset_with_live_instances_returns_none(self) -> None:
+        """Empty preset with live instances still returns None."""
+        live = [
+            _make_instance(101, "Meta Default", "Meta", is_bidder=True),
+        ]
+
+        payload, warnings = build_waterfall_payload([], live)
+
+        assert payload is None
+        assert warnings == []
+
+
+class TestBuildWaterfallPayloadImport:
+    """Tests for build_waterfall_payload import."""
+
+    def test_importable_from_applier_module(self) -> None:
+        """build_waterfall_payload is importable from admedi.engine.applier."""
+        from admedi.engine.applier import build_waterfall_payload as imported
+
+        assert imported is build_waterfall_payload
+
+
+# ---------------------------------------------------------------------------
+# Test Classes: Cross-app sync preset resolution (Step 8)
+# ---------------------------------------------------------------------------
+
+
+class TestCrossAppSyncPresetResolution:
+    """Tests for cross-app sync where preset refs are resolved against destination app instances."""
+
+    def test_preset_resolves_against_destination_instances(self) -> None:
+        """build_waterfall_payload matches by network name, not by source app instance IDs."""
+        # Source app has Meta with instance_id=100
+        # Destination app has Meta with instance_id=200
+        # The preset entries don't carry instance_id, so resolution works
+        # against the destination app's live instances.
+        preset_entries = [
+            {"network": "Meta", "bidder": True},
+            {"network": "AppLovin", "bidder": False, "rate": 5.0},
+        ]
+
+        # Destination app's live instances (different IDs from source)
+        dest_instances = [
+            _make_instance(200, "Meta Default", "Meta", is_bidder=True),
+            _make_instance(201, "AppLovin Default", "AppLovin", is_bidder=False),
+        ]
+
+        payload, warnings = build_waterfall_payload(preset_entries, dest_instances)
+
+        assert payload is not None
+        assert warnings == []
+        # Verify resolution used destination instance IDs (200, 201), not source
+        bidding_ids = [
+            i["instanceId"] for i in payload["bidding"]["instances"]
+        ]
+        assert 200 in bidding_ids
+        manual_ids = [
+            i["instanceId"] for i in payload["tier1"]["instances"]
+        ]
+        assert 201 in manual_ids

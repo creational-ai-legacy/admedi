@@ -32,7 +32,9 @@ Examples:
 from __future__ import annotations
 
 from collections import defaultdict
+from typing import Any
 
+from admedi.exceptions import ConfigValidationError
 from admedi.models.diff import (
     AppDiffReport,
     DiffAction,
@@ -41,7 +43,7 @@ from admedi.models.diff import (
 )
 from admedi.models.enums import AdFormat
 from admedi.models.group import Group
-from admedi.models.portfolio import PortfolioTier
+from admedi.models.portfolio import PortfolioTier, SyncScope
 
 
 def compute_diff(
@@ -49,6 +51,9 @@ def compute_diff(
     remote_groups: list[Group],
     app_key: str,
     app_name: str,
+    *,
+    network_presets: dict[str, list[dict[str, Any]]] | None = None,
+    scope: SyncScope | None = None,
 ) -> AppDiffReport:
     """Compare portfolio tiers against remote groups for one app.
 
@@ -61,6 +66,14 @@ def compute_diff(
         remote_groups: Live groups fetched from the LevelPlay API.
         app_key: The app's unique key.
         app_name: Display name of the app.
+        network_presets: Optional mapping of preset names to their entry
+            lists (from ``networks.yaml``). When provided, waterfalls are
+            compared for tiers that have ``network_preset`` set. When
+            ``None``, network comparison is skipped entirely.
+        scope: Optional sync scope to control which comparisons are
+            performed. When ``None``, defaults to full comparison
+            (backward compatible). When ``scope.tiers is False``, tier
+            field comparisons (countries, position, name) are skipped.
 
     Returns:
         An ``AppDiffReport`` with per-group diffs and A/B test detection.
@@ -78,7 +91,7 @@ def compute_diff(
     for fmt in sorted(all_formats, key=lambda f: f.value):
         tiers = template_by_format.get(fmt, [])
         groups = remote_by_format.get(fmt, [])
-        format_diffs = _diff_format(fmt, tiers, groups)
+        format_diffs = _diff_format(fmt, tiers, groups, network_presets, scope)
         group_diffs.extend(format_diffs)
 
     # A/B test detection
@@ -129,6 +142,8 @@ def _diff_format(
     ad_format: AdFormat,
     tiers: list[PortfolioTier],
     remote_groups: list[Group],
+    network_presets: dict[str, list[dict[str, Any]]] | None = None,
+    scope: SyncScope | None = None,
 ) -> list[GroupDiff]:
     """Produce diffs for one ad_format by matching tiers to remote groups.
 
@@ -153,7 +168,8 @@ def _diff_format(
                 matched_tiers.add(t_idx)
                 matched_groups.add(g_idx)
                 diff = _compare_matched_pair(
-                    ad_format, tier, group, len(tiers), len(remote_groups)
+                    ad_format, tier, group, len(tiers), len(remote_groups),
+                    network_presets, scope,
                 )
                 diffs.append(diff)
                 break
@@ -182,7 +198,8 @@ def _diff_format(
                     (i, g) for i, g in unmatched_groups if i != g_idx
                 ]
                 diff = _compare_matched_pair(
-                    ad_format, tier, group, len(tiers), len(remote_groups)
+                    ad_format, tier, group, len(tiers), len(remote_groups),
+                    network_presets, scope,
                 )
                 diffs.append(diff)
                 break
@@ -229,11 +246,18 @@ def _compare_matched_pair(
     group: Group,
     template_count: int,
     remote_count: int,
+    network_presets: dict[str, list[dict[str, Any]]] | None = None,
+    scope: SyncScope | None = None,
 ) -> GroupDiff:
     """Compare a matched template tier and remote group, producing a GroupDiff.
 
-    Compares only template-controlled fields: countries, position, name.
-    Does NOT compare floor_price, instances, or waterfall.
+    Compares template-controlled fields (countries, position, name) and
+    optionally the network waterfall when ``network_presets`` is provided
+    and the tier has a ``network_preset`` reference.
+
+    When ``scope`` is provided and ``scope.tiers is False``, tier field
+    comparisons (countries, position, name) are skipped. This enables
+    ``--networks``-only sync where only waterfall changes are surfaced.
 
     Args:
         ad_format: The ad format being compared.
@@ -241,22 +265,43 @@ def _compare_matched_pair(
         group: The remote group (live state).
         template_count: Total number of template tiers for this format.
         remote_count: Total number of remote groups for this format.
+        network_presets: Optional preset name -> entries mapping. When
+            provided and the tier references a preset, waterfall comparison
+            is performed.
+        scope: Optional sync scope. When ``scope.tiers is False``, tier
+            field comparisons are skipped.
 
     Returns:
         A ``GroupDiff`` with action UNCHANGED or UPDATE.
     """
     changes: list[FieldChange] = []
 
-    # Compare countries (set comparison)
-    _compare_countries(tier, group, changes)
+    # Compare tier fields only when scope allows (or scope is None)
+    compare_tiers = scope is None or scope.tiers
 
-    # Compare position (skip if single group in both template and remote)
-    skip_position = template_count == 1 and remote_count == 1
-    if not skip_position:
-        _compare_position(tier, group, changes)
+    if compare_tiers:
+        # Compare countries (set comparison)
+        _compare_countries(tier, group, changes)
 
-    # Compare name
-    _compare_name(tier, group, changes)
+        # Compare position (skip if single group in both template and remote)
+        skip_position = template_count == 1 and remote_count == 1
+        if not skip_position:
+            _compare_position(tier, group, changes)
+
+        # Compare name
+        _compare_name(tier, group, changes)
+
+    # Compare waterfall (when preset is configured and presets are loaded)
+    if tier.network_preset is not None and network_presets is not None:
+        if tier.network_preset not in network_presets:
+            raise ConfigValidationError(
+                f"Tier '{tier.name}' references network preset "
+                f"'{tier.network_preset}' which does not exist in "
+                f"networks.yaml"
+            )
+        preset_entries = network_presets[tier.network_preset]
+        waterfall_changes = _compare_waterfall(preset_entries, group)
+        changes.extend(waterfall_changes)
 
     if changes:
         desired = Group(
@@ -350,6 +395,143 @@ def _compare_name(
                 description=f"Name: '{group.group_name}' -> '{tier.name}'",
             )
         )
+
+
+def _compare_waterfall(
+    preset_entries: list[dict[str, Any]],
+    group: Group,
+) -> list[FieldChange]:
+    """Compare a network waterfall preset against a group's live instances.
+
+    Matches preset entries to live instances by ``(networkName, isBidder)``
+    and optionally ``instance_name`` when the preset entry has a ``name``
+    key. Produces ``FieldChange`` entries for:
+
+    - **Missing**: preset entry has no matching live instance (informational,
+      the instance may not be configured in this app).
+    - **Extra**: live instance has no matching preset entry (informational;
+      ``adSourcePriority`` PUT reorders but cannot remove instances).
+    - **Rate change**: preset ``rate`` differs from live ``groupRate``
+      beyond a tolerance of 0.01.
+
+    Args:
+        preset_entries: List of dicts from ``networks.yaml`` preset
+            (each with ``network``, ``bidder``, and optional ``rate``/``name``).
+        group: The remote group with live instances.
+
+    Returns:
+        List of ``FieldChange`` entries with ``field="waterfall"``.
+    """
+    changes: list[FieldChange] = []
+    live_instances = group.instances or []
+
+    # Handle None instances (group has no waterfall data)
+    if group.instances is None:
+        changes.append(
+            FieldChange(
+                field="waterfall",
+                old_value=None,
+                new_value="preset configured",
+                description=(
+                    f"Waterfall: group '{group.group_name}' has no instance "
+                    f"data (instances=None); cannot compare waterfall"
+                ),
+            )
+        )
+        return changes
+
+    # Track which live instances are matched by preset entries
+    matched_live_indices: set[int] = set()
+
+    for entry in preset_entries:
+        network = entry["network"]
+        is_bidder = entry["bidder"]
+        preset_name = entry.get("name")
+        preset_rate = entry.get("rate")
+
+        # Find matching live instance(s)
+        candidates = [
+            (idx, inst)
+            for idx, inst in enumerate(live_instances)
+            if inst.network_name == network and inst.is_bidder == is_bidder
+        ]
+
+        # When preset has a name, narrow to name match
+        if preset_name is not None:
+            candidates = [
+                (idx, inst)
+                for idx, inst in candidates
+                if inst.instance_name == preset_name
+            ]
+
+        if not candidates:
+            # Missing: preset entry has no match in live -- informational
+            entry_desc = f"{network} ({'bidder' if is_bidder else 'manual'})"
+            if preset_name:
+                entry_desc += f" [{preset_name}]"
+            changes.append(
+                FieldChange(
+                    field="waterfall",
+                    old_value=None,
+                    new_value=entry_desc,
+                    description=(
+                        f"Waterfall: {entry_desc} is in preset but not "
+                        f"found in live instances (may not be configured "
+                        f"in this app)"
+                    ),
+                )
+            )
+            continue
+
+        # Use first candidate match
+        matched_idx, matched_inst = candidates[0]
+        matched_live_indices.add(matched_idx)
+
+        # Check rate (only for entries with a preset rate)
+        if preset_rate is not None and matched_inst.group_rate is not None:
+            if abs(preset_rate - matched_inst.group_rate) >= 0.01:
+                entry_desc = (
+                    f"{network} ({'bidder' if is_bidder else 'manual'})"
+                )
+                if preset_name:
+                    entry_desc += f" [{preset_name}]"
+                changes.append(
+                    FieldChange(
+                        field="waterfall",
+                        old_value=matched_inst.group_rate,
+                        new_value=preset_rate,
+                        description=(
+                            f"Waterfall: {entry_desc} rate "
+                            f"{matched_inst.group_rate} -> {preset_rate}"
+                        ),
+                    )
+                )
+
+    # Check for extra live instances not in preset (informational only).
+    # adSourcePriority PUT reorders instances but cannot remove them --
+    # instance removal requires the LevelPlay dashboard.
+    for idx, inst in enumerate(live_instances):
+        if idx not in matched_live_indices:
+            inst_desc = (
+                f"{inst.network_name} "
+                f"({'bidder' if inst.is_bidder else 'manual'})"
+            )
+            if inst.instance_name:
+                inst_desc += f" [{inst.instance_name}]"
+            changes.append(
+                FieldChange(
+                    field="waterfall",
+                    old_value=inst_desc,
+                    new_value=None,
+                    description=(
+                        f"Waterfall: {inst_desc} is in live but not in "
+                        f"preset (cannot be removed via API -- manage "
+                        f"in LevelPlay dashboard)"
+                    ),
+                )
+            )
+
+    return changes
 
 
 def _detect_ab_test(remote_groups: list[Group]) -> bool:

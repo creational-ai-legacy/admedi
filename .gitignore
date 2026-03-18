@@ -48,3 +48,4 @@ docs-main
 
 # Runtime data (snapshots, logs from live API calls)
 .admedi/
+*_snapshot.yaml

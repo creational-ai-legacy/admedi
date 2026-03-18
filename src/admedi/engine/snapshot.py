@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any
 
 from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedMap
 
 from pydantic import BaseModel
 
@@ -65,7 +66,7 @@ def generate_app_settings(
     groups: list[Group],
     profile: Profile,
     settings_dir: str = "settings",
-) -> tuple[str, list[str]]:
+) -> tuple[str, str | None, list[str]]:
     """Generate per-app settings from live groups with country-content matching.
 
     Matches each live group's country set against existing country group
@@ -79,22 +80,23 @@ def generate_app_settings(
     The function writes:
     - ``settings/{alias}.yaml`` -- per-app settings (display_name: group_ref)
     - ``countries.yaml`` -- updated if new country groups were created
-
-    It does NOT write the networks file -- that is handled by the CLI's
-    ``pull`` flow using ``extract_network_presets()`` and ``write_yaml_file()``.
+    - ``networks.yaml`` -- shared portfolio-wide network presets (merged
+      with existing presets if the file already exists)
 
     Args:
         groups: List of Group models from the live API.
         profile: Profile object with alias, app_key, app_name, platform.
         settings_dir: Directory for per-app settings files. Root-level
-            files (``countries.yaml``) are resolved from
+            files (``countries.yaml``, ``networks.yaml``) are resolved from
             ``Path(settings_dir).parent``.
 
     Returns:
-        A 2-tuple of ``(settings_path, info_messages)`` where
-        *settings_path* is the written per-app YAML file path and
-        *info_messages* is a list of human-readable strings describing
-        actions taken (e.g., new country groups added).
+        A 3-tuple of ``(settings_path, networks_path, info_messages)`` where
+        *settings_path* is the written per-app YAML file path,
+        *networks_path* is the shared ``networks.yaml`` path (or ``None``
+        when no groups have instances), and *info_messages* is a list of
+        human-readable strings describing actions taken (e.g., new country
+        groups added, new network presets created).
 
     Examples:
         >>> from admedi.engine.snapshot import generate_app_settings
@@ -115,7 +117,7 @@ def generate_app_settings(
         ...         "position": 1,
         ...     })
         ... ]
-        >>> path, messages = generate_app_settings(
+        >>> path, net_path, messages = generate_app_settings(
         ...     groups, profile, settings_dir="settings"
         ... )  # doctest: +SKIP
     """
@@ -133,6 +135,32 @@ def generate_app_settings(
         existing_country_groups = load_country_groups(settings_dir=settings_dir)
     else:
         is_bootstrap = True
+
+    # --- Load existing networks.yaml (raw YAML, not validated) ---
+    networks_path = project_root / "networks.yaml"
+    existing_presets: dict[str, list[dict[str, Any]]] = {}
+    if networks_path.exists():
+        yaml_reader = YAML()
+        raw = yaml_reader.load(networks_path)
+        if raw and isinstance(raw, dict):
+            # Convert ruamel types to plain dicts for clean comparison
+            for preset_name, entries in raw.items():
+                if isinstance(entries, list):
+                    existing_presets[preset_name] = [
+                        dict(e) for e in entries if isinstance(e, dict)
+                    ]
+
+    # Build signature-to-preset-name lookup from existing presets
+    sig_to_preset: dict[tuple, str] = {}
+    for preset_name, entries in existing_presets.items():
+        bidders_sig = tuple(sorted(
+            e["network"] for e in entries if e.get("bidder") is True
+        ))
+        manuals_sig = tuple(sorted(
+            (e["network"], e.get("rate"), e.get("name"))
+            for e in entries if e.get("bidder") is False
+        ))
+        sig_to_preset[(bidders_sig, manuals_sig)] = preset_name
 
     # --- Resolve each country group's country set for matching ---
     resolved_group_sets: dict[str, frozenset[str]] = {}
@@ -177,15 +205,104 @@ def generate_app_settings(
         if not countries_path.exists():
             _write_countries_yaml(countries_path, {})
 
+    # --- Match waterfalls to network presets ---
+    # Merge new presets into existing ones; build group_to_network_ref mapping.
+    # Keyed by (group_name, countries, ad_format) because the same
+    # (name, countries) pair can have different waterfalls across formats
+    # (e.g., banner "All Countries" has bidding-6, native "All Countries"
+    # has no instances).
+    merged_presets = dict(existing_presets)
+    all_preset_names: set[str] = set(merged_presets.keys())
+    group_to_network_ref: dict[tuple[str, frozenset[str], str], str | None] = {}
+
+    for group in sorted(groups, key=lambda g: (g.ad_format.value, g.position)):
+        group_countries = frozenset(group.countries)
+        key = (group.group_name, group_countries, group.ad_format.value)
+
+        if key in group_to_network_ref:
+            # Already processed this (name, countries, format) triple
+            continue
+
+        instances = group.instances
+        if not instances:
+            # No instances (e.g., native groups) -> no network ref
+            group_to_network_ref[key] = None
+            continue
+
+        sig = waterfall_signature(group)
+
+        # Check if signature matches an existing or already-created preset
+        if sig in sig_to_preset:
+            group_to_network_ref[key] = sig_to_preset[sig]
+            continue
+
+        # New preset: build entries from instances
+        # Determine which (network_name, is_bidder) pairs appear multiple times
+        pair_counts: dict[tuple[str, bool], int] = {}
+        for inst in instances:
+            pair_key = (inst.network_name, inst.is_bidder)
+            pair_counts[pair_key] = pair_counts.get(pair_key, 0) + 1
+        multi_instance_pairs = {k for k, v in pair_counts.items() if v > 1}
+
+        bidders = sorted(inst.network_name for inst in instances if inst.is_bidder)
+        manuals: list[dict[str, Any]] = []
+        for inst in instances:
+            if not inst.is_bidder:
+                entry: dict[str, Any] = {
+                    "network": inst.network_name,
+                    "bidder": False,
+                }
+                if inst.group_rate is not None:
+                    entry["rate"] = inst.group_rate
+                if (inst.network_name, inst.is_bidder) in multi_instance_pairs:
+                    entry["name"] = inst.instance_name
+                manuals.append(entry)
+
+        preset_name = _auto_name_network(bidders, manuals)
+
+        # Handle name collision (append "-2", "-3")
+        if preset_name in all_preset_names:
+            counter = 2
+            base_name = preset_name
+            while f"{base_name}-{counter}" in all_preset_names:
+                counter += 1
+            preset_name = f"{base_name}-{counter}"
+
+        # Build the preset entry list (bidders first, then manuals)
+        preset_entries: list[dict[str, Any]] = []
+        for b in bidders:
+            preset_entries.append({"network": b, "bidder": True})
+        preset_entries.extend(manuals)
+
+        merged_presets[preset_name] = preset_entries
+        all_preset_names.add(preset_name)
+        sig_to_preset[sig] = preset_name
+        group_to_network_ref[key] = preset_name
+
     # --- Generate per-app settings file ---
     settings_path = _write_per_app_settings(
         settings_dir=settings,
         alias=profile.alias,
         groups=groups,
         group_to_ref=group_to_ref,
+        group_to_network_ref=group_to_network_ref,
     )
 
-    return settings_path, info_messages
+    # --- Write shared networks.yaml (only if there are presets) ---
+    networks_path_str: str | None = None
+    if merged_presets:
+        write_yaml_file(
+            networks_path,
+            merged_presets,
+            header=(
+                "# Admedi network presets\n"
+                "# Portfolio-wide waterfall configurations\n\n"
+            ),
+            root_key=None,
+        )
+        networks_path_str = str(networks_path)
+
+    return settings_path, networks_path_str, info_messages
 
 
 def _match_countries_to_group(
@@ -314,26 +431,29 @@ def _write_per_app_settings(
     alias: str,
     groups: list[Group],
     group_to_ref: dict[tuple[str, frozenset[str]], str],
+    group_to_network_ref: dict[tuple[str, frozenset[str], str], str | None] | None = None,
 ) -> str:
-    """Write per-app settings file in the two-layer format.
+    """Write per-app settings file in the two-layer dict format.
 
     Format::
 
         alias: hexar-ios
 
         rewarded:
-          - Tier 1: US
-          - Tier 2: tier-2
-          - All Countries: '*'
+          - Tier 1: {countries: US, networks: bidding-6}
+          - All Countries: {countries: '*'}
 
         interstitial:
-          - Tier 1: US
-          - Tier 2: tier-2
-          - All Countries: '*'
+          - Tier 1: {countries: US, networks: bidding-6}
+          - Tier 2: {countries: tier-2, networks: bidding-6}
+          - All Countries: {countries: '*'}
 
-    Each entry is a single-key mapping: display_name -> country group ref.
-    The display name is the LevelPlay group name. The group ref resolves
-    against ``countries.yaml`` (or ``'*'`` for catch-all).
+    Each entry is a single-key mapping: display_name -> flow-style dict
+    with ``countries`` (required) and ``networks`` (optional) keys.
+    The display name is the LevelPlay group name. The ``countries`` ref
+    resolves against ``countries.yaml`` (or ``'*'`` for catch-all).
+    The ``networks`` ref resolves against ``networks.yaml`` (omitted
+    when None, e.g., native format groups with no waterfall).
 
     Only formats with live groups appear in the output. Omission means
     deletion intent for ``sync`` (per design item #3).
@@ -343,25 +463,39 @@ def _write_per_app_settings(
         alias: App alias for the filename and ``alias`` field.
         groups: List of Group models from the live API.
         group_to_ref: Mapping from (group_name, countries) to country group ref.
+        group_to_network_ref: Mapping from (group_name, countries) to network
+            preset ref (or None). When None or empty dict, all entries are
+            written with countries-only dicts (no networks key).
 
     Returns:
         The path to the written per-app settings file (as string).
     """
-    # Build format -> ordered tier list (each entry is {display_name: group_ref})
-    by_format: dict[str, list[dict[str, str]]] = {}
+    if group_to_network_ref is None:
+        group_to_network_ref = {}
+
+    # Build format -> ordered tier list (each entry is {display_name: CommentedMap})
+    by_format: dict[str, list[dict[str, Any]]] = {}
     for group in sorted(groups, key=lambda g: g.position):
         fmt = group.ad_format.value
         # Skip rewardedVideo (legacy alias -- use "rewarded" only)
         if fmt == AdFormat.REWARDED_VIDEO.value:
             continue
-        key = (group.group_name, frozenset(group.countries))
-        group_ref = group_to_ref.get(key, group.group_name)
+        country_key = (group.group_name, frozenset(group.countries))
+        country_ref = group_to_ref.get(country_key, group.group_name)
+        network_key = (group.group_name, frozenset(group.countries), fmt)
+        network_ref = group_to_network_ref.get(network_key)
         if fmt not in by_format:
             by_format[fmt] = []
         # Avoid duplicate entries within a format (check by display name)
         existing_names = [next(iter(e)) for e in by_format[fmt]]
         if group.group_name not in existing_names:
-            by_format[fmt].append({group.group_name: group_ref})
+            # Build flow-style dict value
+            value_map = CommentedMap()
+            value_map["countries"] = country_ref
+            if network_ref is not None:
+                value_map["networks"] = network_ref
+            value_map.fa.set_flow_style()
+            by_format[fmt].append({group.group_name: value_map})
 
     # Build YAML content
     data: dict[str, Any] = {"alias": alias}
@@ -387,18 +521,55 @@ def _write_per_app_settings(
 def waterfall_signature(group: Group) -> tuple:
     """Create a hashable signature for a group's waterfall configuration.
 
+    Both bidder and manual instance lists are sorted to produce a
+    deterministic signature regardless of iteration order. Manual tuples
+    include ``instance_name`` only for networks that appear multiple times
+    with the same ``(network_name, is_bidder)`` pair (e.g., 3x Google AdMob
+    manuals get their names included for disambiguation). Unique instances
+    use ``None`` for the name slot. This matches what the preset format
+    stores -- ``name`` is only written for multi-instance pairs -- ensuring
+    that signatures computed from live groups match signatures reconstructed
+    from ``networks.yaml`` entries.
+
     Args:
         group: A Group model from the live API.
 
     Returns:
         A tuple of ``(bidders, manuals)`` suitable for use as a dict key.
+
+    Examples:
+        >>> from admedi.engine.snapshot import waterfall_signature
+        >>> from admedi.models.group import Group
+        >>> g = Group.model_validate({
+        ...     "groupName": "T1", "adFormat": "banner",
+        ...     "countries": ["US"], "position": 1,
+        ...     "instances": [
+        ...         {"id": 1, "name": "B", "networkName": "Meta", "isBidder": True},
+        ...     ],
+        ... })
+        >>> sig = waterfall_signature(g)
+        >>> sig[0]
+        ('Meta',)
     """
-    bidders = tuple(sorted(i.network_name for i in group.instances if i.is_bidder))
-    manuals = tuple(
-        (i.network_name, i.group_rate)
-        for i in group.instances
+    instances = group.instances or []
+
+    # Determine which (network_name, is_bidder) pairs have multiple instances
+    pair_counts: dict[tuple[str, bool], int] = {}
+    for i in instances:
+        pair_key = (i.network_name, i.is_bidder)
+        pair_counts[pair_key] = pair_counts.get(pair_key, 0) + 1
+    multi_pairs = {k for k, v in pair_counts.items() if v > 1}
+
+    bidders = tuple(sorted(i.network_name for i in instances if i.is_bidder))
+    manuals = tuple(sorted(
+        (
+            i.network_name,
+            i.group_rate,
+            i.instance_name if (i.network_name, i.is_bidder) in multi_pairs else None,
+        )
+        for i in instances
         if not i.is_bidder
-    )
+    ))
     return (bidders, manuals)
 
 
@@ -410,22 +581,64 @@ def waterfall_signature(group: Group) -> tuple:
 def _auto_name_network(
     bidders: list[str], manuals: list[dict[str, Any]]
 ) -> str:
-    """Generate a descriptive network preset name."""
+    """Generate a descriptive network preset name using a 5-rule algorithm.
+
+    Rules:
+        1. Bidders-only, <=3: join first word of each (lowercased) with ``+``
+           (e.g., ``["Meta", "ironSource"]`` -> ``"meta+ironsource"``).
+        2. Bidders-only, >3: ``"bidding-{count}"``.
+        3. With manuals, <=3 unique manual networks: ``"{bidder-name}-{manual-short-names}"``
+           where short name is the last word (lowercased) for multi-word network names,
+           or the full name (lowercased) for single-word names. Manual short names
+           are sorted alphabetically for determinism.
+        4. With manuals, >3 unique manual networks: ``"{bidder-name}-manual-{count}"``.
+        5. Name collision is handled by the caller (append ``"-2"``, ``"-3"``).
+        6. Zero bidders (manuals-only): omit the bidder-name prefix.
+
+    Args:
+        bidders: Sorted list of bidder network names.
+        manuals: List of manual instance dicts with at least a ``"network"`` key.
+
+    Returns:
+        A descriptive preset name string.
+
+    Examples:
+        >>> _auto_name_network(["Meta", "ironSource"], [])
+        'meta+ironsource'
+        >>> _auto_name_network(["A", "B", "C", "D", "E", "F", "G"], [])
+        'bidding-7'
+    """
     if not bidders and not manuals:
         return "none"
 
-    parts: list[str] = []
-    if len(bidders) == 1:
-        parts.append(bidders[0].lower().replace(" ", "-"))
-    elif len(bidders) <= 3:
-        parts.append("+".join(b.lower().split()[0] for b in bidders))
+    # --- Bidder portion ---
+    bidder_part = ""
+    if len(bidders) <= 3 and bidders:
+        bidder_part = "+".join(b.lower().split()[0] for b in bidders)
     elif len(bidders) > 3:
-        parts.append(f"bidding-{len(bidders)}")
+        bidder_part = f"bidding-{len(bidders)}"
 
-    for m in manuals:
-        parts.append(m["network"].lower().replace(" ", "-"))
+    # --- Manual portion ---
+    manual_part = ""
+    if manuals:
+        # Collect unique manual network names
+        unique_networks = sorted({m["network"] for m in manuals})
+        if len(unique_networks) <= 3:
+            short_names: list[str] = []
+            for net in unique_networks:
+                words = net.split()
+                if len(words) > 1:
+                    short_names.append(words[-1].lower())
+                else:
+                    short_names.append(net.lower())
+            manual_part = "+".join(sorted(short_names))
+        else:
+            manual_part = f"manual-{len(unique_networks)}"
 
-    return "-".join(parts) if parts else "custom"
+    # --- Combine ---
+    if bidder_part and manual_part:
+        return f"{bidder_part}-{manual_part}"
+    return bidder_part or manual_part or "custom"
 
 
 def extract_network_presets(groups: list[Group]) -> dict[str, list[dict[str, Any]]]:
@@ -434,20 +647,49 @@ def extract_network_presets(groups: list[Group]) -> dict[str, list[dict[str, Any
     Deduplicates groups by their waterfall signature (bidder set + manual
     network/rate pairs) and returns a dict of preset name -> instance list.
 
+    The ``name`` field is emitted on manual instance entries only when there
+    are multiple instances of the same ``(network_name, is_bidder)`` pair
+    within the group (disambiguation needed). Bidder entries never need
+    ``name`` because bidders are unique per network.
+
     Args:
         groups: List of Group models from the live API.
 
     Returns:
         Dict mapping preset name to a list of instance dicts with
-        ``network``, ``bidder``, and optional ``rate`` keys.
+        ``network``, ``bidder``, and optional ``rate`` / ``name`` keys.
+
+    Examples:
+        >>> from admedi.engine.snapshot import extract_network_presets
+        >>> from admedi.models.group import Group
+        >>> g = Group.model_validate({
+        ...     "groupName": "T1", "adFormat": "banner",
+        ...     "countries": ["US"], "position": 1,
+        ...     "instances": [
+        ...         {"id": 1, "name": "B", "networkName": "Meta", "isBidder": True},
+        ...     ],
+        ... })
+        >>> presets = extract_network_presets([g])
+        >>> len(presets)
+        1
     """
     seen: dict[tuple, str] = {}
     presets: dict[str, list[dict[str, Any]]] = {}
 
     for group in groups:
+        if group.instances is None:
+            continue
+
         sig = waterfall_signature(group)
         if sig in seen:
             continue
+
+        # Determine which (network_name, is_bidder) pairs appear multiple times
+        pair_counts: dict[tuple[str, bool], int] = {}
+        for i in group.instances:
+            pair_key = (i.network_name, i.is_bidder)
+            pair_counts[pair_key] = pair_counts.get(pair_key, 0) + 1
+        multi_instance_pairs = {k for k, v in pair_counts.items() if v > 1}
 
         bidders = sorted(i.network_name for i in group.instances if i.is_bidder)
         manuals: list[dict[str, Any]] = []
@@ -456,6 +698,9 @@ def extract_network_presets(groups: list[Group]) -> dict[str, list[dict[str, Any
                 entry: dict[str, Any] = {"network": i.network_name, "bidder": False}
                 if i.group_rate is not None:
                     entry["rate"] = i.group_rate
+                # Add name only for disambiguation
+                if (i.network_name, i.is_bidder) in multi_instance_pairs:
+                    entry["name"] = i.instance_name
                 manuals.append(entry)
 
         if not bidders and not manuals:
@@ -463,6 +708,15 @@ def extract_network_presets(groups: list[Group]) -> dict[str, list[dict[str, Any
             continue
 
         name = _auto_name_network(bidders, manuals)
+
+        # Handle name collision by appending counter suffix
+        if name in presets:
+            counter = 2
+            base_name = name
+            while f"{base_name}-{counter}" in presets:
+                counter += 1
+            name = f"{base_name}-{counter}"
+
         instances: list[dict[str, Any]] = []
         for b in bidders:
             instances.append({"network": b, "bidder": True})
@@ -478,7 +732,7 @@ def write_yaml_file(
     path: Path,
     entries: dict[str, Any],
     header: str,
-    root_key: str = "presets",
+    root_key: str | None = "presets",
 ) -> None:
     """Write entries to a YAML file (overwrites existing).
 
@@ -486,12 +740,25 @@ def write_yaml_file(
         path: Path to the output file.
         entries: Dict of entries to write under the root key.
         header: Comment header string to prepend.
-        root_key: Top-level YAML key wrapping the entries.
+        root_key: Top-level YAML key wrapping the entries. When ``None``,
+            entries are dumped directly as the top-level YAML content
+            (no wrapping key).
+
+    Examples:
+        >>> from pathlib import Path
+        >>> import tempfile
+        >>> p = Path(tempfile.mktemp(suffix=".yaml"))
+        >>> write_yaml_file(p, {"a": 1}, header="# h\\n", root_key=None)
+        >>> p.read_text().startswith("# h")
+        True
     """
     yaml = YAML()
     yaml.default_flow_style = False
     stream = StringIO()
-    yaml.dump({root_key: entries}, stream)
+    if root_key is None:
+        yaml.dump(entries, stream)
+    else:
+        yaml.dump({root_key: entries}, stream)
     path.write_text(header + stream.getvalue(), encoding="utf-8")
 
 

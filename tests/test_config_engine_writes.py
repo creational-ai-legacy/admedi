@@ -419,3 +419,197 @@ class TestWriteGroupsCapability:
         """capabilities should now have 5 entries."""
         adapter = _make_adapter()
         assert len(adapter.capabilities) == 5
+
+
+# ---------------------------------------------------------------------------
+# Tests: update_group() with waterfall_payload and include_tier_fields
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateGroupWaterfallPayload:
+    """Tests for update_group() with waterfall_payload and include_tier_fields parameters."""
+
+    async def test_update_group_with_waterfall_payload_includes_ad_source_priority(
+        self,
+    ) -> None:
+        """update_group() PUT payload includes adSourcePriority when waterfall_payload is provided."""
+        adapter = _make_adapter()
+        group = _make_group(
+            name="Tier 1", ad_format="interstitial", countries=["US"], position=1
+        )
+
+        waterfall = {
+            "bidding": {
+                "tierType": "bidding",
+                "instances": [{"providerName": "Meta", "instanceId": 101}],
+            }
+        }
+
+        request_calls: list[tuple[str, str, dict[str, Any] | None]] = []
+
+        async def mock_request(
+            method: str, url: str, *, json_body: Any = None, **kwargs: Any
+        ) -> Any:
+            request_calls.append((method, url, json_body))
+            if method == "PUT":
+                return {}
+            return [
+                {
+                    "groupId": 555,
+                    "groupName": "Tier 1",
+                    "adFormat": "interstitial",
+                    "countries": ["US"],
+                    "position": 1,
+                }
+            ]
+
+        with patch.object(adapter, "_request", side_effect=mock_request):
+            await adapter.update_group(
+                "app123", 555, group, waterfall_payload=waterfall
+            )
+
+        put_payload = request_calls[0][2]
+        assert put_payload is not None
+        assert len(put_payload) == 1
+        assert "adSourcePriority" in put_payload[0]
+        assert put_payload[0]["adSourcePriority"] == waterfall
+
+    async def test_update_group_without_waterfall_payload_no_ad_source_priority(
+        self,
+    ) -> None:
+        """update_group() without waterfall_payload produces same payload as before (backward compatible)."""
+        adapter = _make_adapter()
+        group = _make_group(
+            name="Tier 1", ad_format="interstitial", countries=["US"], position=1
+        )
+
+        request_calls: list[tuple[str, str, dict[str, Any] | None]] = []
+
+        async def mock_request(
+            method: str, url: str, *, json_body: Any = None, **kwargs: Any
+        ) -> Any:
+            request_calls.append((method, url, json_body))
+            if method == "PUT":
+                return {}
+            return [
+                {
+                    "groupId": 555,
+                    "groupName": "Tier 1",
+                    "adFormat": "interstitial",
+                    "countries": ["US"],
+                    "position": 1,
+                }
+            ]
+
+        with patch.object(adapter, "_request", side_effect=mock_request):
+            await adapter.update_group("app123", 555, group)
+
+        put_payload = request_calls[0][2]
+        assert put_payload is not None
+        assert len(put_payload) == 1
+        assert "adSourcePriority" not in put_payload[0]
+        # Verify backward-compatible payload structure
+        assert put_payload[0] == {
+            "groupId": 555,
+            "adFormat": "interstitial",
+            "groupName": "Tier 1",
+            "countries": ["US"],
+            "position": 1,
+        }
+
+    async def test_update_group_include_tier_fields_false_omits_tier_fields(
+        self,
+    ) -> None:
+        """update_group() with include_tier_fields=False omits groupName, countries, position."""
+        adapter = _make_adapter()
+        group = _make_group(
+            name="Tier 1", ad_format="interstitial", countries=["US"], position=1
+        )
+
+        waterfall = {
+            "bidding": {
+                "tierType": "bidding",
+                "instances": [{"providerName": "Meta", "instanceId": 101}],
+            }
+        }
+
+        request_calls: list[tuple[str, str, dict[str, Any] | None]] = []
+
+        async def mock_request(
+            method: str, url: str, *, json_body: Any = None, **kwargs: Any
+        ) -> Any:
+            request_calls.append((method, url, json_body))
+            if method == "PUT":
+                return {}
+            return [
+                {
+                    "groupId": 555,
+                    "groupName": "Tier 1",
+                    "adFormat": "interstitial",
+                    "countries": ["US"],
+                    "position": 1,
+                }
+            ]
+
+        with patch.object(adapter, "_request", side_effect=mock_request):
+            await adapter.update_group(
+                "app123",
+                555,
+                group,
+                waterfall_payload=waterfall,
+                include_tier_fields=False,
+            )
+
+        put_payload = request_calls[0][2]
+        assert put_payload is not None
+        assert len(put_payload) == 1
+        payload_dict = put_payload[0]
+        # Only groupId, adFormat, and adSourcePriority should be present
+        assert "groupId" in payload_dict
+        assert "adFormat" in payload_dict
+        assert "adSourcePriority" in payload_dict
+        # Tier fields should be absent
+        assert "groupName" not in payload_dict
+        assert "countries" not in payload_dict
+        assert "position" not in payload_dict
+
+    async def test_update_group_include_tier_fields_true_includes_all_fields(
+        self,
+    ) -> None:
+        """update_group() with include_tier_fields=True (default) includes all fields."""
+        adapter = _make_adapter()
+        group = _make_group(
+            name="Tier 1", ad_format="interstitial", countries=["US", "CA"], position=3
+        )
+
+        request_calls: list[tuple[str, str, dict[str, Any] | None]] = []
+
+        async def mock_request(
+            method: str, url: str, *, json_body: Any = None, **kwargs: Any
+        ) -> Any:
+            request_calls.append((method, url, json_body))
+            if method == "PUT":
+                return {}
+            return [
+                {
+                    "groupId": 777,
+                    "groupName": "Tier 1",
+                    "adFormat": "interstitial",
+                    "countries": ["US", "CA"],
+                    "position": 3,
+                }
+            ]
+
+        with patch.object(adapter, "_request", side_effect=mock_request):
+            await adapter.update_group(
+                "app123", 777, group, include_tier_fields=True
+            )
+
+        put_payload = request_calls[0][2]
+        assert put_payload is not None
+        payload_dict = put_payload[0]
+        assert payload_dict["groupId"] == 777
+        assert payload_dict["adFormat"] == "interstitial"
+        assert payload_dict["groupName"] == "Tier 1"
+        assert payload_dict["countries"] == ["US", "CA"]
+        assert payload_dict["position"] == 3

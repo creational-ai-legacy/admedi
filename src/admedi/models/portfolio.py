@@ -109,6 +109,9 @@ class PortfolioTier(BaseModel):
             in a ``PortfolioConfig`` must have ``is_default=True``.
         ad_formats: Ad formats this tier applies to (e.g.,
             ``[AdFormat.INTERSTITIAL, AdFormat.BANNER]``).
+        network_preset: Optional name of a shared network waterfall preset
+            from ``networks.yaml``. When set, sync will apply the preset's
+            waterfall configuration to this tier's groups.
     """
 
     model_config = ConfigDict(populate_by_name=True)
@@ -118,6 +121,40 @@ class PortfolioTier(BaseModel):
     position: int = Field(ge=1)
     is_default: bool = False
     ad_formats: list[AdFormat]
+    network_preset: str | None = Field(
+        default=None,
+        description="Name of a shared network waterfall preset from networks.yaml",
+    )
+
+
+class SyncScope(BaseModel):
+    """Controls which aspects of mediation config are synced.
+
+    Used by ``ConfigEngine.sync()`` and ``ConfigEngine.audit()`` to scope
+    operations to tiers only, networks only, or both (the default).
+
+    Attributes:
+        tiers: When True, sync tier-level changes (countries, position,
+            group name). Defaults to True.
+        networks: When True, sync network waterfall changes
+            (adSourcePriority). Defaults to True.
+
+    Examples:
+        >>> scope = SyncScope()  # full sync (tiers + networks)
+        >>> scope.tiers, scope.networks
+        (True, True)
+        >>> scope = SyncScope(tiers=True, networks=False)  # tiers only
+        >>> scope = SyncScope(tiers=False, networks=True)  # networks only
+    """
+
+    tiers: bool = Field(
+        default=True,
+        description="Sync tier-level changes (countries, position, group name)",
+    )
+    networks: bool = Field(
+        default=True,
+        description="Sync network waterfall changes (adSourcePriority)",
+    )
 
 
 class PortfolioConfig(BaseModel):

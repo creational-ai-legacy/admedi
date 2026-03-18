@@ -170,7 +170,13 @@ class MediationAdapter(ABC):
 
     @abstractmethod
     async def update_group(
-        self, app_key: str, group_id: int, group: Group
+        self,
+        app_key: str,
+        group_id: int,
+        group: Group,
+        *,
+        waterfall_payload: dict[str, Any] | None = None,
+        include_tier_fields: bool = True,
     ) -> Group:
         """Update an existing mediation group.
 
@@ -178,6 +184,13 @@ class MediationAdapter(ABC):
             app_key: Platform-specific app identifier.
             group_id: ID of the group to update.
             group: Updated group configuration.
+            waterfall_payload: Optional waterfall ordering payload to include
+                as ``adSourcePriority`` in the PUT body. When ``None``
+                (default), no waterfall data is sent.
+            include_tier_fields: When ``True`` (default), include
+                ``groupName``, ``countries``, and ``position`` in the PUT
+                body. When ``False``, omit these fields so the server
+                preserves them (partial PUT for waterfall-only updates).
 
         Returns:
             The updated ``Group``.

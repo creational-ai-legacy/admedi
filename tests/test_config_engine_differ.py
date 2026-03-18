@@ -22,9 +22,11 @@ from __future__ import annotations
 import pytest
 
 from admedi.engine.differ import compute_diff
+from admedi.exceptions import ConfigValidationError
 from admedi.models.diff import AppDiffReport, DiffAction, FieldChange, GroupDiff
 from admedi.models.enums import AdFormat, Mediator, Platform
 from admedi.models.group import Group
+from admedi.models.instance import Instance
 from admedi.models.portfolio import PortfolioApp, PortfolioConfig, PortfolioTier
 
 
@@ -71,6 +73,42 @@ def _make_group(
         countries=countries,
         position=position,
         ab_test=ab_test,
+    )
+
+
+def _make_instance(
+    network_name: str,
+    is_bidder: bool,
+    instance_name: str = "Default",
+    instance_id: int = 1,
+    group_rate: float | None = None,
+) -> Instance:
+    """Create an Instance with minimal fields."""
+    return Instance(
+        instance_id=instance_id,
+        instance_name=instance_name,
+        network_name=network_name,
+        is_bidder=is_bidder,
+        group_rate=group_rate,
+    )
+
+
+def _make_group_with_instances(
+    name: str,
+    ad_format: AdFormat,
+    countries: list[str],
+    position: int,
+    group_id: int,
+    instances: list[Instance] | None = None,
+) -> Group:
+    """Create a Group with instances for waterfall testing."""
+    return Group(
+        group_id=group_id,
+        group_name=name,
+        ad_format=ad_format,
+        countries=countries,
+        position=position,
+        instances=instances,
     )
 
 
@@ -951,3 +989,552 @@ class TestMultiFormatConsistency:
         for diff in report.group_diffs:
             assert diff.desired_group is not None
             assert diff.desired_group.ad_format == diff.ad_format
+
+
+# ---------------------------------------------------------------------------
+# Waterfall comparison tests (Step 6)
+# ---------------------------------------------------------------------------
+
+
+class TestWaterfallIdentical:
+    """Identical waterfall produces no waterfall FieldChange."""
+
+    def test_identical_waterfall_no_changes(self) -> None:
+        """Preset matches live instances exactly -- no waterfall FieldChange."""
+        preset = [
+            {"network": "Meta", "bidder": True},
+            {"network": "AppLovin", "bidder": False, "rate": 10.0},
+        ]
+        presets = {"standard": preset}
+
+        tier = PortfolioTier(
+            name="Tier 1",
+            countries=["US"],
+            position=1,
+            ad_formats=[AdFormat.INTERSTITIAL],
+            network_preset="standard",
+        )
+        group = _make_group_with_instances(
+            "Tier 1", AdFormat.INTERSTITIAL, ["US"], 1, group_id=1,
+            instances=[
+                _make_instance("Meta", True, "Meta Default", 10),
+                _make_instance("AppLovin", False, "AppLovin Default", 11, group_rate=10.0),
+            ],
+        )
+
+        report = compute_diff([tier], [group], APP_KEY, APP_NAME, network_presets=presets)
+        waterfall_changes = [
+            c for d in report.group_diffs for c in d.changes if c.field == "waterfall"
+        ]
+        assert len(waterfall_changes) == 0
+
+    def test_identical_waterfall_unchanged_action(self) -> None:
+        """Tier with matching preset and matching tier fields is UNCHANGED."""
+        preset = [{"network": "Meta", "bidder": True}]
+        presets = {"standard": preset}
+
+        tier = PortfolioTier(
+            name="Tier 1",
+            countries=["US"],
+            position=1,
+            ad_formats=[AdFormat.INTERSTITIAL],
+            network_preset="standard",
+        )
+        group = _make_group_with_instances(
+            "Tier 1", AdFormat.INTERSTITIAL, ["US"], 1, group_id=1,
+            instances=[_make_instance("Meta", True, "Meta Default", 10)],
+        )
+
+        report = compute_diff([tier], [group], APP_KEY, APP_NAME, network_presets=presets)
+        assert report.group_diffs[0].action == DiffAction.UNCHANGED
+
+
+class TestWaterfallMissingBidder:
+    """Missing bidder in live instances produces informational FieldChange."""
+
+    def test_missing_bidder_in_live(self) -> None:
+        """Preset has a bidder not present in live -- FieldChange with description."""
+        preset = [
+            {"network": "Meta", "bidder": True},
+            {"network": "Pangle", "bidder": True},
+        ]
+        presets = {"standard": preset}
+
+        tier = PortfolioTier(
+            name="Tier 1",
+            countries=["US"],
+            position=1,
+            ad_formats=[AdFormat.INTERSTITIAL],
+            network_preset="standard",
+        )
+        group = _make_group_with_instances(
+            "Tier 1", AdFormat.INTERSTITIAL, ["US"], 1, group_id=1,
+            instances=[_make_instance("Meta", True, "Meta Default", 10)],
+        )
+
+        report = compute_diff([tier], [group], APP_KEY, APP_NAME, network_presets=presets)
+        waterfall_changes = [
+            c for d in report.group_diffs for c in d.changes if c.field == "waterfall"
+        ]
+        # Pangle is missing but informational
+        assert len(waterfall_changes) == 1
+        assert "Pangle" in waterfall_changes[0].description
+        assert "not found" in waterfall_changes[0].description
+
+
+class TestWaterfallExtraManual:
+    """Extra manual instance in live not in preset is flagged as informational."""
+
+    def test_extra_manual_instance_informational(self) -> None:
+        """Live has a manual instance not in preset -- informational FieldChange (cannot remove via API)."""
+        preset = [{"network": "Meta", "bidder": True}]
+        presets = {"standard": preset}
+
+        tier = PortfolioTier(
+            name="Tier 1",
+            countries=["US"],
+            position=1,
+            ad_formats=[AdFormat.INTERSTITIAL],
+            network_preset="standard",
+        )
+        group = _make_group_with_instances(
+            "Tier 1", AdFormat.INTERSTITIAL, ["US"], 1, group_id=1,
+            instances=[
+                _make_instance("Meta", True, "Meta Default", 10),
+                _make_instance("ironSource", False, "ironSource Default", 11, group_rate=5.0),
+            ],
+        )
+
+        report = compute_diff([tier], [group], APP_KEY, APP_NAME, network_presets=presets)
+        waterfall_changes = [
+            c for d in report.group_diffs for c in d.changes if c.field == "waterfall"
+        ]
+        assert len(waterfall_changes) == 1
+        assert "ironSource" in waterfall_changes[0].description
+        assert "cannot be removed via API" in waterfall_changes[0].description
+
+
+class TestWaterfallRateChange:
+    """Rate changes beyond tolerance produce FieldChange."""
+
+    def test_rate_change_detected(self) -> None:
+        """Preset rate 1.0, live rate 14.5 -- FieldChange with rate description."""
+        preset = [{"network": "AppLovin", "bidder": False, "rate": 1.0}]
+        presets = {"standard": preset}
+
+        tier = PortfolioTier(
+            name="Tier 1",
+            countries=["US"],
+            position=1,
+            ad_formats=[AdFormat.INTERSTITIAL],
+            network_preset="standard",
+        )
+        group = _make_group_with_instances(
+            "Tier 1", AdFormat.INTERSTITIAL, ["US"], 1, group_id=1,
+            instances=[
+                _make_instance("AppLovin", False, "AppLovin Default", 10, group_rate=14.5),
+            ],
+        )
+
+        report = compute_diff([tier], [group], APP_KEY, APP_NAME, network_presets=presets)
+        waterfall_changes = [
+            c for d in report.group_diffs for c in d.changes if c.field == "waterfall"
+        ]
+        assert len(waterfall_changes) == 1
+        assert waterfall_changes[0].old_value == 14.5
+        assert waterfall_changes[0].new_value == 1.0
+        assert "rate" in waterfall_changes[0].description
+
+    def test_rate_within_tolerance_no_change(self) -> None:
+        """Preset 1.0, live 1.005 -- within 0.01 tolerance, no FieldChange."""
+        preset = [{"network": "AppLovin", "bidder": False, "rate": 1.0}]
+        presets = {"standard": preset}
+
+        tier = PortfolioTier(
+            name="Tier 1",
+            countries=["US"],
+            position=1,
+            ad_formats=[AdFormat.INTERSTITIAL],
+            network_preset="standard",
+        )
+        group = _make_group_with_instances(
+            "Tier 1", AdFormat.INTERSTITIAL, ["US"], 1, group_id=1,
+            instances=[
+                _make_instance("AppLovin", False, "AppLovin Default", 10, group_rate=1.005),
+            ],
+        )
+
+        report = compute_diff([tier], [group], APP_KEY, APP_NAME, network_presets=presets)
+        waterfall_changes = [
+            c for d in report.group_diffs for c in d.changes if c.field == "waterfall"
+        ]
+        assert len(waterfall_changes) == 0
+
+
+class TestWaterfallNetworkPresetNone:
+    """When network_preset is None, no waterfall comparison occurs."""
+
+    def test_no_network_preset_no_waterfall_comparison(self) -> None:
+        """Tier with network_preset=None skips waterfall comparison entirely."""
+        presets = {
+            "standard": [{"network": "Meta", "bidder": True}],
+        }
+
+        tier = PortfolioTier(
+            name="Tier 1",
+            countries=["US"],
+            position=1,
+            ad_formats=[AdFormat.INTERSTITIAL],
+            network_preset=None,  # explicitly None
+        )
+        # Live has instances that would differ from any preset,
+        # but comparison should be skipped
+        group = _make_group_with_instances(
+            "Tier 1", AdFormat.INTERSTITIAL, ["US"], 1, group_id=1,
+            instances=[
+                _make_instance("ironSource", False, "ironSource Default", 10, group_rate=5.0),
+            ],
+        )
+
+        report = compute_diff([tier], [group], APP_KEY, APP_NAME, network_presets=presets)
+        waterfall_changes = [
+            c for d in report.group_diffs for c in d.changes if c.field == "waterfall"
+        ]
+        assert len(waterfall_changes) == 0
+        assert report.group_diffs[0].action == DiffAction.UNCHANGED
+
+
+class TestWaterfallNetworkPresetsNone:
+    """When network_presets parameter is None, existing behavior is preserved."""
+
+    def test_network_presets_none_no_waterfall_comparison(self) -> None:
+        """compute_diff with network_presets=None produces same output as before."""
+        tier = PortfolioTier(
+            name="Tier 1",
+            countries=["US"],
+            position=1,
+            ad_formats=[AdFormat.INTERSTITIAL],
+            network_preset="standard",  # tier HAS a preset reference
+        )
+        group = _make_group_with_instances(
+            "Tier 1", AdFormat.INTERSTITIAL, ["US"], 1, group_id=1,
+            instances=[
+                _make_instance("ironSource", False, "ironSource Default", 10, group_rate=5.0),
+            ],
+        )
+
+        # network_presets=None (default) -- no waterfall comparison
+        report = compute_diff([tier], [group], APP_KEY, APP_NAME, network_presets=None)
+        waterfall_changes = [
+            c for d in report.group_diffs for c in d.changes if c.field == "waterfall"
+        ]
+        assert len(waterfall_changes) == 0
+
+    def test_network_presets_default_none(self) -> None:
+        """compute_diff without network_presets arg uses default None."""
+        tier = PortfolioTier(
+            name="Tier 1",
+            countries=["US"],
+            position=1,
+            ad_formats=[AdFormat.INTERSTITIAL],
+            network_preset="standard",
+        )
+        group = _make_group_with_instances(
+            "Tier 1", AdFormat.INTERSTITIAL, ["US"], 1, group_id=1,
+            instances=[
+                _make_instance("ironSource", False, "ironSource Default", 10),
+            ],
+        )
+
+        # No network_presets keyword -- default None
+        report = compute_diff([tier], [group], APP_KEY, APP_NAME)
+        waterfall_changes = [
+            c for d in report.group_diffs for c in d.changes if c.field == "waterfall"
+        ]
+        assert len(waterfall_changes) == 0
+
+
+class TestWaterfallInvalidPresetRef:
+    """Invalid preset reference raises ConfigValidationError."""
+
+    def test_invalid_preset_ref_raises(self) -> None:
+        """Tier references a preset not in network_presets -- raises ConfigValidationError."""
+        presets = {"standard": [{"network": "Meta", "bidder": True}]}
+
+        tier = PortfolioTier(
+            name="Tier 1",
+            countries=["US"],
+            position=1,
+            ad_formats=[AdFormat.INTERSTITIAL],
+            network_preset="nonexistent_preset",
+        )
+        group = _make_group_with_instances(
+            "Tier 1", AdFormat.INTERSTITIAL, ["US"], 1, group_id=1,
+            instances=[_make_instance("Meta", True, "Meta Default", 10)],
+        )
+
+        with pytest.raises(ConfigValidationError, match="nonexistent_preset"):
+            compute_diff([tier], [group], APP_KEY, APP_NAME, network_presets=presets)
+
+
+class TestWaterfallInstancesNone:
+    """Group with instances=None is handled gracefully."""
+
+    def test_instances_none_warning(self) -> None:
+        """Group with instances=None produces warning FieldChange."""
+        presets = {"standard": [{"network": "Meta", "bidder": True}]}
+
+        tier = PortfolioTier(
+            name="Tier 1",
+            countries=["US"],
+            position=1,
+            ad_formats=[AdFormat.INTERSTITIAL],
+            network_preset="standard",
+        )
+        group = _make_group_with_instances(
+            "Tier 1", AdFormat.INTERSTITIAL, ["US"], 1, group_id=1,
+            instances=None,
+        )
+
+        report = compute_diff([tier], [group], APP_KEY, APP_NAME, network_presets=presets)
+        waterfall_changes = [
+            c for d in report.group_diffs for c in d.changes if c.field == "waterfall"
+        ]
+        assert len(waterfall_changes) == 1
+        assert "instances=None" in waterfall_changes[0].description
+        assert "cannot compare" in waterfall_changes[0].description
+
+
+class TestWaterfallNameBasedMatching:
+    """Preset with name field matches by instance_name."""
+
+    def test_name_based_matching(self) -> None:
+        """Preset with name='High' matches instance with instance_name='High'."""
+        preset = [
+            {"network": "AppLovin", "bidder": False, "rate": 10.0, "name": "High"},
+            {"network": "AppLovin", "bidder": False, "rate": 5.0, "name": "Low"},
+        ]
+        presets = {"standard": preset}
+
+        tier = PortfolioTier(
+            name="Tier 1",
+            countries=["US"],
+            position=1,
+            ad_formats=[AdFormat.INTERSTITIAL],
+            network_preset="standard",
+        )
+        group = _make_group_with_instances(
+            "Tier 1", AdFormat.INTERSTITIAL, ["US"], 1, group_id=1,
+            instances=[
+                _make_instance("AppLovin", False, "High", 10, group_rate=10.0),
+                _make_instance("AppLovin", False, "Low", 11, group_rate=5.0),
+            ],
+        )
+
+        report = compute_diff([tier], [group], APP_KEY, APP_NAME, network_presets=presets)
+        waterfall_changes = [
+            c for d in report.group_diffs for c in d.changes if c.field == "waterfall"
+        ]
+        assert len(waterfall_changes) == 0
+
+    def test_name_mismatch_produces_missing(self) -> None:
+        """Preset name='High' with no matching instance_name produces missing."""
+        preset = [
+            {"network": "AppLovin", "bidder": False, "rate": 10.0, "name": "High"},
+        ]
+        presets = {"standard": preset}
+
+        tier = PortfolioTier(
+            name="Tier 1",
+            countries=["US"],
+            position=1,
+            ad_formats=[AdFormat.INTERSTITIAL],
+            network_preset="standard",
+        )
+        group = _make_group_with_instances(
+            "Tier 1", AdFormat.INTERSTITIAL, ["US"], 1, group_id=1,
+            instances=[
+                _make_instance("AppLovin", False, "Low", 10, group_rate=5.0),
+            ],
+        )
+
+        report = compute_diff([tier], [group], APP_KEY, APP_NAME, network_presets=presets)
+        waterfall_changes = [
+            c for d in report.group_diffs for c in d.changes if c.field == "waterfall"
+        ]
+        # Missing (High not found) + Extra (Low not matched)
+        assert len(waterfall_changes) == 2
+        missing = [c for c in waterfall_changes if "not found" in c.description]
+        extra = [c for c in waterfall_changes if "cannot be removed" in c.description]
+        assert len(missing) == 1
+        assert "High" in missing[0].description
+        assert len(extra) == 1
+        assert "Low" in extra[0].description
+
+
+# ---------------------------------------------------------------------------
+# Test Classes: SyncScope-based comparison scoping (Step 8)
+# ---------------------------------------------------------------------------
+
+
+class TestScopeNetworksOnlySkipsTierFields:
+    """scope=SyncScope(tiers=False, networks=True) produces only waterfall FieldChanges."""
+
+    def test_scope_networks_only_no_country_changes(self) -> None:
+        """With tiers=False, country differences are not reported."""
+        from admedi.models.portfolio import SyncScope
+
+        preset = [{"network": "Meta", "bidder": True}]
+        presets = {"bidding-1": preset}
+
+        tier = PortfolioTier(
+            name="Tier 1",
+            countries=["US", "GB"],  # Different from remote
+            position=1,
+            ad_formats=[AdFormat.INTERSTITIAL],
+            network_preset="bidding-1",
+        )
+        group = _make_group_with_instances(
+            "Tier 1", AdFormat.INTERSTITIAL, ["US"], 1, group_id=1,
+            instances=[
+                _make_instance("Meta", True, "Meta", 1),
+            ],
+        )
+
+        scope = SyncScope(tiers=False, networks=True)
+        report = compute_diff(
+            [tier], [group], APP_KEY, APP_NAME,
+            network_presets=presets, scope=scope,
+        )
+
+        # No country/position/name changes should appear
+        tier_changes = [
+            c for d in report.group_diffs for c in d.changes
+            if c.field in ("countries", "position", "name")
+        ]
+        assert len(tier_changes) == 0
+
+    def test_scope_networks_only_still_produces_waterfall_changes(self) -> None:
+        """With tiers=False, waterfall changes are still reported."""
+        from admedi.models.portfolio import SyncScope
+
+        preset = [
+            {"network": "Meta", "bidder": True},
+            {"network": "AppLovin", "bidder": True},  # Not in live
+        ]
+        presets = {"bidding-2": preset}
+
+        tier = PortfolioTier(
+            name="Tier 1",
+            countries=["US"],
+            position=1,
+            ad_formats=[AdFormat.INTERSTITIAL],
+            network_preset="bidding-2",
+        )
+        group = _make_group_with_instances(
+            "Tier 1", AdFormat.INTERSTITIAL, ["US"], 1, group_id=1,
+            instances=[
+                _make_instance("Meta", True, "Meta", 1),
+            ],
+        )
+
+        scope = SyncScope(tiers=False, networks=True)
+        report = compute_diff(
+            [tier], [group], APP_KEY, APP_NAME,
+            network_presets=presets, scope=scope,
+        )
+
+        waterfall_changes = [
+            c for d in report.group_diffs for c in d.changes
+            if c.field == "waterfall"
+        ]
+        assert len(waterfall_changes) > 0
+        # AppLovin missing
+        missing = [c for c in waterfall_changes if "not found" in c.description]
+        assert len(missing) == 1
+        assert "AppLovin" in missing[0].description
+
+
+class TestScopeTiersOnlySkipsWaterfall:
+    """scope=SyncScope(tiers=True, networks=False) produces only tier FieldChanges."""
+
+    def test_scope_tiers_only_no_waterfall_changes(self) -> None:
+        """With networks=False (via network_presets=None), no waterfall changes are reported."""
+        from admedi.models.portfolio import SyncScope
+
+        tier = PortfolioTier(
+            name="Tier 1",
+            countries=["US", "GB"],  # Different from remote
+            position=1,
+            ad_formats=[AdFormat.INTERSTITIAL],
+            network_preset="bidding-1",  # Preset ref exists but presets not loaded
+        )
+        group = _make_group_with_instances(
+            "Tier 1", AdFormat.INTERSTITIAL, ["US"], 1, group_id=1,
+            instances=[
+                _make_instance("Meta", True, "Meta", 1),
+            ],
+        )
+
+        scope = SyncScope(tiers=True, networks=False)
+        # network_presets=None means waterfall comparison is skipped
+        report = compute_diff(
+            [tier], [group], APP_KEY, APP_NAME,
+            network_presets=None, scope=scope,
+        )
+
+        waterfall_changes = [
+            c for d in report.group_diffs for c in d.changes
+            if c.field == "waterfall"
+        ]
+        assert len(waterfall_changes) == 0
+
+        # But tier changes should be present
+        tier_changes = [
+            c for d in report.group_diffs for c in d.changes
+            if c.field == "countries"
+        ]
+        assert len(tier_changes) == 1
+
+
+class TestScopeNoneFullComparison:
+    """scope=None defaults to full comparison (backward compatible)."""
+
+    def test_scope_none_produces_both_tier_and_waterfall_changes(self) -> None:
+        """With scope=None, both tier and waterfall changes are reported."""
+        preset = [
+            {"network": "Meta", "bidder": True},
+            {"network": "AppLovin", "bidder": True},  # Not in live
+        ]
+        presets = {"bidding-2": preset}
+
+        tier = PortfolioTier(
+            name="Tier 1",
+            countries=["US", "GB"],  # Different from remote
+            position=1,
+            ad_formats=[AdFormat.INTERSTITIAL],
+            network_preset="bidding-2",
+        )
+        group = _make_group_with_instances(
+            "Tier 1", AdFormat.INTERSTITIAL, ["US"], 1, group_id=1,
+            instances=[
+                _make_instance("Meta", True, "Meta", 1),
+            ],
+        )
+
+        # scope=None (default) = full comparison
+        report = compute_diff(
+            [tier], [group], APP_KEY, APP_NAME,
+            network_presets=presets, scope=None,
+        )
+
+        tier_changes = [
+            c for d in report.group_diffs for c in d.changes
+            if c.field == "countries"
+        ]
+        waterfall_changes = [
+            c for d in report.group_diffs for c in d.changes
+            if c.field == "waterfall"
+        ]
+        assert len(tier_changes) == 1
+        assert len(waterfall_changes) > 0

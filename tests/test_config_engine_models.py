@@ -20,7 +20,7 @@ from admedi.models.diff import (
 )
 from admedi.models.enums import AdFormat, Mediator, Platform
 from admedi.models.group import Group
-from admedi.models.portfolio import PortfolioApp, PortfolioConfig, PortfolioTier
+from admedi.models.portfolio import PortfolioApp, PortfolioConfig, PortfolioTier, SyncScope
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +178,90 @@ class TestPortfolioTier:
     def test_populate_by_name_config(self):
         """ConfigDict has populate_by_name=True."""
         assert PortfolioTier.model_config.get("populate_by_name") is True
+
+    def test_network_preset_defaults_to_none(self):
+        """network_preset defaults to None when not specified."""
+        tier = PortfolioTier(**_make_tier())
+        assert tier.network_preset is None
+
+    def test_network_preset_construction_with_value(self):
+        """network_preset stores value when explicitly set."""
+        tier = PortfolioTier(**_make_tier(network_preset="bidding-7"))
+        assert tier.network_preset == "bidding-7"
+
+    def test_network_preset_round_trip_serialization(self):
+        """network_preset survives model_dump/model_validate round-trip."""
+        original = PortfolioTier(**_make_tier(network_preset="bidding-6"))
+        dumped = original.model_dump()
+        assert dumped["network_preset"] == "bidding-6"
+        restored = PortfolioTier.model_validate(dumped)
+        assert restored.network_preset == "bidding-6"
+        assert restored == original
+
+    def test_network_preset_none_round_trip(self):
+        """network_preset=None survives model_dump/model_validate round-trip."""
+        original = PortfolioTier(**_make_tier())
+        dumped = original.model_dump()
+        assert dumped["network_preset"] is None
+        restored = PortfolioTier.model_validate(dumped)
+        assert restored.network_preset is None
+        assert restored == original
+
+    def test_network_preset_explicit_none(self):
+        """Explicitly passing network_preset=None is accepted."""
+        tier = PortfolioTier(**_make_tier(network_preset=None))
+        assert tier.network_preset is None
+
+
+# ---------------------------------------------------------------------------
+# SyncScope Tests
+# ---------------------------------------------------------------------------
+
+class TestSyncScope:
+    """Tests for SyncScope model."""
+
+    def test_default_construction(self):
+        """SyncScope() defaults to tiers=True, networks=True (full sync)."""
+        scope = SyncScope()
+        assert scope.tiers is True
+        assert scope.networks is True
+
+    def test_tiers_only(self):
+        """SyncScope(tiers=True, networks=False) scopes to tiers only."""
+        scope = SyncScope(tiers=True, networks=False)
+        assert scope.tiers is True
+        assert scope.networks is False
+
+    def test_networks_only(self):
+        """SyncScope(tiers=False, networks=True) scopes to networks only."""
+        scope = SyncScope(tiers=False, networks=True)
+        assert scope.tiers is False
+        assert scope.networks is True
+
+    def test_both_false(self):
+        """SyncScope(tiers=False, networks=False) is valid (no-op sync)."""
+        scope = SyncScope(tiers=False, networks=False)
+        assert scope.tiers is False
+        assert scope.networks is False
+
+    def test_model_dump_output(self):
+        """model_dump() returns expected dict structure."""
+        scope = SyncScope(tiers=True, networks=False)
+        dumped = scope.model_dump()
+        assert dumped == {"tiers": True, "networks": False}
+
+    def test_model_dump_defaults(self):
+        """model_dump() on default SyncScope returns both True."""
+        scope = SyncScope()
+        dumped = scope.model_dump()
+        assert dumped == {"tiers": True, "networks": True}
+
+    def test_round_trip_serialization(self):
+        """SyncScope round-trips through model_dump/model_validate."""
+        original = SyncScope(tiers=False, networks=True)
+        dumped = original.model_dump()
+        restored = SyncScope.model_validate(dumped)
+        assert restored == original
 
 
 # ---------------------------------------------------------------------------

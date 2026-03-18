@@ -5,8 +5,12 @@ the required create/update operations via a ``MediationAdapter``, with
 safety guards including dry-run default, pre-write snapshots, A/B test
 detection, per-app error isolation, and post-write verification.
 
+The module also provides ``build_waterfall_payload()``, a standalone helper
+that resolves preset entries against live instances to produce an
+``adSourcePriority`` payload for the Groups v4 PUT.
+
 Examples:
-    >>> from admedi.engine.applier import Applier
+    >>> from admedi.engine.applier import Applier, build_waterfall_payload
     >>> applier = Applier(adapter=adapter, storage=storage)
     >>> result = await applier.apply(diff_report, dry_run=True)
     >>> result.was_dry_run
@@ -18,15 +22,151 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from datetime import datetime, timezone
+from typing import Any
 
 from admedi.adapters.mediation import MediationAdapter
 from admedi.adapters.storage import StorageAdapter
 from admedi.models.apply_result import AppApplyResult, ApplyResult, ApplyStatus
 from admedi.models.config_snapshot import ConfigSnapshot
-from admedi.models.diff import AppDiffReport, DiffAction, GroupDiff
+from admedi.models.diff import AppDiffReport, DiffAction, DiffReport, GroupDiff
+from admedi.models.group import Group
+from admedi.models.instance import Instance
+from admedi.models.portfolio import SyncScope
 from admedi.models.sync_log import SyncLog
 
 logger = logging.getLogger(__name__)
+
+
+def build_waterfall_payload(
+    preset_entries: list[dict[str, Any]],
+    live_instances: list[Instance],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Resolve preset entries against live instances to build a waterfall payload.
+
+    Matches each preset entry to a live instance by ``(network_name, is_bidder)``
+    and optionally ``instance_name``. Returns a payload dict suitable for the
+    ``adSourcePriority`` field on the Groups v4 PUT, or ``None`` if the payload
+    cannot be safely constructed.
+
+    Resolution rules:
+        1. **Exact match** (network + bidder + name): use instance_id.
+        2. **Unique match** (network + bidder, no name in preset): use instance_id.
+        3. **Ambiguous** (network + bidder, no name, multiple candidates): abort.
+        4. **No match** (network not in app): skip with warning.
+        5. **Name changed** (preset has name, no match): abort.
+
+    Args:
+        preset_entries: List of preset entry dicts, each with ``network`` (str),
+            ``bidder`` (bool), and optional ``name`` (str) and ``rate`` (float).
+        live_instances: Flat list of live ``Instance`` objects from the group.
+
+    Returns:
+        A tuple of ``(payload, warnings)``:
+        - ``payload``: A dict with ``"bidding"`` and/or tier keys, or ``None``
+          if the preset is empty or resolution was aborted due to ambiguity
+          or name-change failure.
+        - ``warnings``: List of warning messages. Empty for clean resolution
+          or empty preset; non-empty for skipped or aborted entries.
+
+    Examples:
+        >>> payload, warnings = build_waterfall_payload(
+        ...     [{"network": "Meta", "bidder": True}],
+        ...     [Instance(instance_id=1, instance_name="Meta", network_name="Meta", is_bidder=True)],
+        ... )
+        >>> payload["bidding"]["instances"][0]["instanceId"]
+        1
+    """
+    if not preset_entries:
+        return None, []
+
+    warnings: list[str] = []
+    bidding_instances: list[dict[str, Any]] = []
+    manual_instances: list[dict[str, Any]] = []
+    abort = False
+
+    for entry in preset_entries:
+        network = entry["network"]
+        is_bidder = entry["bidder"]
+        preset_name = entry.get("name")
+        preset_rate = entry.get("rate")
+
+        # Find candidates matching network + bidder
+        candidates = [
+            inst for inst in live_instances
+            if inst.network_name == network and inst.is_bidder == is_bidder
+        ]
+
+        if not candidates:
+            # Rule 4: No match -- skip with warning
+            warnings.append(
+                f"Network '{network}' (bidder={is_bidder}) not found in live "
+                f"instances; skipping"
+            )
+            continue
+
+        if preset_name is not None:
+            # Narrow by instance_name
+            named_candidates = [
+                inst for inst in candidates
+                if inst.instance_name == preset_name
+            ]
+            if not named_candidates:
+                # Rule 5: Name changed -- abort
+                abort = True
+                warnings.append(
+                    f"Network '{network}' (bidder={is_bidder}) has no instance "
+                    f"named '{preset_name}'; aborting waterfall update"
+                )
+                continue
+            matched = named_candidates[0]
+        elif len(candidates) == 1:
+            # Rule 2: Unique match
+            matched = candidates[0]
+        else:
+            # Rule 3: Ambiguous -- abort
+            abort = True
+            candidate_names = [c.instance_name for c in candidates]
+            warnings.append(
+                f"Network '{network}' (bidder={is_bidder}) has {len(candidates)} "
+                f"instances {candidate_names}; cannot resolve without 'name' "
+                f"in preset; aborting waterfall update"
+            )
+            continue
+
+        # Build instance entry
+        instance_entry: dict[str, Any] = {
+            "providerName": matched.network_name,
+            "instanceId": matched.instance_id,
+        }
+        if preset_rate is not None and not is_bidder:
+            instance_entry["rate"] = preset_rate
+
+        if is_bidder:
+            bidding_instances.append(instance_entry)
+        else:
+            manual_instances.append(instance_entry)
+
+    if abort:
+        return None, warnings
+
+    # Build payload structure
+    payload: dict[str, Any] = {}
+    if bidding_instances:
+        payload["bidding"] = {
+            "tierType": "bidding",
+            "instances": bidding_instances,
+        }
+    if manual_instances:
+        payload["tier1"] = {
+            "tierType": "sortByCpm",
+            "instances": manual_instances,
+        }
+
+    if not payload:
+        # All entries were skipped (rule 4) but no abort
+        return None, warnings
+
+    return payload, warnings
 
 
 class Applier:
@@ -54,7 +194,13 @@ class Applier:
         self._storage = storage
 
     async def apply(
-        self, diff_report: DiffReport, *, dry_run: bool = True
+        self,
+        diff_report: DiffReport,
+        *,
+        dry_run: bool = True,
+        scope: SyncScope | None = None,
+        network_presets: dict[str, list[dict[str, Any]]] | None = None,
+        tiers: list | None = None,
     ) -> ApplyResult:
         """Apply a diff report, executing create/update operations.
 
@@ -62,6 +208,14 @@ class Applier:
             diff_report: The diff report to execute.
             dry_run: If True (default), return results without making
                 any API calls. If False, execute write operations.
+            scope: Optional sync scope controlling which fields are
+                included in PUT payloads. When ``None``, defaults to
+                full sync (tiers + networks).
+            network_presets: Optional network preset mapping for
+                waterfall payload construction. Required when
+                ``scope.networks is True``.
+            tiers: Optional list of PortfolioTier objects for looking up
+                which network preset each group references.
 
         Returns:
             ApplyResult with per-app outcomes and aggregate totals.
@@ -71,7 +225,10 @@ class Applier:
 
         app_results: list[AppApplyResult] = []
         for app_report in diff_report.app_reports:
-            result = await self._process_app(app_report)
+            result = await self._process_app(
+                app_report, scope=scope,
+                network_presets=network_presets, tiers=tiers,
+            )
             app_results.append(result)
 
         return ApplyResult(app_results=app_results, was_dry_run=False)
@@ -101,7 +258,12 @@ class Applier:
         return ApplyResult(app_results=app_results, was_dry_run=True)
 
     async def _process_app(
-        self, app_report: AppDiffReport
+        self,
+        app_report: AppDiffReport,
+        *,
+        scope: SyncScope | None = None,
+        network_presets: dict[str, list[dict[str, Any]]] | None = None,
+        tiers: list | None = None,
     ) -> AppApplyResult:
         """Process a single app's diff report with error isolation.
 
@@ -110,12 +272,18 @@ class Applier:
 
         Args:
             app_report: The per-app diff report to process.
+            scope: Optional sync scope for scoped PUT payloads.
+            network_presets: Optional network presets for waterfall payloads.
+            tiers: Optional tier list for preset name lookup.
 
         Returns:
             AppApplyResult with the outcome for this app.
         """
         try:
-            return await self._process_app_inner(app_report)
+            return await self._process_app_inner(
+                app_report, scope=scope,
+                network_presets=network_presets, tiers=tiers,
+            )
         except Exception as exc:
             logger.error(
                 "Failed to apply changes for app %s: %s",
@@ -132,7 +300,12 @@ class Applier:
             )
 
     async def _process_app_inner(
-        self, app_report: AppDiffReport
+        self,
+        app_report: AppDiffReport,
+        *,
+        scope: SyncScope | None = None,
+        network_presets: dict[str, list[dict[str, Any]]] | None = None,
+        tiers: list | None = None,
     ) -> AppApplyResult:
         """Inner per-app processing logic without error isolation.
 
@@ -148,6 +321,9 @@ class Applier:
 
         Args:
             app_report: The per-app diff report to process.
+            scope: Optional sync scope for scoped PUT payloads.
+            network_presets: Optional network presets for waterfall payloads.
+            tiers: Optional tier list for preset name lookup.
 
         Returns:
             AppApplyResult with the outcome for this app.
@@ -225,7 +401,13 @@ class Applier:
         groups_created = await self._execute_creates(app_key, creates)
 
         # Step 4: Execute UPDATEs after all CREATEs
-        groups_updated = await self._execute_updates(app_key, updates)
+        groups_updated = await self._execute_updates(
+            app_key, updates,
+            scope=scope,
+            network_presets=network_presets,
+            fresh_groups=fresh_groups,
+            tiers=tiers,
+        )
 
         # Step 5: Post-write verification
         warnings = await self._verify_writes(
@@ -322,22 +504,88 @@ class Applier:
         return count
 
     async def _execute_updates(
-        self, app_key: str, updates: list[GroupDiff]
+        self,
+        app_key: str,
+        updates: list[GroupDiff],
+        *,
+        scope: SyncScope | None = None,
+        network_presets: dict[str, list[dict[str, Any]]] | None = None,
+        fresh_groups: list[Group] | None = None,
+        tiers: list | None = None,
     ) -> int:
         """Execute UPDATE operations after all CREATEs.
+
+        When ``scope`` is provided, controls which fields are included
+        in PUT payloads:
+
+        - ``scope.tiers and scope.networks``: full update with waterfall.
+        - ``scope.tiers only``: tier fields only (current behavior).
+        - ``scope.networks only``: waterfall only via ``include_tier_fields=False``.
 
         Args:
             app_key: The app to update groups in.
             updates: List of GroupDiff with action=UPDATE.
+            scope: Optional sync scope for field control.
+            network_presets: Optional network presets for waterfall payload.
+            fresh_groups: Fresh groups from pre-write snapshot, used for
+                instance resolution when building waterfall payloads.
+            tiers: Optional list of PortfolioTier objects for looking up
+                which network preset each group references.
 
         Returns:
             Number of groups successfully updated.
         """
+        # Determine scope flags
+        include_tiers = scope is None or scope.tiers
+        include_networks = scope is not None and scope.networks
+
+        # Build group_id -> instances lookup from fresh groups for waterfall resolution
+        group_instances: dict[int, list[Instance]] = {}
+        if include_networks and fresh_groups:
+            for g in fresh_groups:
+                if g.group_id is not None and g.instances is not None:
+                    group_instances[g.group_id] = g.instances
+
+        # Build group_name -> preset_name lookup from tiers
+        tier_preset_lookup: dict[str, str] = {}
+        if include_networks and tiers:
+            for tier in tiers:
+                if tier.network_preset is not None:
+                    tier_preset_lookup[tier.name] = tier.network_preset
+
         count = 0
         for diff in updates:
             if diff.desired_group is not None and diff.group_id is not None:
+                # Build waterfall payload if networks scope is active
+                waterfall_payload: dict[str, Any] | None = None
+                if include_networks and network_presets is not None:
+                    has_waterfall_changes = any(
+                        c.field == "waterfall" for c in diff.changes
+                    )
+                    if has_waterfall_changes:
+                        # Look up preset name from tier
+                        group_name = diff.desired_group.group_name
+                        preset_name = tier_preset_lookup.get(group_name)
+                        if preset_name and preset_name in network_presets:
+                            preset_entries = network_presets[preset_name]
+                            live_instances = group_instances.get(
+                                diff.group_id, []
+                            )
+                            waterfall_payload, warnings = (
+                                build_waterfall_payload(
+                                    preset_entries, live_instances
+                                )
+                            )
+                            for w in warnings:
+                                logger.warning(
+                                    "Waterfall warning for %s: %s",
+                                    group_name, w,
+                                )
+
                 await self._adapter.update_group(
-                    app_key, diff.group_id, diff.desired_group
+                    app_key, diff.group_id, diff.desired_group,
+                    include_tier_fields=include_tiers,
+                    waterfall_payload=waterfall_payload,
                 )
                 count += 1
         return count

@@ -1,5 +1,7 @@
 # git-crypt encrypted files
 .env filter=git-crypt diff=git-crypt
+countries.yaml filter=git-crypt diff=git-crypt
+networks.yaml filter=git-crypt diff=git-crypt
 docs/** filter=git-crypt diff=git-crypt
 docs/**/** filter=git-crypt diff=git-crypt
 settings/** filter=git-crypt diff=git-crypt

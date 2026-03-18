@@ -9,8 +9,7 @@ CLI command:
 - ``status()``  -> ``admedi status``
 
 All methods use profiles-based app discovery (``load_profiles()``) and
-three-layer settings resolution (``resolve_app_tiers()``). The monolithic
-``admedi.yaml`` template is no longer used.
+two-layer settings resolution (``resolve_app_tiers()``).
 
 Group data caching strategy: within a single ``audit()`` or ``sync()``
 call, the initial ``get_groups()`` result per app is cached and passed to
@@ -30,15 +29,23 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from typing import Any
+
 from admedi.adapters.mediation import MediationAdapter
 from admedi.adapters.storage import StorageAdapter
 from admedi.engine.applier import Applier
 from admedi.engine.differ import compute_diff
-from admedi.engine.loader import Profile, load_profiles, resolve_app_tiers
+from admedi.engine.loader import (
+    Profile,
+    load_network_presets,
+    load_profiles,
+    resolve_app_tiers,
+)
 from admedi.models.apply_result import AppStatus, ApplyResult, PortfolioStatus
 from admedi.models.diff import DiffReport
 from admedi.models.enums import Mediator
 from admedi.models.group import Group
+from admedi.models.portfolio import SyncScope
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +56,7 @@ class ConfigEngine:
     Provides three async methods corresponding to CLI commands: audit,
     sync, and status. Each method manages the full lifecycle of its
     operation: loading profiles, resolving per-app settings through
-    the three-layer chain, fetching remote state, computing diffs,
+    the two-layer chain, fetching remote state, computing diffs,
     and applying changes.
 
     Attributes:
@@ -75,13 +82,13 @@ class ConfigEngine:
         self,
         *,
         aliases: list[str] | None = None,
+        scope: SyncScope | None = None,
     ) -> DiffReport:
         """Audit the portfolio by comparing per-app settings against live state.
 
         Loads profiles from ``profiles.yaml``, resolves per-app settings
-        through the three-layer chain (per-app file -> ``tiers.yaml`` ->
-        ``countries.yaml``), fetches remote groups concurrently, and
-        computes diffs.
+        through the two-layer chain (per-app file -> ``countries.yaml``),
+        fetches remote groups concurrently, and computes diffs.
 
         When iterating all profiles, aliases without a
         ``settings/{alias}.yaml`` file are skipped with a warning. When
@@ -91,6 +98,10 @@ class ConfigEngine:
         Args:
             aliases: Optional list of profile aliases to audit. If ``None``,
                 all profiles in ``profiles.yaml`` are audited.
+            scope: Optional sync scope to control which comparisons are
+                performed. When provided and ``scope.networks is True``,
+                network presets are loaded and passed to ``compute_diff()``.
+                When ``scope.tiers is False``, tier comparisons are skipped.
 
         Returns:
             A ``DiffReport`` with per-app diff results.
@@ -138,6 +149,16 @@ class ConfigEngine:
         if not resolved:
             return DiffReport(app_reports=[])
 
+        # Load network presets if scope includes networks
+        network_presets: dict[str, list[dict[str, Any]]] | None = None
+        if scope is not None and scope.networks:
+            try:
+                network_presets = load_network_presets()
+            except FileNotFoundError:
+                logger.warning(
+                    "networks.yaml not found; skipping network comparison"
+                )
+
         # Concurrent fetch of remote groups per app
         groups_by_key = await self._fetch_groups_concurrent(
             [p.app_key for p, _ in resolved]
@@ -150,6 +171,8 @@ class ConfigEngine:
                 groups_by_key[profile.app_key],
                 profile.app_key,
                 profile.app_name,
+                network_presets=network_presets,
+                scope=scope,
             )
             for profile, tiers in resolved
         ]
@@ -161,6 +184,7 @@ class ConfigEngine:
         *,
         aliases: list[str] | None = None,
         dry_run: bool = True,
+        scope: SyncScope | None = None,
     ) -> tuple[DiffReport, ApplyResult]:
         """Sync the portfolio by computing and applying diffs.
 
@@ -174,6 +198,8 @@ class ConfigEngine:
             dry_run: If ``True`` (default), compute diffs and return
                 results without making any write API calls. If ``False``,
                 execute write operations.
+            scope: Optional sync scope to control which comparisons and
+                writes are performed.
 
         Returns:
             A tuple of ``(DiffReport, ApplyResult)``. When ``dry_run``
@@ -184,9 +210,9 @@ class ConfigEngine:
             FileNotFoundError: If profiles or settings files do not exist.
             ConfigValidationError: If settings are invalid.
         """
-        diff_report = await self.audit(aliases=aliases)
+        diff_report = await self.audit(aliases=aliases, scope=scope)
         apply_result = await self._applier.apply(
-            diff_report, dry_run=dry_run
+            diff_report, dry_run=dry_run, scope=scope,
         )
         return diff_report, apply_result
 

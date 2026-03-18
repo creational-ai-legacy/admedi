@@ -18,6 +18,7 @@ import pytest
 from admedi.engine.loader import (
     Profile,
     load_country_groups,
+    load_network_presets,
     load_profiles,
     load_template,
     load_tiers_definition,
@@ -2050,15 +2051,15 @@ _APP_YAML_HEXAR_IOS = """\
 alias: hexar-ios
 
 rewarded:
-  - Tier 1: US
-  - Tier 2: high-value
-  - All Countries: '*'
+  - Tier 1: {countries: US}
+  - Tier 2: {countries: high-value}
+  - All Countries: {countries: '*'}
 
 interstitial:
-  - Tier 1: US
-  - Tier 2: high-value
-  - Tier 3: europe
-  - All Countries: '*'
+  - Tier 1: {countries: US}
+  - Tier 2: {countries: high-value}
+  - Tier 3: {countries: europe}
+  - All Countries: {countries: '*'}
 """
 
 
@@ -2212,11 +2213,11 @@ class TestResolveAppTiersValid:
         alias: hexar-ios
 
         banner:
-          - All Countries: '*'
+          - All Countries: {countries: '*'}
 
         rewarded:
-          - Tier 1: US
-          - All Countries: '*'
+          - Tier 1: {countries: US}
+          - All Countries: {countries: '*'}
         """
         settings_dir = _write_three_layer_files(
             tmp_path,
@@ -2241,7 +2242,7 @@ class TestResolveAppTiersValid:
         alias: hexar-ios
 
         rewarded:
-          - Tier 1: US
+          - Tier 1: {countries: US}
 
         interstitial: []
         """
@@ -2263,13 +2264,13 @@ class TestResolveAppTiersValid:
         alias: hexar-ios
 
         banner:
-          - All Countries: '*'
+          - All Countries: {countries: '*'}
         interstitial:
-          - All Countries: '*'
+          - All Countries: {countries: '*'}
         rewarded:
-          - All Countries: '*'
+          - All Countries: {countries: '*'}
         native:
-          - All Countries: '*'
+          - All Countries: {countries: '*'}
         """
         settings_dir = _write_three_layer_files(
             tmp_path,
@@ -2292,7 +2293,7 @@ class TestResolveAppTiersValid:
         alias: hexar-ios
 
         banner:
-          - All Countries: '*'
+          - All Countries: {countries: '*'}
         """
         settings_dir = _write_three_layer_files(
             tmp_path,
@@ -2364,7 +2365,7 @@ class TestResolveAppTiersErrors:
         alias: ss-ios
 
         rewarded:
-          - Tier 1: US
+          - Tier 1: {countries: US}
         """
         settings_dir = _write_three_layer_files(
             tmp_path,
@@ -2382,7 +2383,7 @@ class TestResolveAppTiersErrors:
         alias: ss-ios
 
         rewarded:
-          - Tier 1: US
+          - Tier 1: {countries: US}
         """
         settings_dir = _write_three_layer_files(
             tmp_path,
@@ -2407,7 +2408,7 @@ class TestResolveAppTiersErrors:
         alias: hexar-ios
 
         rewarded:
-          - Tier 1: US
+          - Tier 1: {countries: US}
         """
         settings_dir = _write_three_layer_files(
             tmp_path,
@@ -2425,8 +2426,8 @@ class TestResolveAppTiersErrors:
         alias: hexar-ios
 
         rewarded:
-          - Tier 1: US
-          - Nonexistent Tier: nonexistent-group
+          - Tier 1: {countries: US}
+          - Nonexistent Tier: {countries: nonexistent-group}
         """
         settings_dir = _write_three_layer_files(
             tmp_path,
@@ -2444,7 +2445,7 @@ class TestResolveAppTiersErrors:
         alias: hexar-ios
 
         interstitial:
-          - Bad Tier: nonexistent-group
+          - Bad Tier: {countries: nonexistent-group}
         """
         settings_dir = _write_three_layer_files(
             tmp_path,
@@ -2462,7 +2463,7 @@ class TestResolveAppTiersErrors:
         alias: hexar-ios
 
         invalidformat:
-          - Tier 1: US
+          - Tier 1: {countries: US}
         """
         settings_dir = _write_three_layer_files(
             tmp_path,
@@ -2480,7 +2481,7 @@ class TestResolveAppTiersErrors:
         alias: hexar-ios
 
         rewardedVideo:
-          - Tier 1: US
+          - Tier 1: {countries: US}
         """
         settings_dir = _write_three_layer_files(
             tmp_path,
@@ -2584,7 +2585,7 @@ class TestResolveAppTiersErrorMessages:
         alias: hexar-ios
 
         rewarded:
-          - My Custom Tier: nonexistent
+          - My Custom Tier: {countries: nonexistent}
         """
         settings_dir = _write_three_layer_files(
             tmp_path,
@@ -2602,7 +2603,7 @@ class TestResolveAppTiersErrorMessages:
         alias: hexar-ios
 
         badformat:
-          - Tier 1: US
+          - Tier 1: {countries: US}
         """
         settings_dir = _write_three_layer_files(
             tmp_path,
@@ -2627,7 +2628,7 @@ class TestResolveAppTiersErrorMessages:
         alias: hexar-ios
 
         rewarded:
-          - Tier 1: US
+          - Tier 1: {countries: US}
         """
         settings_dir = _write_three_layer_files(
             tmp_path,
@@ -2654,3 +2655,374 @@ class TestResolveAppTiersImport:
         from admedi.engine.loader import resolve_app_tiers as rat
 
         assert callable(rat)
+
+
+# ---------------------------------------------------------------------------
+# Test Classes: resolve_app_tiers() dict format (Step 4)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveAppTiersDictFormat:
+    """Tests for resolve_app_tiers() with {countries: ref, networks: ref} dict format."""
+
+    def test_string_value_raises_error_with_migration_hint(self, tmp_path: Path) -> None:
+        """Plain string value (old format 'Tier 1: US') raises ConfigValidationError."""
+        app_yaml = """\
+        alias: hexar-ios
+
+        rewarded:
+          - Tier 1: US
+        """
+        settings_dir = _write_three_layer_files(
+            tmp_path,
+            countries_yaml=_COUNTRIES_YAML,
+            profiles_yaml=_PROFILES_YAML,
+            app_yaml=app_yaml,
+        )
+
+        with pytest.raises(ConfigValidationError, match="must be a dict.*admedi pull"):
+            resolve_app_tiers("hexar-ios", settings_dir=settings_dir)
+
+    def test_dict_without_countries_key_raises_error(self, tmp_path: Path) -> None:
+        """Dict entry missing 'countries' key raises ConfigValidationError."""
+        app_yaml = """\
+        alias: hexar-ios
+
+        rewarded:
+          - Tier 1: {networks: bidding-6}
+        """
+        settings_dir = _write_three_layer_files(
+            tmp_path,
+            countries_yaml=_COUNTRIES_YAML,
+            profiles_yaml=_PROFILES_YAML,
+            app_yaml=app_yaml,
+        )
+
+        with pytest.raises(ConfigValidationError, match="missing required 'countries' key"):
+            resolve_app_tiers("hexar-ios", settings_dir=settings_dir)
+
+    def test_dict_with_networks_stores_network_preset(self, tmp_path: Path) -> None:
+        """Dict with 'networks' key stores network_preset on PortfolioTier."""
+        app_yaml = """\
+        alias: hexar-ios
+
+        rewarded:
+          - Tier 1: {countries: US, networks: bidding-6}
+        """
+        settings_dir = _write_three_layer_files(
+            tmp_path,
+            countries_yaml=_COUNTRIES_YAML,
+            profiles_yaml=_PROFILES_YAML,
+            app_yaml=app_yaml,
+        )
+
+        result = resolve_app_tiers("hexar-ios", settings_dir=settings_dir)
+
+        assert len(result) == 1
+        assert result[0].network_preset == "bidding-6"
+
+    def test_dict_without_networks_stores_none(self, tmp_path: Path) -> None:
+        """Dict without 'networks' key stores network_preset=None on PortfolioTier."""
+        app_yaml = """\
+        alias: hexar-ios
+
+        rewarded:
+          - Tier 1: {countries: US}
+        """
+        settings_dir = _write_three_layer_files(
+            tmp_path,
+            countries_yaml=_COUNTRIES_YAML,
+            profiles_yaml=_PROFILES_YAML,
+            app_yaml=app_yaml,
+        )
+
+        result = resolve_app_tiers("hexar-ios", settings_dir=settings_dir)
+
+        assert len(result) == 1
+        assert result[0].network_preset is None
+
+    def test_wildcard_dict_with_no_networks(self, tmp_path: Path) -> None:
+        """Wildcard entry '{countries: '*'}' resolves correctly with no network_preset."""
+        app_yaml = """\
+        alias: hexar-ios
+
+        banner:
+          - All Countries: {countries: '*'}
+        """
+        settings_dir = _write_three_layer_files(
+            tmp_path,
+            countries_yaml=_COUNTRIES_YAML,
+            profiles_yaml=_PROFILES_YAML,
+            app_yaml=app_yaml,
+        )
+
+        result = resolve_app_tiers("hexar-ios", settings_dir=settings_dir)
+
+        assert len(result) == 1
+        assert result[0].countries == ["*"]
+        assert result[0].is_default is True
+        assert result[0].network_preset is None
+
+    def test_mixed_entries_with_and_without_networks(self, tmp_path: Path) -> None:
+        """Mix of entries with and without 'networks' key stores correctly."""
+        app_yaml = """\
+        alias: hexar-ios
+
+        interstitial:
+          - Tier 1: {countries: US, networks: bidding-6}
+          - All Countries: {countries: '*'}
+        """
+        settings_dir = _write_three_layer_files(
+            tmp_path,
+            countries_yaml=_COUNTRIES_YAML,
+            profiles_yaml=_PROFILES_YAML,
+            app_yaml=app_yaml,
+        )
+
+        result = resolve_app_tiers("hexar-ios", settings_dir=settings_dir)
+
+        assert len(result) == 2
+        assert result[0].network_preset == "bidding-6"
+        assert result[1].network_preset is None
+
+    def test_countries_still_resolved_from_dict(self, tmp_path: Path) -> None:
+        """Country group ref in dict value is resolved via countries.yaml."""
+        app_yaml = """\
+        alias: hexar-ios
+
+        rewarded:
+          - Tier 2: {countries: high-value, networks: bidding-3}
+        """
+        settings_dir = _write_three_layer_files(
+            tmp_path,
+            countries_yaml=_COUNTRIES_YAML,
+            profiles_yaml=_PROFILES_YAML,
+            app_yaml=app_yaml,
+        )
+
+        result = resolve_app_tiers("hexar-ios", settings_dir=settings_dir)
+
+        assert result[0].countries == ["AU", "CA", "DE", "GB"]
+        assert result[0].network_preset == "bidding-3"
+
+
+# ---------------------------------------------------------------------------
+# Test Classes: load_network_presets()
+# ---------------------------------------------------------------------------
+
+
+def _setup_network_presets(tmp_path: Path, content: str) -> str:
+    """Write networks.yaml and return settings_dir path for load_network_presets.
+
+    Creates the file structure expected by load_network_presets():
+    ``tmp_path/networks.yaml`` with ``settings_dir = tmp_path / "settings"``.
+    """
+    networks_path = tmp_path / "networks.yaml"
+    networks_path.write_text(dedent(content))
+    settings_dir = tmp_path / "settings"
+    settings_dir.mkdir(exist_ok=True)
+    return str(settings_dir)
+
+
+class TestLoadNetworkPresetsValid:
+    """Tests for successful network preset loading."""
+
+    def test_valid_presets_with_bidders_and_manuals(self, tmp_path: Path) -> None:
+        """Valid presets with bidders and manual entries load correctly."""
+        settings_dir = _setup_network_presets(tmp_path, """\
+            bidding-2:
+              - network: Meta Audience Network
+                bidder: true
+              - network: Google AdMob
+                bidder: false
+        """)
+
+        result = load_network_presets(settings_dir=settings_dir)
+
+        assert "bidding-2" in result
+        assert len(result["bidding-2"]) == 2
+        assert result["bidding-2"][0]["network"] == "Meta Audience Network"
+        assert result["bidding-2"][0]["bidder"] is True
+        assert result["bidding-2"][1]["network"] == "Google AdMob"
+        assert result["bidding-2"][1]["bidder"] is False
+
+    def test_valid_preset_with_name_field(self, tmp_path: Path) -> None:
+        """Preset entries with optional name field are preserved."""
+        settings_dir = _setup_network_presets(tmp_path, """\
+            admob-multi:
+              - network: Google AdMob
+                bidder: false
+                name: Google AdMob High
+              - network: Google AdMob
+                bidder: false
+                name: Google AdMob Low
+        """)
+
+        result = load_network_presets(settings_dir=settings_dir)
+
+        assert result["admob-multi"][0]["name"] == "Google AdMob High"
+        assert result["admob-multi"][1]["name"] == "Google AdMob Low"
+
+    def test_valid_preset_with_rate_field(self, tmp_path: Path) -> None:
+        """Preset entries with optional rate field are preserved."""
+        settings_dir = _setup_network_presets(tmp_path, """\
+            manual-rates:
+              - network: Google AdMob
+                bidder: false
+                rate: 12.5
+              - network: InMobi
+                bidder: false
+                rate: 8.0
+        """)
+
+        result = load_network_presets(settings_dir=settings_dir)
+
+        assert result["manual-rates"][0]["rate"] == 12.5
+        assert result["manual-rates"][1]["rate"] == 8.0
+
+    def test_empty_preset_list_is_valid(self, tmp_path: Path) -> None:
+        """Empty list as a preset value does not raise an error."""
+        settings_dir = _setup_network_presets(tmp_path, """\
+            empty-preset: []
+        """)
+
+        result = load_network_presets(settings_dir=settings_dir)
+
+        assert result["empty-preset"] == []
+
+    def test_multiple_presets(self, tmp_path: Path) -> None:
+        """Multiple presets are loaded correctly."""
+        settings_dir = _setup_network_presets(tmp_path, """\
+            bidding-1:
+              - network: Meta Audience Network
+                bidder: true
+            manual-1:
+              - network: Google AdMob
+                bidder: false
+        """)
+
+        result = load_network_presets(settings_dir=settings_dir)
+
+        assert len(result) == 2
+        assert "bidding-1" in result
+        assert "manual-1" in result
+
+    def test_return_type_is_dict(self, tmp_path: Path) -> None:
+        """Return type is dict[str, list[dict[str, Any]]]."""
+        settings_dir = _setup_network_presets(tmp_path, """\
+            preset-a:
+              - network: InMobi
+                bidder: true
+        """)
+
+        result = load_network_presets(settings_dir=settings_dir)
+
+        assert isinstance(result, dict)
+        assert isinstance(result["preset-a"], list)
+        assert isinstance(result["preset-a"][0], dict)
+
+    def test_entries_are_copies(self, tmp_path: Path) -> None:
+        """Returned entries are copies, not references to internal data."""
+        settings_dir = _setup_network_presets(tmp_path, """\
+            preset-a:
+              - network: InMobi
+                bidder: true
+        """)
+
+        result = load_network_presets(settings_dir=settings_dir)
+        result["preset-a"][0]["network"] = "MUTATED"
+
+        # Re-load to verify original is not affected
+        result2 = load_network_presets(settings_dir=settings_dir)
+        assert result2["preset-a"][0]["network"] == "InMobi"
+
+
+class TestLoadNetworkPresetsErrors:
+    """Tests for error handling in load_network_presets."""
+
+    def test_missing_file_raises_file_not_found_error(self, tmp_path: Path) -> None:
+        """Missing networks.yaml raises FileNotFoundError."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        with pytest.raises(FileNotFoundError, match="Network presets file not found"):
+            load_network_presets(settings_dir=str(settings_dir))
+
+    def test_empty_file_raises_config_validation_error(self, tmp_path: Path) -> None:
+        """Empty networks.yaml raises ConfigValidationError."""
+        settings_dir = _setup_network_presets(tmp_path, "")
+
+        with pytest.raises(ConfigValidationError, match="empty"):
+            load_network_presets(settings_dir=settings_dir)
+
+    def test_non_mapping_yaml_raises_config_validation_error(self, tmp_path: Path) -> None:
+        """YAML that parses to a list raises ConfigValidationError."""
+        settings_dir = _setup_network_presets(tmp_path, """\
+            - item1
+            - item2
+        """)
+
+        with pytest.raises(ConfigValidationError, match="mapping"):
+            load_network_presets(settings_dir=settings_dir)
+
+    def test_entry_missing_network_raises_config_validation_error(self, tmp_path: Path) -> None:
+        """Entry without 'network' key raises ConfigValidationError."""
+        settings_dir = _setup_network_presets(tmp_path, """\
+            broken:
+              - bidder: true
+        """)
+
+        with pytest.raises(ConfigValidationError, match="network"):
+            load_network_presets(settings_dir=settings_dir)
+
+    def test_entry_missing_bidder_raises_config_validation_error(self, tmp_path: Path) -> None:
+        """Entry without 'bidder' key raises ConfigValidationError."""
+        settings_dir = _setup_network_presets(tmp_path, """\
+            broken:
+              - network: InMobi
+        """)
+
+        with pytest.raises(ConfigValidationError, match="bidder"):
+            load_network_presets(settings_dir=settings_dir)
+
+    def test_preset_value_not_list_raises_config_validation_error(self, tmp_path: Path) -> None:
+        """Preset value that is not a list raises ConfigValidationError."""
+        settings_dir = _setup_network_presets(tmp_path, """\
+            broken: "not a list"
+        """)
+
+        with pytest.raises(ConfigValidationError, match="list"):
+            load_network_presets(settings_dir=settings_dir)
+
+    def test_entry_not_dict_raises_config_validation_error(self, tmp_path: Path) -> None:
+        """Entry that is not a dict raises ConfigValidationError."""
+        settings_dir = _setup_network_presets(tmp_path, """\
+            broken:
+              - just a string
+        """)
+
+        with pytest.raises(ConfigValidationError, match="mapping"):
+            load_network_presets(settings_dir=settings_dir)
+
+    def test_malformed_yaml_raises_config_validation_error(self, tmp_path: Path) -> None:
+        """Malformed YAML raises ConfigValidationError."""
+        settings_dir = _setup_network_presets(tmp_path, ":\n  invalid: [yaml\n  missing bracket")
+
+        with pytest.raises(ConfigValidationError, match="Malformed YAML"):
+            load_network_presets(settings_dir=settings_dir)
+
+
+class TestLoadNetworkPresetsImport:
+    """Tests verifying load_network_presets is importable from admedi.engine."""
+
+    def test_importable_from_engine_package(self) -> None:
+        """load_network_presets is importable from admedi.engine."""
+        from admedi.engine import load_network_presets as lnp
+
+        assert callable(lnp)
+
+    def test_importable_from_loader_module(self) -> None:
+        """load_network_presets is importable from admedi.engine.loader."""
+        from admedi.engine.loader import load_network_presets as lnp
+
+        assert callable(lnp)

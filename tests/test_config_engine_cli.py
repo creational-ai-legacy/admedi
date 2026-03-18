@@ -1115,8 +1115,6 @@ class TestPullCommand:
     """Tests for the 'admedi pull' CLI command."""
 
     @patch("admedi.cli.main.save_raw_snapshot")
-    @patch("admedi.cli.main.write_yaml_file")
-    @patch("admedi.cli.main.extract_network_presets")
     @patch("admedi.cli.main.generate_app_settings")
     @patch("admedi.cli.main.LevelPlayAdapter")
     @patch("admedi.cli.main._resolve_profile")
@@ -1124,7 +1122,6 @@ class TestPullCommand:
     def test_pull_invokes_correct_flow(
         self, mock_load_cred: MagicMock, mock_resolve_profile: MagicMock,
         mock_adapter_cls: MagicMock, mock_gen_settings: MagicMock,
-        mock_extract_presets: MagicMock, mock_write_yaml: MagicMock,
         mock_save_raw: MagicMock,
     ) -> None:
         """pull --app hexar-ios invokes the full pull flow."""
@@ -1145,8 +1142,7 @@ class TestPullCommand:
             App(app_key="676996cd", app_name="Hexar.io iOS", platform=Platform.IOS),
         ]
 
-        mock_gen_settings.return_value = ("settings/hexar-ios.yaml", [])
-        mock_extract_presets.return_value = {}
+        mock_gen_settings.return_value = ("settings/hexar-ios.yaml", "networks.yaml", [])
         mock_save_raw.return_value = "snapshots/hexar-ios.yaml"
 
         result = runner.invoke(cli_app, ["pull", "--app", "hexar-ios"])
@@ -1176,8 +1172,6 @@ class TestPullCommand:
         assert "Unknown profile alias" in result.output
 
     @patch("admedi.cli.main.save_raw_snapshot")
-    @patch("admedi.cli.main.write_yaml_file")
-    @patch("admedi.cli.main.extract_network_presets")
     @patch("admedi.cli.main.generate_app_settings")
     @patch("admedi.cli.main.LevelPlayAdapter")
     @patch("admedi.cli.main._resolve_profile")
@@ -1185,7 +1179,6 @@ class TestPullCommand:
     def test_pull_metadata_drift_warning(
         self, mock_load_cred: MagicMock, mock_resolve_profile: MagicMock,
         mock_adapter_cls: MagicMock, mock_gen_settings: MagicMock,
-        mock_extract_presets: MagicMock, mock_write_yaml: MagicMock,
         mock_save_raw: MagicMock,
     ) -> None:
         """Profile metadata drift warning appears when API returns different app_name."""
@@ -1206,8 +1199,7 @@ class TestPullCommand:
             App(app_key="676996cd", app_name="New Name", platform=Platform.IOS),
         ]
 
-        mock_gen_settings.return_value = ("settings/hexar-ios.yaml", [])
-        mock_extract_presets.return_value = {}
+        mock_gen_settings.return_value = ("settings/hexar-ios.yaml", "networks.yaml", [])
         mock_save_raw.return_value = "snapshots/hexar-ios.yaml"
 
         result = runner.invoke(cli_app, ["pull", "--app", "hexar-ios"])
@@ -1218,19 +1210,16 @@ class TestPullCommand:
         assert "New Name" in result.output
 
     @patch("admedi.cli.main.save_raw_snapshot")
-    @patch("admedi.cli.main.write_yaml_file")
-    @patch("admedi.cli.main.extract_network_presets")
     @patch("admedi.cli.main.generate_app_settings")
     @patch("admedi.cli.main.LevelPlayAdapter")
     @patch("admedi.cli.main._resolve_profile")
     @patch("admedi.cli.main.load_credential_from_env")
-    def test_pull_writes_networks_file_when_presets_exist(
+    def test_pull_returns_networks_path_when_presets_exist(
         self, mock_load_cred: MagicMock, mock_resolve_profile: MagicMock,
         mock_adapter_cls: MagicMock, mock_gen_settings: MagicMock,
-        mock_extract_presets: MagicMock, mock_write_yaml: MagicMock,
         mock_save_raw: MagicMock,
     ) -> None:
-        """Pull writes networks file when extract_network_presets returns presets."""
+        """Pull uses networks_path from generate_app_settings 3-tuple."""
         from admedi.engine.loader import Profile
         from admedi.models.app import App
 
@@ -1248,31 +1237,25 @@ class TestPullCommand:
             App(app_key="676996cd", app_name="Hexar.io iOS", platform=Platform.IOS),
         ]
 
-        mock_gen_settings.return_value = ("settings/hexar-ios.yaml", [])
-        mock_extract_presets.return_value = {"bidding": [{"network": "Meta", "bidder": True}]}
+        mock_gen_settings.return_value = ("settings/hexar-ios.yaml", "networks.yaml", [])
         mock_save_raw.return_value = "snapshots/hexar-ios.yaml"
 
         result = runner.invoke(cli_app, ["pull", "--app", "hexar-ios"])
 
         assert result.exit_code == 0
-        mock_write_yaml.assert_called_once()
-        call_args = mock_write_yaml.call_args
-        assert "hexar-ios-networks.yaml" in str(call_args.args[0])
+        mock_gen_settings.assert_called_once()
 
     @patch("admedi.cli.main.save_raw_snapshot")
-    @patch("admedi.cli.main.write_yaml_file")
-    @patch("admedi.cli.main.extract_network_presets")
     @patch("admedi.cli.main.generate_app_settings")
     @patch("admedi.cli.main.LevelPlayAdapter")
     @patch("admedi.cli.main._resolve_profile")
     @patch("admedi.cli.main.load_credential_from_env")
-    def test_pull_skips_networks_file_when_no_presets(
+    def test_pull_handles_none_networks_path(
         self, mock_load_cred: MagicMock, mock_resolve_profile: MagicMock,
         mock_adapter_cls: MagicMock, mock_gen_settings: MagicMock,
-        mock_extract_presets: MagicMock, mock_write_yaml: MagicMock,
         mock_save_raw: MagicMock,
     ) -> None:
-        """Pull does not write networks file when extract_network_presets returns empty."""
+        """Pull succeeds when generate_app_settings returns None networks_path."""
         from admedi.engine.loader import Profile
         from admedi.models.app import App
 
@@ -1290,18 +1273,14 @@ class TestPullCommand:
             App(app_key="676996cd", app_name="Hexar.io iOS", platform=Platform.IOS),
         ]
 
-        mock_gen_settings.return_value = ("settings/hexar-ios.yaml", [])
-        mock_extract_presets.return_value = {}
+        mock_gen_settings.return_value = ("settings/hexar-ios.yaml", None, [])
         mock_save_raw.return_value = "snapshots/hexar-ios.yaml"
 
         result = runner.invoke(cli_app, ["pull", "--app", "hexar-ios"])
 
         assert result.exit_code == 0
-        mock_write_yaml.assert_not_called()
 
     @patch("admedi.cli.main.save_raw_snapshot")
-    @patch("admedi.cli.main.write_yaml_file")
-    @patch("admedi.cli.main.extract_network_presets")
     @patch("admedi.cli.main.generate_app_settings")
     @patch("admedi.cli.main.LevelPlayAdapter")
     @patch("admedi.cli.main._resolve_profile")
@@ -1309,7 +1288,6 @@ class TestPullCommand:
     def test_pull_saves_raw_snapshot(
         self, mock_load_cred: MagicMock, mock_resolve_profile: MagicMock,
         mock_adapter_cls: MagicMock, mock_gen_settings: MagicMock,
-        mock_extract_presets: MagicMock, mock_write_yaml: MagicMock,
         mock_save_raw: MagicMock,
     ) -> None:
         """Pull saves raw snapshot to snapshots/{alias}.yaml."""
@@ -1330,8 +1308,7 @@ class TestPullCommand:
             App(app_key="676996cd", app_name="Hexar.io iOS", platform=Platform.IOS),
         ]
 
-        mock_gen_settings.return_value = ("settings/hexar-ios.yaml", [])
-        mock_extract_presets.return_value = {}
+        mock_gen_settings.return_value = ("settings/hexar-ios.yaml", "networks.yaml", [])
         mock_save_raw.return_value = "snapshots/hexar-ios.yaml"
 
         result = runner.invoke(cli_app, ["pull", "--app", "hexar-ios"])
@@ -1356,6 +1333,185 @@ class TestPullCommand:
 
         assert result.exit_code == 2
         assert "LEVELPLAY_SECRET_KEY" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Pull: shared networks.yaml (no per-app network files)
+# ---------------------------------------------------------------------------
+
+
+class TestPullSharedNetworksFile:
+    """Tests verifying pull uses shared networks.yaml, not per-app files."""
+
+    @patch("admedi.cli.main.save_raw_snapshot")
+    @patch("admedi.cli.main.generate_app_settings")
+    @patch("admedi.cli.main.LevelPlayAdapter")
+    @patch("admedi.cli.main._resolve_profile")
+    @patch("admedi.cli.main.load_credential_from_env")
+    def test_pull_output_shows_shared_networks_path(
+        self, mock_load_cred: MagicMock, mock_resolve_profile: MagicMock,
+        mock_adapter_cls: MagicMock, mock_gen_settings: MagicMock,
+        mock_save_raw: MagicMock,
+    ) -> None:
+        """Pull output contains the shared networks.yaml path."""
+        from admedi.engine.loader import Profile
+        from admedi.models.app import App
+
+        mock_load_cred.return_value = _mock_credential()
+        mock_resolve_profile.return_value = Profile(
+            alias="hexar-ios", app_key="676996cd",
+            app_name="Hexar.io iOS", platform=Platform.IOS,
+        )
+
+        mock_adapter = AsyncMock()
+        mock_adapter_cls.return_value.__aenter__ = AsyncMock(return_value=mock_adapter)
+        mock_adapter_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_adapter.get_groups.return_value = []
+        mock_adapter.list_apps.return_value = [
+            App(app_key="676996cd", app_name="Hexar.io iOS", platform=Platform.IOS),
+        ]
+
+        mock_gen_settings.return_value = ("settings/hexar-ios.yaml", "networks.yaml", [])
+        mock_save_raw.return_value = "snapshots/hexar-ios.yaml"
+
+        result = runner.invoke(cli_app, ["pull", "--app", "hexar-ios"])
+
+        assert result.exit_code == 0
+        assert "networks.yaml" in result.output
+
+    @patch("admedi.cli.main.save_raw_snapshot")
+    @patch("admedi.cli.main.generate_app_settings")
+    @patch("admedi.cli.main.LevelPlayAdapter")
+    @patch("admedi.cli.main._resolve_profile")
+    @patch("admedi.cli.main.load_credential_from_env")
+    def test_pull_does_not_create_per_app_networks_file(
+        self, mock_load_cred: MagicMock, mock_resolve_profile: MagicMock,
+        mock_adapter_cls: MagicMock, mock_gen_settings: MagicMock,
+        mock_save_raw: MagicMock,
+    ) -> None:
+        """Pull does not create {alias}-networks.yaml per-app file."""
+        from admedi.engine.loader import Profile
+        from admedi.models.app import App
+
+        mock_load_cred.return_value = _mock_credential()
+        mock_resolve_profile.return_value = Profile(
+            alias="hexar-ios", app_key="676996cd",
+            app_name="Hexar.io iOS", platform=Platform.IOS,
+        )
+
+        mock_adapter = AsyncMock()
+        mock_adapter_cls.return_value.__aenter__ = AsyncMock(return_value=mock_adapter)
+        mock_adapter_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_adapter.get_groups.return_value = []
+        mock_adapter.list_apps.return_value = [
+            App(app_key="676996cd", app_name="Hexar.io iOS", platform=Platform.IOS),
+        ]
+
+        mock_gen_settings.return_value = ("settings/hexar-ios.yaml", "networks.yaml", [])
+        mock_save_raw.return_value = "snapshots/hexar-ios.yaml"
+
+        result = runner.invoke(cli_app, ["pull", "--app", "hexar-ios"])
+
+        assert result.exit_code == 0
+        # Output should NOT contain any per-app networks file reference
+        assert "hexar-ios-networks.yaml" not in result.output
+
+    @patch("admedi.cli.main.save_raw_snapshot")
+    @patch("admedi.cli.main.generate_app_settings")
+    @patch("admedi.cli.main.LevelPlayAdapter")
+    @patch("admedi.cli.main._resolve_profile")
+    @patch("admedi.cli.main.load_credential_from_env")
+    def test_pull_no_direct_extract_network_presets_call(
+        self, mock_load_cred: MagicMock, mock_resolve_profile: MagicMock,
+        mock_adapter_cls: MagicMock, mock_gen_settings: MagicMock,
+        mock_save_raw: MagicMock,
+    ) -> None:
+        """Pull does not call extract_network_presets() directly in CLI."""
+        import admedi.cli.main as main_module
+
+        # Verify extract_network_presets is not imported in cli/main.py
+        assert not hasattr(main_module, "extract_network_presets"), (
+            "extract_network_presets should not be imported in cli/main.py"
+        )
+        # Verify write_yaml_file is not imported in cli/main.py
+        assert not hasattr(main_module, "write_yaml_file"), (
+            "write_yaml_file should not be imported in cli/main.py"
+        )
+
+    @patch("admedi.cli.main.save_raw_snapshot")
+    @patch("admedi.cli.main.generate_app_settings")
+    @patch("admedi.cli.main.LevelPlayAdapter")
+    @patch("admedi.cli.main._resolve_profile")
+    @patch("admedi.cli.main.load_credential_from_env")
+    def test_pull_networks_path_comes_from_generate_app_settings(
+        self, mock_load_cred: MagicMock, mock_resolve_profile: MagicMock,
+        mock_adapter_cls: MagicMock, mock_gen_settings: MagicMock,
+        mock_save_raw: MagicMock,
+    ) -> None:
+        """Pull passes networks_path from generate_app_settings to display."""
+        from admedi.engine.loader import Profile
+        from admedi.models.app import App
+
+        mock_load_cred.return_value = _mock_credential()
+        mock_resolve_profile.return_value = Profile(
+            alias="ss-ios", app_key="abc123",
+            app_name="Shelf Sort iOS", platform=Platform.IOS,
+        )
+
+        mock_adapter = AsyncMock()
+        mock_adapter_cls.return_value.__aenter__ = AsyncMock(return_value=mock_adapter)
+        mock_adapter_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_adapter.get_groups.return_value = []
+        mock_adapter.list_apps.return_value = [
+            App(app_key="abc123", app_name="Shelf Sort iOS", platform=Platform.IOS),
+        ]
+
+        # generate_app_settings returns shared networks.yaml (not per-app)
+        mock_gen_settings.return_value = ("settings/ss-ios.yaml", "networks.yaml", [])
+        mock_save_raw.return_value = "snapshots/ss-ios.yaml"
+
+        result = runner.invoke(cli_app, ["pull", "--app", "ss-ios"])
+
+        assert result.exit_code == 0
+        # Shared path in output (not ss-ios-networks.yaml)
+        assert "networks.yaml" in result.output
+        assert "ss-ios-networks.yaml" not in result.output
+
+    @patch("admedi.cli.main.save_raw_snapshot")
+    @patch("admedi.cli.main.generate_app_settings")
+    @patch("admedi.cli.main.LevelPlayAdapter")
+    @patch("admedi.cli.main._resolve_profile")
+    @patch("admedi.cli.main.load_credential_from_env")
+    def test_pull_none_networks_path_omits_networks_line(
+        self, mock_load_cred: MagicMock, mock_resolve_profile: MagicMock,
+        mock_adapter_cls: MagicMock, mock_gen_settings: MagicMock,
+        mock_save_raw: MagicMock,
+    ) -> None:
+        """Pull omits Networks saved to line when networks_path is None."""
+        from admedi.engine.loader import Profile
+        from admedi.models.app import App
+
+        mock_load_cred.return_value = _mock_credential()
+        mock_resolve_profile.return_value = Profile(
+            alias="hexar-ios", app_key="676996cd",
+            app_name="Hexar.io iOS", platform=Platform.IOS,
+        )
+
+        mock_adapter = AsyncMock()
+        mock_adapter_cls.return_value.__aenter__ = AsyncMock(return_value=mock_adapter)
+        mock_adapter_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_adapter.get_groups.return_value = []
+        mock_adapter.list_apps.return_value = [
+            App(app_key="676996cd", app_name="Hexar.io iOS", platform=Platform.IOS),
+        ]
+
+        mock_gen_settings.return_value = ("settings/hexar-ios.yaml", None, [])
+        mock_save_raw.return_value = "snapshots/hexar-ios.yaml"
+
+        result = runner.invoke(cli_app, ["pull", "--app", "hexar-ios"])
+
+        assert result.exit_code == 0
+        assert "Networks saved to:" not in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -1420,8 +1576,8 @@ class TestDisplayPull:
         assert "iOS" in output
         assert "abc123" in output
 
-    def test_display_pull_shows_networks_path(self) -> None:
-        """display_pull() shows networks path in footer when provided."""
+    def test_display_pull_shows_shared_networks_path(self) -> None:
+        """display_pull() shows shared networks.yaml path in footer."""
         from admedi.models.app import App
 
         console, buf = _make_console()
@@ -1429,13 +1585,33 @@ class TestDisplayPull:
 
         display_pull(
             app, [],
-            networks_path="settings/test-networks.yaml",
+            networks_path="networks.yaml",
             console=console,
         )
         output = buf.getvalue()
 
         assert "Networks saved to:" in output
-        assert "test-networks.yaml" in output
+        assert "networks.yaml" in output
+
+    def test_display_pull_no_per_app_networks_reference(self) -> None:
+        """display_pull() does not reference per-app {alias}-networks.yaml."""
+        from admedi.models.app import App
+
+        console, buf = _make_console()
+        app = App(app_key="abc123", app_name="Test App", platform=Platform.IOS)
+
+        display_pull(
+            app, [],
+            networks_path="networks.yaml",
+            settings_path="settings/hexar-ios.yaml",
+            console=console,
+        )
+        output = buf.getvalue()
+
+        # Shared networks.yaml is present
+        assert "networks.yaml" in output
+        # No per-app networks file reference
+        assert "hexar-ios-networks.yaml" not in output
 
     def test_display_pull_shows_info_messages(self) -> None:
         """display_pull() renders info messages from settings generation."""
@@ -1752,43 +1928,122 @@ class TestSyncCommand:
         # Verify resolve_app_tiers was called with source alias
         mock_load_tiers.assert_called_once_with("hexar-ios")
 
+    @patch("admedi.cli.main.load_network_presets")
     @patch("admedi.cli.main.compute_diff")
     @patch("admedi.cli.main.resolve_app_tiers")
     @patch("admedi.cli.main.LevelPlayAdapter")
     @patch("admedi.cli.main._resolve_profile")
     @patch("admedi.cli.main.load_credential_from_env")
-    def test_sync_no_scope_defaults_to_tiers(
+    def test_sync_no_scope_defaults_to_full_sync(
         self, mock_load_cred: MagicMock, mock_resolve: MagicMock,
         mock_adapter_cls: MagicMock,
         mock_load_tiers: MagicMock, mock_compute_diff: MagicMock,
+        mock_load_presets: MagicMock,
     ) -> None:
-        """sync {alias} with no scope flag defaults to --tiers."""
+        """sync {alias} with no scope flag defaults to full sync (tiers + networks)."""
         self._setup_sync_mocks(
             mock_load_cred, mock_resolve, mock_adapter_cls, mock_load_tiers,
             mock_compute_diff, drift=False,
         )
+        mock_load_presets.return_value = {}
 
         result = runner.invoke(
             cli_app, ["sync", "hexar-ios", "--dry-run"]
         )
 
         assert result.exit_code == 0
-        # resolve_app_tiers should be called since --tiers is defaulted
+        # resolve_app_tiers should be called (tiers enabled)
         mock_load_tiers.assert_called_once()
+        # load_network_presets should be called (networks enabled)
+        mock_load_presets.assert_called_once()
+        # compute_diff should receive network_presets
+        mock_compute_diff.assert_called_once()
+        call_kwargs = mock_compute_diff.call_args[1]
+        assert call_kwargs["network_presets"] == {}
 
+    @patch("admedi.cli.main.compute_diff")
+    @patch("admedi.cli.main.resolve_app_tiers")
+    @patch("admedi.cli.main.LevelPlayAdapter")
+    @patch("admedi.cli.main._resolve_profile")
     @patch("admedi.cli.main.load_credential_from_env")
-    def test_sync_networks_not_implemented_exits_2(
-        self, mock_load_cred: MagicMock,
+    def test_sync_tiers_only_skips_network_presets(
+        self, mock_load_cred: MagicMock, mock_resolve: MagicMock,
+        mock_adapter_cls: MagicMock,
+        mock_load_tiers: MagicMock, mock_compute_diff: MagicMock,
     ) -> None:
-        """sync --networks prints 'not yet implemented' and exits 2."""
-        mock_load_cred.return_value = _mock_credential()
-
-        result = runner.invoke(
-            cli_app, ["sync", "--networks", "hexar-ios"]
+        """--tiers only: compute_diff called with network_presets=None."""
+        self._setup_sync_mocks(
+            mock_load_cred, mock_resolve, mock_adapter_cls, mock_load_tiers,
+            mock_compute_diff, drift=False,
         )
 
-        assert result.exit_code == 2
-        assert "not yet implemented" in result.output.lower()
+        result = runner.invoke(
+            cli_app, ["sync", "--tiers", "hexar-ios", "--dry-run"]
+        )
+
+        assert result.exit_code == 0
+        mock_compute_diff.assert_called_once()
+        call_kwargs = mock_compute_diff.call_args[1]
+        assert call_kwargs["network_presets"] is None
+
+    @patch("admedi.cli.main.load_network_presets")
+    @patch("admedi.cli.main.compute_diff")
+    @patch("admedi.cli.main.resolve_app_tiers")
+    @patch("admedi.cli.main.LevelPlayAdapter")
+    @patch("admedi.cli.main._resolve_profile")
+    @patch("admedi.cli.main.load_credential_from_env")
+    def test_sync_networks_only_loads_presets(
+        self, mock_load_cred: MagicMock, mock_resolve: MagicMock,
+        mock_adapter_cls: MagicMock,
+        mock_load_tiers: MagicMock, mock_compute_diff: MagicMock,
+        mock_load_presets: MagicMock,
+    ) -> None:
+        """--networks only: compute_diff called with network_presets loaded."""
+        self._setup_sync_mocks(
+            mock_load_cred, mock_resolve, mock_adapter_cls, mock_load_tiers,
+            mock_compute_diff, drift=False,
+        )
+        mock_load_presets.return_value = {"bidding-6": [{"network": "Meta", "bidder": True}]}
+
+        result = runner.invoke(
+            cli_app, ["sync", "--networks", "hexar-ios", "--dry-run"]
+        )
+
+        assert result.exit_code == 0
+        mock_load_presets.assert_called_once()
+        mock_compute_diff.assert_called_once()
+        call_kwargs = mock_compute_diff.call_args[1]
+        assert call_kwargs["network_presets"] is not None
+        assert "bidding-6" in call_kwargs["network_presets"]
+
+    @patch("admedi.cli.main.load_network_presets")
+    @patch("admedi.cli.main.compute_diff")
+    @patch("admedi.cli.main.resolve_app_tiers")
+    @patch("admedi.cli.main.LevelPlayAdapter")
+    @patch("admedi.cli.main._resolve_profile")
+    @patch("admedi.cli.main.load_credential_from_env")
+    def test_sync_tiers_and_networks_same_as_no_flags(
+        self, mock_load_cred: MagicMock, mock_resolve: MagicMock,
+        mock_adapter_cls: MagicMock,
+        mock_load_tiers: MagicMock, mock_compute_diff: MagicMock,
+        mock_load_presets: MagicMock,
+    ) -> None:
+        """--tiers --networks: same as no flags (full sync with presets loaded)."""
+        self._setup_sync_mocks(
+            mock_load_cred, mock_resolve, mock_adapter_cls, mock_load_tiers,
+            mock_compute_diff, drift=False,
+        )
+        mock_load_presets.return_value = {}
+
+        result = runner.invoke(
+            cli_app, ["sync", "--tiers", "--networks", "hexar-ios", "--dry-run"]
+        )
+
+        assert result.exit_code == 0
+        mock_load_presets.assert_called_once()
+        mock_compute_diff.assert_called_once()
+        call_kwargs = mock_compute_diff.call_args[1]
+        assert call_kwargs["network_presets"] == {}
 
     @patch("admedi.cli.main.compute_diff")
     @patch("admedi.cli.main.resolve_app_tiers")

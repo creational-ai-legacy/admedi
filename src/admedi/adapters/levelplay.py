@@ -815,21 +815,36 @@ class LevelPlayAdapter(MediationAdapter):
         )
 
     async def update_group(
-        self, app_key: str, group_id: int, group: Group
+        self,
+        app_key: str,
+        group_id: int,
+        group: Group,
+        *,
+        waterfall_payload: dict[str, Any] | None = None,
+        include_tier_fields: bool = True,
     ) -> Group:
         """Update an existing mediation group.
 
-        Sends a PUT request to the LevelPlay Groups API v4 with
-        prefixed field names (``groupId``, ``groupName``,
-        ``groupCountries``, ``groupPosition``). The ``adFormat`` field
-        is omitted from the PUT payload. Partial PUT preserves all
-        unincluded fields on the server side.
+        Sends a PUT request to the LevelPlay Groups API v4. When
+        ``include_tier_fields`` is ``True`` (default), the payload includes
+        ``groupName``, ``countries``, and ``position``. When ``False``,
+        those fields are omitted so the server preserves them (partial PUT
+        for waterfall-only updates).
+
+        When ``waterfall_payload`` is provided, it is included as
+        ``adSourcePriority`` in the PUT body to set waterfall ordering.
 
         Args:
             app_key: The LevelPlay app key.
             group_id: ID of the group to update.
             group: Updated group configuration. Must not use
                 ``AdFormat.REWARDED_VIDEO``.
+            waterfall_payload: Optional waterfall ordering payload to include
+                as ``adSourcePriority``. When ``None`` (default), no
+                waterfall data is sent.
+            include_tier_fields: When ``True`` (default), include
+                ``groupName``, ``countries``, and ``position`` in the PUT
+                body. When ``False``, omit them for waterfall-only updates.
 
         Returns:
             The updated ``Group`` fetched from the server after the PUT.
@@ -853,10 +868,15 @@ class LevelPlayAdapter(MediationAdapter):
         payload: dict[str, Any] = {
             "groupId": group_id,
             "adFormat": group.ad_format.value,
-            "groupName": group.group_name,
-            "countries": group.countries,
-            "position": group.position,
         }
+
+        if include_tier_fields:
+            payload["groupName"] = group.group_name
+            payload["countries"] = group.countries
+            payload["position"] = group.position
+
+        if waterfall_payload is not None:
+            payload["adSourcePriority"] = waterfall_payload
 
         logger.info(
             "Updating group %d ('%s') for app '%s'",

@@ -3,7 +3,7 @@
 Reads YAML files from disk, parses them via ``ruamel.yaml`` (safe mode),
 and validates the results into Pydantic models.
 
-Six loaders are provided:
+Seven loaders are provided:
 
 1. ``load_template()`` -- Reads a full portfolio tier template (with
    ``schema_version``, ``mediator``, ``portfolio``, and ``tiers`` keys)
@@ -30,6 +30,11 @@ Six loaders are provided:
    settings file (``settings/{alias}.yaml``), resolves country group
    references via ``countries.yaml``, and returns a
    ``list[PortfolioTier]`` (one per format-tier combination).
+
+7. ``load_network_presets()`` -- Reads a ``networks.yaml`` file defining
+   portfolio-wide named network waterfall presets. Each preset maps to a
+   list of instance entries with ``network`` (str) and ``bidder`` (bool)
+   fields. Returns a ``dict[str, list[dict[str, Any]]]``.
 
 The loader is synchronous (no async I/O). If the calling orchestrator
 needs non-blocking behavior, it can wrap the loader in
@@ -58,6 +63,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
 from ruamel.yaml import YAML, YAMLError
@@ -679,7 +685,25 @@ def resolve_app_tiers(
                 )
 
             display_name = next(iter(entry))
-            group_ref = entry[display_name]
+            entry_value = entry[display_name]
+
+            # Entry value must be a dict: {countries: ref, networks: ref}
+            if not isinstance(entry_value, dict):
+                raise ConfigValidationError(
+                    f"Tier entry '{display_name}' in format section '{key}' "
+                    f"of '{file_path.name}' must be a dict "
+                    f"(e.g., '{{countries: US, networks: bidding-6}}'). "
+                    f"Run 'admedi pull --app {alias}' to regenerate settings."
+                )
+
+            if "countries" not in entry_value:
+                raise ConfigValidationError(
+                    f"Tier entry '{display_name}' in format section '{key}' "
+                    f"of '{file_path.name}' is missing required 'countries' key"
+                )
+
+            group_ref = entry_value["countries"]
+            network_ref = entry_value.get("networks")
 
             # Resolve country group reference -> country codes
             if group_ref == "*":
@@ -702,6 +726,7 @@ def resolve_app_tiers(
                     position=position,
                     is_default=is_default,
                     ad_formats=[ad_format],
+                    network_preset=network_ref,
                 )
             )
 
@@ -835,5 +860,131 @@ def load_profiles(
             app_name=str(entry["app_name"]),
             platform=platform,
         )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Network presets loader
+# ---------------------------------------------------------------------------
+
+
+def load_network_presets(
+    settings_dir: str = "settings",
+) -> dict[str, list[dict[str, Any]]]:
+    """Load and validate portfolio-wide network waterfall presets.
+
+    Reads ``networks.yaml`` from the project root (resolved as
+    ``Path(settings_dir).parent``), following the same convention as
+    ``load_country_groups()``. The file is a YAML mapping of preset name
+    to a list of instance entries.
+
+    Each instance entry must have:
+    - ``network`` (str): Ad network name (e.g., "Meta Audience Network")
+    - ``bidder`` (bool): Whether this is a bidding instance
+
+    Optional fields:
+    - ``name`` (str): Instance display name (for disambiguation)
+    - ``rate`` (float): Manual CPM rate
+
+    Args:
+        settings_dir: Path to the settings directory. The parent of this
+            path is treated as the project root containing
+            ``networks.yaml``.
+
+    Returns:
+        A dict mapping preset name (str) to a list of instance entry
+        dicts (list[dict[str, Any]]).
+
+    Raises:
+        FileNotFoundError: If ``networks.yaml`` does not exist.
+        ConfigValidationError: If the YAML is malformed, empty, not a
+            mapping, or contains entries missing required fields.
+
+    Examples:
+        >>> presets = load_network_presets("settings")  # doctest: +SKIP
+        >>> len(presets["bidding-6"])  # doctest: +SKIP
+        6
+        >>> presets["bidding-6"][0]["network"]  # doctest: +SKIP
+        'Meta Audience Network'
+    """
+    project_root = Path(settings_dir).parent
+    file_path = project_root / "networks.yaml"
+
+    if not file_path.exists():
+        raise FileNotFoundError(
+            f"Network presets file not found: {file_path}"
+        )
+
+    yaml = YAML(typ="safe")
+
+    try:
+        raw_data = yaml.load(file_path)
+    except YAMLError as exc:
+        raise ConfigValidationError(
+            f"Malformed YAML in '{file_path.name}': {exc}",
+            detail=str(exc),
+        ) from exc
+
+    if raw_data is None:
+        raise ConfigValidationError(
+            f"Network presets file '{file_path.name}' is empty or contains "
+            f"no YAML data"
+        )
+
+    if not isinstance(raw_data, dict):
+        raise ConfigValidationError(
+            f"Network presets file '{file_path.name}' must contain a YAML "
+            f"mapping (got {type(raw_data).__name__})"
+        )
+
+    result: dict[str, list[dict[str, Any]]] = {}
+
+    for preset_name, entries in raw_data.items():
+        if not isinstance(entries, list):
+            raise ConfigValidationError(
+                f"Preset '{preset_name}' in '{file_path.name}' must be a "
+                f"list of instance entries, got {type(entries).__name__}"
+            )
+
+        validated_entries: list[dict[str, Any]] = []
+
+        for idx, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                raise ConfigValidationError(
+                    f"Entry {idx} in preset '{preset_name}' of "
+                    f"'{file_path.name}' must be a mapping, "
+                    f"got {type(entry).__name__}"
+                )
+
+            if "network" not in entry:
+                raise ConfigValidationError(
+                    f"Entry {idx} in preset '{preset_name}' of "
+                    f"'{file_path.name}' is missing required 'network' field"
+                )
+
+            if not isinstance(entry["network"], str):
+                raise ConfigValidationError(
+                    f"Entry {idx} in preset '{preset_name}' of "
+                    f"'{file_path.name}' has invalid 'network': must be a "
+                    f"string, got {type(entry['network']).__name__}"
+                )
+
+            if "bidder" not in entry:
+                raise ConfigValidationError(
+                    f"Entry {idx} in preset '{preset_name}' of "
+                    f"'{file_path.name}' is missing required 'bidder' field"
+                )
+
+            if not isinstance(entry["bidder"], bool):
+                raise ConfigValidationError(
+                    f"Entry {idx} in preset '{preset_name}' of "
+                    f"'{file_path.name}' has invalid 'bidder': must be a "
+                    f"boolean, got {type(entry['bidder']).__name__}"
+                )
+
+            validated_entries.append(dict(entry))
+
+        result[preset_name] = validated_entries
 
     return result

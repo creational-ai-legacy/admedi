@@ -1,10 +1,10 @@
 # Project State: Admedi
 
-> **Last Updated**: 2026-03-17T18:06:41-0700
+> **Last Updated**: 2026-03-18T00:40:25-0700
 
 **Admedi** is a config-driven ad mediation management tool that replaces manual dashboard clicking with config-as-code: define country tiers in YAML, diff against live mediation configs via platform APIs, and sync across an entire app portfolio.
 
-**Current Status**: Core milestone nearing completion -- Foundation, Auth-Reads, Config-Engine, Snapshot-Unify, Unified-Settings, Sync-UX, and Settings-Redesign tasks complete. Three-layer settings architecture operational (countries.yaml, tiers.yaml, per-app settings). Smart `pull` command with country-content matching. `admedi.yaml` retired. 1392 tests passing. Next: Dogfood on Shelf Sort portfolio.
+**Current Status**: Core milestone nearing completion -- Foundation, Auth-Reads, Config-Engine, Snapshot-Unify, Unified-Settings, Sync-UX, Settings-Redesign, and Sync-Networks tasks complete. Network waterfall sync operational via shared `networks.yaml` presets, dict-format settings, and scoped `--tiers`/`--networks` sync flags. 1533 tests passing. Next: Dogfood on Shelf Sort portfolio.
 
 ---
 
@@ -21,11 +21,12 @@
 | unified-settings | Unified settings format for pull-edit-push round-trip | refactor | ✅ Complete | 253 passing | `core-unified-settings-*.md` |
 | sync-ux | Sync command UX improvements | refactor | ✅ Complete | 242 passing | `core-sync-ux-*.md` |
 | settings-redesign | Three-layer settings architecture | refactor | ✅ Complete | 469 passing | `core-settings-redesign-*.md` |
+| sync-networks | Network waterfall sync | feature | ✅ Complete | 128 new (776 affected) | `core-sync-networks-*.md` |
 | dogfood | Shelf Sort Dogfood | validation | ⬜ Pending | -- | -- |
 
 **Post-Core (deferred)**: Instance CRUD, placement ops, reporting API, MCP server, `admedi revenue`, `admedi manage-instances`
 
-**Total Tests**: 1392 passing (2 pre-existing failures in test_config_engine_writes.py), 10 deselected (integration markers)
+**Total Tests**: 1533 passing, 10 deselected (integration markers)
 
 ---
 
@@ -54,65 +55,69 @@
 | 2026-03-17 | Smart `pull` matches by country content, not names | Local tier naming is authoritative; `pull` reads by content, `sync` writes by name |
 | 2026-03-17 | Retire `admedi.yaml` monolithic template | Replaced by `profiles.yaml` + three-layer settings; `audit`/`status` use profiles-based app discovery |
 | 2026-03-17 | Rename `show` to `pull` | Clear directionality: `pull` = fetch live, `sync` = push local |
+| 2026-03-18 | Shared `networks.yaml` for portfolio-wide presets | Avoid waterfall duplication across apps; single source of truth for network ordering |
+| 2026-03-18 | Dict-format settings `{countries: ref, networks: ref}` | Clean separation of tier and network config per group; `networks` key optional |
+| 2026-03-18 | SyncScope as Pydantic model with dual booleans | Validated defaults (both=True), type-safe field access, composable `--tiers`/`--networks` flags |
+| 2026-03-18 | Abort-on-ambiguity for waterfall resolution | Ambiguous or name-change failures block the entire group's waterfall update; conservative safety for live API writes |
+| 2026-03-18 | `include_tier_fields` partial PUT pattern | `--networks` only sends `groupId + adFormat + adSourcePriority`, server preserves existing tier fields |
 
 ---
 
 ## What's Next
 
 **Recommended Next Steps**:
-1. Run `admedi pull --app hexar-ios` against live API to verify end-to-end with new settings format
+1. Run `admedi pull --app hexar-ios` against live API to verify end-to-end with dict-format settings and networks.yaml
 2. Migrate: pull all apps, rename auto-generated groups, delete old files (`admedi.yaml`, `*-tiers.yaml`)
-3. Portfolio Dogfood -- real Shelf Sort validation with `admedi sync`
+3. Portfolio Dogfood -- real Shelf Sort validation with `admedi sync` (tiers + networks)
 4. After dogfood: open-source packaging, MCP server, extended operations
 
-**System Status**: ✅ **Settings Redesign Complete**
+**System Status**: ✅ **Network Sync Complete**
 - Three-layer resolution: per-app -> tiers.yaml -> countries.yaml -> `list[PortfolioTier]`
-- 4 CLI commands: pull (smart matching), audit, sync (unified), status
-- Pull-edit-sync workflow: `pull` writes settings, user edits, `sync` reads settings
-- Smart pull: country-content matching, bootstrap from live API, auto-create tiers/groups
-- Per-format tier differences via different tier names (no convergence hack)
-- Profiles-based app discovery: expanded `profiles.yaml` as single identity source
-- `admedi.yaml` retired from all commands
-- Group write operations: create, update, delete via LevelPlay v4 API
-- Local file storage: JSONL sync logs, per-snapshot JSON files in .admedi/
-- Safety: dry-run default, pre-write snapshots, A/B test detection, post-write verification, per-app error isolation
-- 1392 tests passing
+- Network waterfall sync: shared `networks.yaml` presets, `adSourcePriority` PUT
+- Scoped sync: `--tiers` only, `--networks` only, no flags = full sync
+- Dict-format settings: `{countries: ref, networks: ref}` per group
+- 4 CLI commands: pull (smart matching + network presets), audit, sync (unified + scoped), status
+- Pull-edit-sync workflow: `pull` writes settings + networks.yaml, user edits, `sync` reads and applies
+- Cross-app sync with network preset resolution against destination app instances
+- Graceful degradation: missing networks produce warnings, not errors
+- Safety: dry-run default, pre-write snapshots, A/B test detection, post-write verification, per-app error isolation, abort-on-ambiguity
+- 1533 tests passing
 
 ---
 
 ## Latest Health Check
 
-### 2026-03-17 - Settings-Redesign Task Finalization
+### 2026-03-18 - Sync-Networks Task Finalization
 **Status**: ✅ On Track
 
 **Context**:
-Settings-Redesign task completed -- a refactor task in the Core milestone. Replaced monolithic `admedi.yaml` and per-app tiers files with a three-layer architecture: `countries.yaml` (portfolio-wide country groups), `tiers.yaml` (tier-to-group mapping), and per-app settings (format -> tier list). Smart `pull` command with country-content matching replaces dumb `show`.
+Sync-Networks task completed -- a feature task in the Core milestone. Added network waterfall sync: shared `networks.yaml` presets, dict-format `{countries: ref, networks: ref}` settings, network differ, waterfall apply via `adSourcePriority` PUT, and scoped `--tiers`/`--networks` sync flags. All 12 success criteria met.
 
 **Findings**:
-- ✅ Work directly aligned with Core milestone -- three-layer settings is the last architecture piece before dogfood
-- ✅ Architecture clean: three-layer resolution chain produces the same `list[PortfolioTier]` type, downstream pipeline (`compute_diff`, `Applier`) unchanged
-- ✅ No scope drift -- all 8 steps (plus Step 0 baseline) implemented per plan specification, zero deviations except one YAML parser behavior correction (bare `*` is alias syntax)
-- ✅ Complexity proportionate -- no unnecessary abstractions, each layer is a single YAML file with a clear loader function
-- ✅ Production integration solid -- `pull` bootstraps from live API, `sync` round-trips through three layers, `audit`/`status` use profiles
-- ✅ 1392 tests passing (up from 1232), 10 integration tests deselected
-- ⚠️ 2 pre-existing test failures in test_config_engine_writes.py remain (payload format, unrelated)
+- ✅ Work directly aligned with Core milestone -- network sync was the last feature before dogfood
+- ✅ Architecture clean: SyncScope threads through differ (skip tier comparisons) and applier (control PUT payload) as layered concerns, no coupling between layers
+- ✅ No scope drift -- all 11 steps implemented per plan, one pragmatic deviation (passing tiers list through applier chain for preset lookup) documented and justified
+- ✅ Complexity proportionate -- SyncScope is 2 fields, network differ follows existing tier differ pattern, `build_waterfall_payload()` is a standalone function
+- ✅ Production integration solid -- `adSourcePriority` PUT uses real LevelPlay v4 API field, waterfall payloads structured per API documentation
+- ✅ 1533 tests passing (up from 1392), 10 integration tests deselected
+- ✅ 128 new tests added across 11 steps; 338 network-specific tests total
 
 **Challenges**:
-- ruamel.yaml's safe loader treats bare `*` as YAML alias syntax, not a plain scalar. Plan assumed it would parse as a string. Resolved by always quoting wildcards as `'*'` and updating tests.
-- Old test classes for removed functions (`save_modular_snapshot`, `_extract_tiers`, `_build_app_yaml`) had to be deleted. Test count dropped mid-task before new tests replaced them.
+- Step 8 (sync flag scoping) required threading `scope`, `network_presets`, and `tiers` through the full applier call chain (apply -> _process_app -> _process_app_inner -> _execute_updates). Each layer needed parameter additions and existing mock-based tests needed assertion updates.
+- Step 5 (pull flow) naturally subsumed Step 9 (stop writing per-app network files), making Step 9 a verification-only step rather than a code change step.
 
 **Results**:
-- ✅ Three-layer resolution: per-app -> tiers.yaml -> countries.yaml -> `list[PortfolioTier]`
-- ✅ Smart `pull` with country-content matching, bootstrap, and auto-create
-- ✅ `admedi.yaml` fully retired from audit, status, and sync
-- ✅ Expanded `profiles.yaml` as single identity source
-- ✅ Per-format tier differences via different tier names (convergence hack eliminated)
-- ✅ Round-trip and zero-drift integration tests prove pipeline correctness
-- ✅ 469 affected tests passing across 5 test files
+- ✅ Shared `networks.yaml` with portfolio-wide named waterfall presets
+- ✅ Dict-format settings: `{countries: ref, networks: ref}` per group
+- ✅ Scoped sync: `--tiers`, `--networks`, no flags = full sync
+- ✅ Network differ compares desired preset against live waterfall per group
+- ✅ Waterfall apply via `adSourcePriority` PUT with 5-rule instance resolution
+- ✅ Cross-app sync resolves network presets against destination app instances
+- ✅ Graceful degradation: missing networks produce warnings, not errors
 
 **Lessons Learned**:
-- Country-content matching decouples inbound naming from local naming -- `pull` reads by content, `sync` writes by name
-- Round-trip + zero-drift integration tests are the strongest validation for multi-layer resolution pipelines
-- Skip-with-warning vs error-on-explicit is a clean pattern for partial portfolio setups
+- Scope threading as layered concern keeps each component focused: differ reads scope for comparison control, applier reads scope for payload control
+- Abort-on-ambiguity is the right safety posture for live API waterfall writes -- partial payloads with unresolved instances risk breaking production ad serving
+- Sequential plan steps can naturally subsume later steps; the later step's value becomes verification tests
 
-**Next**: Run `admedi pull --app hexar-ios` against live API, migrate all apps, then proceed to Portfolio Dogfood
+**Next**: Run `admedi pull --app hexar-ios` against live API with dict-format settings, migrate all apps, then proceed to Portfolio Dogfood

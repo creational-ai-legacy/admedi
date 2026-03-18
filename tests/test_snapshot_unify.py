@@ -67,6 +67,8 @@ from admedi.cli.main import app as cli_app
 from admedi.engine.loader import Profile, resolve_app_tiers
 from admedi.engine.snapshot import (
     SnapshotData,
+    _auto_name_network,
+    _write_per_app_settings,
     extract_network_presets,
     generate_app_settings,
     load_snapshot,
@@ -1247,7 +1249,8 @@ class TestWaterfallSignature:
         sig = waterfall_signature(group_interstitial_with_rates)
         bidders, manuals = sig
         assert bidders == ("Meta",)
-        assert manuals == (("AppLovin", 1.0),)
+        # Unique instance within (network, bidder) pair -> name is None
+        assert manuals == (("AppLovin", 1.0, None),)
 
 
 class TestExtractNetworkPresets:
@@ -1326,6 +1329,309 @@ class TestWriteYamlFile:
         yaml = YAML()
         data = yaml.load(path)
         assert "custom" in data
+
+
+# ===========================================================================
+# Step 2 (sync-networks): Improved snapshot helper tests
+# ===========================================================================
+
+
+class TestWaterfallSignatureSorting:
+    """Verify waterfall_signature() sorts instances for deterministic signatures."""
+
+    def test_same_signature_regardless_of_instance_order(self) -> None:
+        """Instances in different iteration order produce identical signature."""
+        group_a = Group.model_validate({
+            "groupName": "T1", "adFormat": "banner",
+            "countries": ["US"], "position": 1,
+            "instances": [
+                {"id": 1, "name": "B", "networkName": "ironSource", "isBidder": True},
+                {"id": 2, "name": "B", "networkName": "Meta", "isBidder": True},
+                {"id": 3, "name": "Low", "networkName": "AppLovin", "isBidder": False, "groupRate": 0.5},
+                {"id": 4, "name": "High", "networkName": "Google AdMob", "isBidder": False, "groupRate": 2.0},
+            ],
+        })
+        # Same instances in reversed order
+        group_b = Group.model_validate({
+            "groupName": "T1", "adFormat": "banner",
+            "countries": ["US"], "position": 1,
+            "instances": [
+                {"id": 4, "name": "High", "networkName": "Google AdMob", "isBidder": False, "groupRate": 2.0},
+                {"id": 3, "name": "Low", "networkName": "AppLovin", "isBidder": False, "groupRate": 0.5},
+                {"id": 2, "name": "B", "networkName": "Meta", "isBidder": True},
+                {"id": 1, "name": "B", "networkName": "ironSource", "isBidder": True},
+            ],
+        })
+        assert waterfall_signature(group_a) == waterfall_signature(group_b)
+
+    def test_instance_name_differentiates_duplicate_networks(self) -> None:
+        """Two instances of same network with different names produce different signature."""
+        group_one = Group.model_validate({
+            "groupName": "T1", "adFormat": "banner",
+            "countries": ["US"], "position": 1,
+            "instances": [
+                {"id": 1, "name": "High", "networkName": "Google AdMob", "isBidder": False, "groupRate": 2.0},
+            ],
+        })
+        group_two = Group.model_validate({
+            "groupName": "T2", "adFormat": "banner",
+            "countries": ["US"], "position": 1,
+            "instances": [
+                {"id": 1, "name": "High", "networkName": "Google AdMob", "isBidder": False, "groupRate": 2.0},
+                {"id": 2, "name": "Low", "networkName": "Google AdMob", "isBidder": False, "groupRate": 0.5},
+            ],
+        })
+        assert waterfall_signature(group_one) != waterfall_signature(group_two)
+
+    def test_none_instances_handled(self) -> None:
+        """Group with instances=None returns empty bidders and manuals."""
+        group = Group.model_validate({
+            "groupName": "Empty", "adFormat": "native",
+            "countries": ["*"], "position": 1,
+        })
+        assert group.instances is None
+        sig = waterfall_signature(group)
+        bidders, manuals = sig
+        assert bidders == ()
+        assert manuals == ()
+
+
+class TestAutoNameNetworkRules:
+    """Verify _auto_name_network() implements all 5 naming rules."""
+
+    def test_rule1_bidders_only_two(self) -> None:
+        """Rule 1: bidders-only <=3 joins first words with '+'."""
+        result = _auto_name_network(["Google", "InMobi"], [])
+        assert result == "google+inmobi"
+
+    def test_rule1_bidders_only_three(self) -> None:
+        """Rule 1: exactly 3 bidders joins first words."""
+        result = _auto_name_network(["ironSource", "Meta", "UnityAds"], [])
+        assert result == "ironsource+meta+unityads"
+
+    def test_rule1_single_bidder(self) -> None:
+        """Rule 1: single bidder uses first word lowercased."""
+        result = _auto_name_network(["Meta"], [])
+        assert result == "meta"
+
+    def test_rule2_bidders_over_three(self) -> None:
+        """Rule 2: >3 bidders produces 'bidding-{count}'."""
+        result = _auto_name_network(
+            ["A", "B", "C", "D", "E", "F", "G"], []
+        )
+        assert result == "bidding-7"
+
+    def test_rule2_exactly_four_bidders(self) -> None:
+        """Rule 2: exactly 4 bidders produces 'bidding-4'."""
+        result = _auto_name_network(["A", "B", "C", "D"], [])
+        assert result == "bidding-4"
+
+    def test_rule3_with_manuals_short_names(self) -> None:
+        """Rule 3: <=3 manual networks uses last word lowercased."""
+        manuals = [
+            {"network": "Google AdMob", "bidder": False},
+        ]
+        result = _auto_name_network(["Meta"], manuals)
+        assert "admob" in result
+        assert result == "meta-admob"
+
+    def test_rule3_multiple_manuals_sorted(self) -> None:
+        """Rule 3: manual short names are sorted alphabetically."""
+        manuals = [
+            {"network": "Google AdMob", "bidder": False},
+            {"network": "AppLovin", "bidder": False},
+        ]
+        result = _auto_name_network(["Meta"], manuals)
+        # "admob" before "applovin" alphabetically
+        assert result == "meta-admob+applovin"
+
+    def test_rule3_single_word_network_full_name(self) -> None:
+        """Rule 3: single-word network name uses full name lowercased."""
+        manuals = [
+            {"network": "Fyber", "bidder": False},
+        ]
+        result = _auto_name_network(["Meta"], manuals)
+        assert result == "meta-fyber"
+
+    def test_rule4_manuals_over_three(self) -> None:
+        """Rule 4: >3 unique manual networks produces 'manual-{count}'."""
+        manuals = [
+            {"network": "Google AdMob", "bidder": False},
+            {"network": "AppLovin", "bidder": False},
+            {"network": "Fyber", "bidder": False},
+            {"network": "Pangle", "bidder": False},
+        ]
+        result = _auto_name_network(["Meta"], manuals)
+        assert result == "meta-manual-4"
+
+    def test_rule6_manuals_only(self) -> None:
+        """Rule 6: zero bidders omits bidder prefix."""
+        manuals = [
+            {"network": "Google AdMob", "bidder": False},
+            {"network": "AppLovin", "bidder": False},
+        ]
+        result = _auto_name_network([], manuals)
+        assert result == "admob+applovin"
+
+    def test_none_inputs(self) -> None:
+        """No bidders and no manuals returns 'none'."""
+        result = _auto_name_network([], [])
+        assert result == "none"
+
+    def test_rule3_dedups_manual_networks(self) -> None:
+        """Rule 3: duplicate manual network names count as one unique."""
+        manuals = [
+            {"network": "Google AdMob", "bidder": False},
+            {"network": "Google AdMob", "bidder": False},
+        ]
+        result = _auto_name_network(["Meta"], manuals)
+        assert result == "meta-admob"
+
+
+class TestExtractNetworkPresetsNameField:
+    """Verify extract_network_presets() name field emission logic."""
+
+    def test_no_name_for_unique_instances(self) -> None:
+        """Single instance per network does not emit 'name' field."""
+        groups = [
+            Group.model_validate({
+                "groupName": "T1", "adFormat": "banner",
+                "countries": ["US"], "position": 1,
+                "instances": [
+                    {"id": 1, "name": "Bidding", "networkName": "Meta", "isBidder": True},
+                    {"id": 2, "name": "Default", "networkName": "AppLovin", "isBidder": False, "groupRate": 1.0},
+                ],
+            }),
+        ]
+        presets = extract_network_presets(groups)
+        assert len(presets) == 1
+        entries = list(presets.values())[0]
+        for entry in entries:
+            assert "name" not in entry
+
+    def test_name_for_duplicate_manual_network(self) -> None:
+        """Multiple instances of same manual network emit 'name' for disambiguation."""
+        groups = [
+            Group.model_validate({
+                "groupName": "T1", "adFormat": "banner",
+                "countries": ["US"], "position": 1,
+                "instances": [
+                    {"id": 1, "name": "Bidding", "networkName": "Meta", "isBidder": True},
+                    {"id": 2, "name": "High", "networkName": "Google AdMob", "isBidder": False, "groupRate": 2.0},
+                    {"id": 3, "name": "Low", "networkName": "Google AdMob", "isBidder": False, "groupRate": 0.5},
+                ],
+            }),
+        ]
+        presets = extract_network_presets(groups)
+        entries = list(presets.values())[0]
+
+        # Bidder (Meta) should not have name field
+        bidder_entries = [e for e in entries if e.get("bidder") is True]
+        for be in bidder_entries:
+            assert "name" not in be
+
+        # Both Google AdMob manuals should have name field
+        admob_entries = [e for e in entries if e["network"] == "Google AdMob"]
+        assert len(admob_entries) == 2
+        names = {e["name"] for e in admob_entries}
+        assert names == {"High", "Low"}
+
+    def test_bidders_only_no_name_field(self) -> None:
+        """Bidder-only groups never emit 'name' field."""
+        groups = [
+            Group.model_validate({
+                "groupName": "T1", "adFormat": "banner",
+                "countries": ["US"], "position": 1,
+                "instances": [
+                    {"id": 1, "name": "B1", "networkName": "ironSource", "isBidder": True},
+                    {"id": 2, "name": "B2", "networkName": "Meta", "isBidder": True},
+                ],
+            }),
+        ]
+        presets = extract_network_presets(groups)
+        entries = list(presets.values())[0]
+        for entry in entries:
+            assert "name" not in entry
+
+    def test_none_instances_group_skipped(self) -> None:
+        """Group with instances=None is skipped (no error, no entry)."""
+        groups = [
+            Group.model_validate({
+                "groupName": "Empty", "adFormat": "native",
+                "countries": ["*"], "position": 1,
+            }),
+        ]
+        presets = extract_network_presets(groups)
+        assert presets == {}
+
+    def test_bidder_field_on_all_entries(self) -> None:
+        """All entries have a 'bidder' field (True for bidders, False for manuals)."""
+        groups = [
+            Group.model_validate({
+                "groupName": "T1", "adFormat": "banner",
+                "countries": ["US"], "position": 1,
+                "instances": [
+                    {"id": 1, "name": "B", "networkName": "Meta", "isBidder": True},
+                    {"id": 2, "name": "D", "networkName": "AppLovin", "isBidder": False, "groupRate": 1.0},
+                ],
+            }),
+        ]
+        presets = extract_network_presets(groups)
+        entries = list(presets.values())[0]
+        for entry in entries:
+            assert "bidder" in entry
+            assert isinstance(entry["bidder"], bool)
+
+
+class TestWriteYamlFileRootKeyNone:
+    """Verify write_yaml_file() with root_key=None."""
+
+    def test_root_key_none_no_wrapping(self, tmp_path: Path) -> None:
+        """root_key=None dumps entries directly as top-level YAML content."""
+        path = tmp_path / "test.yaml"
+        entries = {
+            "preset-a": [{"network": "Meta", "bidder": True}],
+            "preset-b": [{"network": "AppLovin", "bidder": False}],
+        }
+        write_yaml_file(path, entries, header="# Header\n\n", root_key=None)
+
+        yaml = YAML()
+        data = yaml.load(path)
+
+        # Entries are at top level, not nested under a key
+        assert "preset-a" in data
+        assert "preset-b" in data
+        assert "presets" not in data
+
+    def test_root_key_presets_wraps_content(self, tmp_path: Path) -> None:
+        """root_key='presets' wraps entries under 'presets' key (default behavior)."""
+        path = tmp_path / "test.yaml"
+        entries = {"entry1": [{"key": "value"}]}
+        write_yaml_file(path, entries, header="# H\n\n", root_key="presets")
+
+        yaml = YAML()
+        data = yaml.load(path)
+
+        assert "presets" in data
+        assert data["presets"]["entry1"] == [{"key": "value"}]
+
+    def test_root_key_none_preserves_header(self, tmp_path: Path) -> None:
+        """Header is still prepended when root_key=None."""
+        path = tmp_path / "test.yaml"
+        write_yaml_file(
+            path, {"a": 1}, header="# My custom header\n\n", root_key=None
+        )
+        content = path.read_text()
+        assert content.startswith("# My custom header")
+
+    def test_default_root_key_is_presets(self, tmp_path: Path) -> None:
+        """Default root_key is 'presets' (backward compatible)."""
+        path = tmp_path / "test.yaml"
+        write_yaml_file(path, {"x": 1}, header="# H\n\n")
+
+        yaml = YAML()
+        data = yaml.load(path)
+        assert "presets" in data
 
 
 # ===========================================================================
@@ -1421,7 +1727,7 @@ class TestGenerateAppSettingsBootstrap:
         ]
         profile = _make_profile()
 
-        path, _messages = generate_app_settings(
+        path, _net_path, _messages = generate_app_settings(
             groups, profile, settings_dir=str(settings_dir)
         )
 
@@ -1490,10 +1796,10 @@ class TestGenerateAppSettingsBootstrap:
 
         yaml = YAML(typ="safe")
         app_data = yaml.load(settings_dir / "hexar-ios.yaml")
-        # Catch-all entry is {display_name: '*'}
+        # Catch-all entry is {display_name: {countries: '*'}}
         assert len(app_data["interstitial"]) == 1
         entry = app_data["interstitial"][0]
-        assert entry["All Countries"] == "*"
+        assert entry["All Countries"]["countries"] == "*"
 
     def test_bootstrap_returns_info_messages(self, tmp_path: Path) -> None:
         """Bootstrap returns info messages about created country groups."""
@@ -1510,7 +1816,7 @@ class TestGenerateAppSettingsBootstrap:
         ]
         profile = _make_profile()
 
-        _path, messages = generate_app_settings(
+        _path, _net_path, messages = generate_app_settings(
             groups, profile, settings_dir=str(settings_dir)
         )
 
@@ -1525,7 +1831,7 @@ class TestGenerateAppSettingsBootstrap:
 
         profile = _make_profile()
 
-        path, messages = generate_app_settings([], profile, settings_dir=str(settings_dir))
+        path, _net_path, messages = generate_app_settings([], profile, settings_dir=str(settings_dir))
 
         assert Path(path).exists()
         assert (tmp_path / "countries.yaml").exists()
@@ -1556,7 +1862,7 @@ class TestGenerateAppSettingsCountryMatching:
         ]
         profile = _make_profile()
 
-        _path, messages = generate_app_settings(
+        _path, _net_path, messages = generate_app_settings(
             groups, profile, settings_dir=str(settings_dir)
         )
 
@@ -1566,7 +1872,7 @@ class TestGenerateAppSettingsCountryMatching:
         # Per-app settings references the existing group
         yaml = YAML(typ="safe")
         app_data = yaml.load(settings_dir / "hexar-ios.yaml")
-        assert app_data["interstitial"] == [{"Tier 1": "US"}]
+        assert app_data["interstitial"] == [{"Tier 1": {"countries": "US"}}]
 
     def test_set_match_is_order_independent(self, tmp_path: Path) -> None:
         """Country order doesn't matter — set comparison matches regardless."""
@@ -1590,7 +1896,7 @@ class TestGenerateAppSettingsCountryMatching:
         ]
         profile = _make_profile()
 
-        _path, messages = generate_app_settings(
+        _path, _net_path, messages = generate_app_settings(
             groups, profile, settings_dir=str(settings_dir)
         )
 
@@ -1599,7 +1905,7 @@ class TestGenerateAppSettingsCountryMatching:
 
         yaml = YAML(typ="safe")
         app_data = yaml.load(settings_dir / "hexar-ios.yaml")
-        assert app_data["interstitial"] == [{"Tier 2": "high-value"}]
+        assert app_data["interstitial"] == [{"Tier 2": {"countries": "high-value"}}]
 
     def test_catch_all_uses_star_ref(self, tmp_path: Path) -> None:
         """Group with ['*'] gets '*' as group ref."""
@@ -1621,7 +1927,7 @@ class TestGenerateAppSettingsCountryMatching:
         ]
         profile = _make_profile()
 
-        _path, messages = generate_app_settings(
+        _path, _net_path, messages = generate_app_settings(
             groups, profile, settings_dir=str(settings_dir)
         )
 
@@ -1630,7 +1936,7 @@ class TestGenerateAppSettingsCountryMatching:
 
         yaml = YAML(typ="safe")
         app_data = yaml.load(settings_dir / "hexar-ios.yaml")
-        assert app_data["interstitial"] == [{"Default": "*"}]
+        assert app_data["interstitial"] == [{"Default": {"countries": "*"}}]
 
     def test_no_match_auto_creates_country_group(self, tmp_path: Path) -> None:
         """Group with unknown country set triggers auto-create of country group."""
@@ -1658,7 +1964,7 @@ class TestGenerateAppSettingsCountryMatching:
         ]
         profile = _make_profile()
 
-        _path, messages = generate_app_settings(
+        _path, _net_path, messages = generate_app_settings(
             groups, profile, settings_dir=str(settings_dir)
         )
 
@@ -1710,7 +2016,7 @@ class TestGenerateAppSettingsCountryMatching:
         ]
         profile = _make_profile()
 
-        _path, messages = generate_app_settings(
+        _path, _net_path, messages = generate_app_settings(
             groups, profile, settings_dir=str(settings_dir)
         )
 
@@ -1840,7 +2146,7 @@ class TestGenerateAppSettingsPerAppFormat:
         assert "native" not in data
 
     def test_returns_tuple_of_path_and_messages(self, tmp_path: Path) -> None:
-        """generate_app_settings returns (str, list[str])."""
+        """generate_app_settings returns (str, str | None, list[str])."""
         settings_dir = tmp_path / "settings"
         settings_dir.mkdir()
 
@@ -1858,9 +2164,10 @@ class TestGenerateAppSettingsPerAppFormat:
             groups, profile, settings_dir=str(settings_dir)
         )
         assert isinstance(result, tuple)
-        assert len(result) == 2
-        path, messages = result
+        assert len(result) == 3
+        path, networks_path, messages = result
         assert isinstance(path, str)
+        assert networks_path is None or isinstance(networks_path, str)
         assert isinstance(messages, list)
 
     def test_per_format_tier_differences(self, tmp_path: Path) -> None:
@@ -2017,7 +2324,7 @@ class TestGenerateAppSettingsMultiApp:
         ]
         profile_app2 = _make_profile(alias="ss-ios", app_key="ss123")
 
-        _path, messages = generate_app_settings(
+        _path, _net_path, messages = generate_app_settings(
             groups_app2, profile_app2, settings_dir=str(settings_dir)
         )
 
@@ -2063,7 +2370,7 @@ class TestGenerateAppSettingsMultiApp:
         ]
         profile_app2 = _make_profile(alias="ss-ios", app_key="ss123")
 
-        _path, messages = generate_app_settings(
+        _path, _net_path, messages = generate_app_settings(
             groups_app2, profile_app2, settings_dir=str(settings_dir)
         )
 
@@ -2077,11 +2384,11 @@ class TestGenerateAppSettingsMultiApp:
         assert "tier-2" in countries
 
 
-class TestGenerateAppSettingsNetworkUnchanged:
-    """Verify generate_app_settings does NOT write the networks file."""
+class TestGenerateAppSettingsNetworkFile:
+    """Verify generate_app_settings writes shared networks.yaml, not per-app files."""
 
-    def test_no_networks_file_written(self, tmp_path: Path) -> None:
-        """generate_app_settings does not write any networks file."""
+    def test_no_per_app_networks_file_written(self, tmp_path: Path) -> None:
+        """generate_app_settings does not write per-app networks file."""
         settings_dir = tmp_path / "settings"
         settings_dir.mkdir()
 
@@ -2100,8 +2407,29 @@ class TestGenerateAppSettingsNetworkUnchanged:
 
         generate_app_settings(groups, profile, settings_dir=str(settings_dir))
 
-        # No networks file
+        # No per-app networks file
         assert not (settings_dir / "hexar-ios-networks.yaml").exists()
+        # Shared networks.yaml IS written (groups have instances)
+        assert (tmp_path / "networks.yaml").exists()
+
+    def test_no_networks_when_no_instances(self, tmp_path: Path) -> None:
+        """generate_app_settings does not write networks.yaml when groups have no instances."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        # No networks.yaml when no groups have instances
         assert not (tmp_path / "networks.yaml").exists()
 
 
@@ -2184,7 +2512,7 @@ class TestGenerateAppSettingsKeyValueFormat:
         yaml = YAML(typ="safe")
         data = yaml.load(settings_dir / "hexar-ios.yaml")
         entry = data["interstitial"][0]
-        assert entry["Tier 2"] == "high-value"
+        assert entry["Tier 2"]["countries"] == "high-value"
 
     def test_catch_all_ref_is_star(self, tmp_path: Path) -> None:
         """Catch-all group gets '*' as group ref."""
@@ -2206,7 +2534,7 @@ class TestGenerateAppSettingsKeyValueFormat:
         yaml = YAML(typ="safe")
         data = yaml.load(settings_dir / "hexar-ios.yaml")
         entry = data["interstitial"][0]
-        assert entry["All Countries"] == "*"
+        assert entry["All Countries"]["countries"] == "*"
 
     def test_catch_all_does_not_create_country_group(self, tmp_path: Path) -> None:
         """Catch-all group does NOT create an entry in countries.yaml."""
@@ -2223,7 +2551,7 @@ class TestGenerateAppSettingsKeyValueFormat:
         ]
         profile = _make_profile()
 
-        _path, messages = generate_app_settings(
+        _path, _net_path, messages = generate_app_settings(
             groups, profile, settings_dir=str(settings_dir)
         )
 
@@ -2250,7 +2578,7 @@ class TestGenerateAppSettingsKeyValueFormat:
         yaml = YAML(typ="safe")
         data = yaml.load(settings_dir / "hexar-ios.yaml")
         entry = data["interstitial"][0]
-        assert entry["Tier 1"] == "US"
+        assert entry["Tier 1"]["countries"] == "US"
 
     def test_multi_country_group_ref_is_hyphenated_name(self, tmp_path: Path) -> None:
         """Auto-naming: multi-country group gets lowercased hyphenated name."""
@@ -2272,7 +2600,173 @@ class TestGenerateAppSettingsKeyValueFormat:
         yaml = YAML(typ="safe")
         data = yaml.load(settings_dir / "hexar-ios.yaml")
         entry = data["interstitial"][0]
-        assert entry["Tier 2"] == "tier-2"
+        assert entry["Tier 2"]["countries"] == "tier-2"
+
+
+class TestWritePerAppSettingsDictFormat:
+    """Verify _write_per_app_settings outputs flow-style {countries: ref, networks: ref} dicts."""
+
+    def test_output_contains_flow_style_countries_key(self, tmp_path: Path) -> None:
+        """Written YAML contains flow-style dict with 'countries' key."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        raw_text = (settings_dir / "hexar-ios.yaml").read_text()
+        assert "{countries:" in raw_text
+
+    def test_output_flow_style_with_network_ref(self, tmp_path: Path) -> None:
+        """Written YAML contains flow-style dict with both countries and networks keys."""
+        from admedi.engine.snapshot import _write_per_app_settings
+
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+        ]
+        group_to_ref = {("Tier 1", frozenset(["US"])): "US"}
+        group_to_network_ref = {("Tier 1", frozenset(["US"]), "interstitial"): "bidding-6"}
+
+        _write_per_app_settings(
+            settings_dir=settings_dir,
+            alias="hexar-ios",
+            groups=groups,
+            group_to_ref=group_to_ref,
+            group_to_network_ref=group_to_network_ref,
+        )
+
+        raw_text = (settings_dir / "hexar-ios.yaml").read_text()
+        assert "{countries: US, networks: bidding-6}" in raw_text
+
+    def test_output_omits_networks_when_none(self, tmp_path: Path) -> None:
+        """Written YAML omits 'networks' key when network ref is None."""
+        from admedi.engine.snapshot import _write_per_app_settings
+
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "All Countries",
+                "adFormat": "interstitial",
+                "countries": ["*"],
+                "position": 1,
+            }),
+        ]
+        group_to_ref = {("All Countries", frozenset(["*"])): "*"}
+        group_to_network_ref = {("All Countries", frozenset(["*"]), "interstitial"): None}
+
+        _write_per_app_settings(
+            settings_dir=settings_dir,
+            alias="hexar-ios",
+            groups=groups,
+            group_to_ref=group_to_ref,
+            group_to_network_ref=group_to_network_ref,
+        )
+
+        raw_text = (settings_dir / "hexar-ios.yaml").read_text()
+        assert "networks" not in raw_text
+        assert "{countries:" in raw_text
+
+    def test_round_trip_dict_format(self, tmp_path: Path) -> None:
+        """Write settings then read back with resolve_app_tiers and verify field values."""
+        from admedi.engine.snapshot import _write_per_app_settings
+
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        # Write shared files for resolve_app_tiers
+        _write_profiles_yaml(tmp_path)
+        yaml = YAML()
+        yaml.default_flow_style = False
+        stream = StringIO()
+        yaml.dump({"US": ["US"]}, stream)
+        (tmp_path / "countries.yaml").write_text(
+            "# countries\n\n" + stream.getvalue(), encoding="utf-8"
+        )
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+            Group.model_validate({
+                "groupName": "All Countries",
+                "adFormat": "interstitial",
+                "countries": ["*"],
+                "position": 2,
+            }),
+        ]
+        group_to_ref = {
+            ("Tier 1", frozenset(["US"])): "US",
+            ("All Countries", frozenset(["*"])): "*",
+        }
+        group_to_network_ref = {
+            ("Tier 1", frozenset(["US"]), "interstitial"): "bidding-6",
+            ("All Countries", frozenset(["*"]), "interstitial"): None,
+        }
+
+        _write_per_app_settings(
+            settings_dir=settings_dir,
+            alias="hexar-ios",
+            groups=groups,
+            group_to_ref=group_to_ref,
+            group_to_network_ref=group_to_network_ref,
+        )
+
+        # Read back and verify
+        tiers = resolve_app_tiers("hexar-ios", settings_dir=str(settings_dir))
+
+        assert len(tiers) == 2
+        by_name = {t.name: t for t in tiers}
+        assert by_name["Tier 1"].network_preset == "bidding-6"
+        assert by_name["Tier 1"].countries == ["US"]
+        assert by_name["All Countries"].network_preset is None
+        assert by_name["All Countries"].countries == ["*"]
+
+    def test_generate_app_settings_no_network_ref(self, tmp_path: Path) -> None:
+        """generate_app_settings (without group_to_network_ref) outputs countries-only dicts."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml_loader = YAML(typ="safe")
+        data = yaml_loader.load(settings_dir / "hexar-ios.yaml")
+        entry = data["interstitial"][0]
+        # Value is a dict with only 'countries' key (no 'networks')
+        assert isinstance(entry["Tier 1"], dict)
+        assert "countries" in entry["Tier 1"]
+        assert "networks" not in entry["Tier 1"]
 
 
 class TestResolveAppTiersMultiKeyDict:
@@ -2358,7 +2852,7 @@ class TestRoundTripIntegration:
         profile = _make_profile()
 
         # Generate settings files (bootstrap mode -- creates shared files)
-        settings_path, messages = generate_app_settings(
+        settings_path, _net_path2, messages = generate_app_settings(
             groups, profile, settings_dir=str(settings_dir)
         )
 
@@ -2744,14 +3238,545 @@ class TestDeadCodeRemoval:
         assert "load_tiers_settings" not in admedi.engine.__all__
 
 
+# ===========================================================================
+# Step 5: generate_app_settings -- network matching and networks.yaml
+# ===========================================================================
+
+
+def _write_networks_yaml(project_root: Path, presets: dict) -> None:
+    """Write a networks.yaml to the project root for incremental pull tests."""
+    yaml = YAML()
+    yaml.default_flow_style = False
+    stream = StringIO()
+    yaml.dump(presets, stream)
+    (project_root / "networks.yaml").write_text(
+        "# Admedi network presets\n\n" + stream.getvalue(), encoding="utf-8"
+    )
+
+
+class TestGenerateAppSettingsFreshPull:
+    """Verify generate_app_settings generates networks.yaml on fresh pull."""
+
+    def test_fresh_pull_creates_networks_yaml(self, tmp_path: Path) -> None:
+        """Fresh pull with instances creates networks.yaml at project root."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+                "instances": [
+                    {"id": 1, "name": "Bidding", "networkName": "Meta", "isBidder": True},
+                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
+                ],
+            }),
+        ]
+        profile = _make_profile()
+
+        _path, net_path, _messages = generate_app_settings(
+            groups, profile, settings_dir=str(settings_dir)
+        )
+
+        assert net_path is not None
+        assert Path(net_path).exists()
+        assert "networks.yaml" in net_path
+
+    def test_fresh_pull_networks_has_preset_entries(self, tmp_path: Path) -> None:
+        """Fresh pull writes preset entries with network and bidder fields."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+                "instances": [
+                    {"id": 1, "name": "Bidding", "networkName": "Meta", "isBidder": True},
+                    {"id": 2, "name": "Default", "networkName": "AppLovin", "isBidder": False, "groupRate": 1.5},
+                ],
+            }),
+        ]
+        profile = _make_profile()
+
+        _path, net_path, _messages = generate_app_settings(
+            groups, profile, settings_dir=str(settings_dir)
+        )
+
+        yaml = YAML(typ="safe")
+        presets = yaml.load(Path(net_path))
+        assert isinstance(presets, dict)
+        assert len(presets) == 1
+
+        preset_name = next(iter(presets))
+        entries = presets[preset_name]
+        assert any(e["network"] == "Meta" and e["bidder"] is True for e in entries)
+        assert any(e["network"] == "AppLovin" and e["bidder"] is False for e in entries)
+
+    def test_fresh_pull_settings_has_network_ref(self, tmp_path: Path) -> None:
+        """Fresh pull writes settings with networks ref pointing to the preset."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+                "instances": [
+                    {"id": 1, "name": "Bidding", "networkName": "Meta", "isBidder": True},
+                ],
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml_loader = YAML(typ="safe")
+        data = yaml_loader.load(settings_dir / "hexar-ios.yaml")
+        entry = data["interstitial"][0]
+        # Should have a networks key pointing to a preset name
+        assert "networks" in entry["Tier 1"]
+        assert isinstance(entry["Tier 1"]["networks"], str)
+
+    def test_fresh_pull_returns_3_tuple(self, tmp_path: Path) -> None:
+        """generate_app_settings returns (str, str | None, list[str])."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+                "instances": [
+                    {"id": 1, "name": "Bidding", "networkName": "Meta", "isBidder": True},
+                ],
+            }),
+        ]
+        profile = _make_profile()
+
+        result = generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        assert isinstance(result, tuple)
+        assert len(result) == 3
+        settings_path, networks_path, messages = result
+        assert isinstance(settings_path, str)
+        assert isinstance(networks_path, str)
+        assert isinstance(messages, list)
+
+    def test_fresh_pull_no_instances_returns_none_networks(self, tmp_path: Path) -> None:
+        """Groups without instances return None for networks_path."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "native",
+                "countries": ["US"],
+                "position": 1,
+            }),
+        ]
+        profile = _make_profile()
+
+        _path, net_path, _messages = generate_app_settings(
+            groups, profile, settings_dir=str(settings_dir)
+        )
+
+        assert net_path is None
+
+
+class TestGenerateAppSettingsIncrementalPull:
+    """Verify incremental pull matches existing presets by signature."""
+
+    def test_incremental_pull_reuses_existing_preset(self, tmp_path: Path) -> None:
+        """When existing networks.yaml has matching preset, reuse its name."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        # Write existing networks.yaml with a preset
+        existing_presets = {
+            "my-custom-name": [
+                {"network": "Meta", "bidder": True},
+                {"network": "ironSource", "bidder": True},
+            ],
+        }
+        _write_networks_yaml(tmp_path, existing_presets)
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+                "instances": [
+                    {"id": 1, "name": "Bidding", "networkName": "Meta", "isBidder": True},
+                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
+                ],
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        # Check settings file references the existing preset name
+        yaml_loader = YAML(typ="safe")
+        data = yaml_loader.load(settings_dir / "hexar-ios.yaml")
+        entry = data["interstitial"][0]
+        assert entry["Tier 1"]["networks"] == "my-custom-name"
+
+        # Check networks.yaml was not duplicated (still has 1 preset)
+        presets = yaml_loader.load(tmp_path / "networks.yaml")
+        assert len(presets) == 1
+        assert "my-custom-name" in presets
+
+    def test_incremental_pull_adds_new_preset(self, tmp_path: Path) -> None:
+        """New waterfall pattern creates a new preset alongside existing ones."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        # Write existing networks.yaml with one preset
+        existing_presets = {
+            "existing-preset": [
+                {"network": "Meta", "bidder": True},
+            ],
+        }
+        _write_networks_yaml(tmp_path, existing_presets)
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+                "instances": [
+                    {"id": 1, "name": "Bidding", "networkName": "UnityAds", "isBidder": True},
+                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
+                ],
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml_loader = YAML(typ="safe")
+        presets = yaml_loader.load(tmp_path / "networks.yaml")
+        # Should have 2 presets: existing + new
+        assert len(presets) == 2
+        assert "existing-preset" in presets
+
+
+class TestGenerateAppSettingsNoInstances:
+    """Verify groups without instances get None network ref."""
+
+    def test_no_instances_omits_networks_key(self, tmp_path: Path) -> None:
+        """Group with no instances omits networks key from settings entry."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Native Group",
+                "adFormat": "native",
+                "countries": ["US"],
+                "position": 1,
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml_loader = YAML(typ="safe")
+        data = yaml_loader.load(settings_dir / "hexar-ios.yaml")
+        entry = data["native"][0]
+        assert "networks" not in entry["Native Group"]
+        assert "countries" in entry["Native Group"]
+
+    def test_mixed_groups_with_and_without_instances(self, tmp_path: Path) -> None:
+        """Mix of groups with and without instances produces correct network refs."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+                "instances": [
+                    {"id": 1, "name": "Bidding", "networkName": "Meta", "isBidder": True},
+                ],
+            }),
+            Group.model_validate({
+                "groupName": "All Countries",
+                "adFormat": "interstitial",
+                "countries": ["*"],
+                "position": 2,
+                # No instances
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml_loader = YAML(typ="safe")
+        data = yaml_loader.load(settings_dir / "hexar-ios.yaml")
+        entries = data["interstitial"]
+        by_name = {next(iter(e)): e[next(iter(e))] for e in entries}
+        assert "networks" in by_name["Tier 1"]
+        assert "networks" not in by_name["All Countries"]
+
+
+class TestGenerateAppSettingsSharedPresets:
+    """Verify groups with identical waterfalls share the same preset."""
+
+    def test_same_waterfall_shares_preset(self, tmp_path: Path) -> None:
+        """Two groups with identical instances share the same network preset name."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+                "instances": [
+                    {"id": 1, "name": "Bidding", "networkName": "Meta", "isBidder": True},
+                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
+                ],
+            }),
+            Group.model_validate({
+                "groupName": "Tier 2",
+                "adFormat": "interstitial",
+                "countries": ["GB"],
+                "position": 2,
+                "instances": [
+                    {"id": 3, "name": "Bidding", "networkName": "Meta", "isBidder": True},
+                    {"id": 4, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
+                ],
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml_loader = YAML(typ="safe")
+        data = yaml_loader.load(settings_dir / "hexar-ios.yaml")
+        entries = data["interstitial"]
+        by_name = {next(iter(e)): e[next(iter(e))] for e in entries}
+        assert by_name["Tier 1"]["networks"] == by_name["Tier 2"]["networks"]
+
+        # Only 1 preset in networks.yaml
+        presets = yaml_loader.load(tmp_path / "networks.yaml")
+        assert len(presets) == 1
+
+    def test_different_waterfalls_get_different_presets(self, tmp_path: Path) -> None:
+        """Two groups with different instances get different preset names."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+                "instances": [
+                    {"id": 1, "name": "Bidding", "networkName": "Meta", "isBidder": True},
+                ],
+            }),
+            Group.model_validate({
+                "groupName": "Tier 2",
+                "adFormat": "interstitial",
+                "countries": ["GB"],
+                "position": 2,
+                "instances": [
+                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
+                ],
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml_loader = YAML(typ="safe")
+        data = yaml_loader.load(settings_dir / "hexar-ios.yaml")
+        entries = data["interstitial"]
+        by_name = {next(iter(e)): e[next(iter(e))] for e in entries}
+        assert by_name["Tier 1"]["networks"] != by_name["Tier 2"]["networks"]
+
+        # 2 presets in networks.yaml
+        presets = yaml_loader.load(tmp_path / "networks.yaml")
+        assert len(presets) == 2
+
+
+class TestGenerateAppSettingsAutoNaming:
+    """Verify auto-naming produces readable preset names."""
+
+    def test_bidders_only_few_uses_plus_names(self, tmp_path: Path) -> None:
+        """<=3 bidders produce plus-joined first-word names (e.g., 'meta+ironsource')."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+                "instances": [
+                    {"id": 1, "name": "Bidding", "networkName": "Meta", "isBidder": True},
+                    {"id": 2, "name": "Bidding", "networkName": "ironSource", "isBidder": True},
+                ],
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml_loader = YAML(typ="safe")
+        presets = yaml_loader.load(tmp_path / "networks.yaml")
+        preset_name = next(iter(presets))
+        assert "+" in preset_name
+        assert "meta" in preset_name.lower()
+
+    def test_bidders_many_uses_count(self, tmp_path: Path) -> None:
+        """>3 bidders produce 'bidding-N' name."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+                "instances": [
+                    {"id": i, "name": f"B{i}", "networkName": name, "isBidder": True}
+                    for i, name in enumerate(
+                        ["Meta", "ironSource", "UnityAds", "AppLovin", "InMobi", "Pangle", "Vungle"],
+                        start=1,
+                    )
+                ],
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml_loader = YAML(typ="safe")
+        presets = yaml_loader.load(tmp_path / "networks.yaml")
+        preset_name = next(iter(presets))
+        assert preset_name == "bidding-7"
+
+    def test_name_collision_resolved_with_suffix(self, tmp_path: Path) -> None:
+        """Name collision appends '-2' suffix."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        # Write existing networks.yaml with a preset that would collide
+        existing_presets = {
+            "meta": [{"network": "Meta", "bidder": True}],
+        }
+        _write_networks_yaml(tmp_path, existing_presets)
+
+        # Create a group whose auto-name would be "meta" but with different signature
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+                "instances": [
+                    {"id": 1, "name": "Bidding", "networkName": "Meta", "isBidder": True},
+                    {"id": 2, "name": "Default", "networkName": "AppLovin", "isBidder": False, "groupRate": 1.0},
+                ],
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml_loader = YAML(typ="safe")
+        presets = yaml_loader.load(tmp_path / "networks.yaml")
+        assert len(presets) == 2
+        # Original name preserved, new one has different name
+        assert "meta" in presets
+        # The new preset has a name that doesn't collide with "meta"
+        new_name = [n for n in presets if n != "meta"][0]
+        assert new_name != "meta"
+
+    def test_networks_yaml_no_root_key_wrapper(self, tmp_path: Path) -> None:
+        """networks.yaml uses top-level preset keys (no root key wrapper)."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+                "instances": [
+                    {"id": 1, "name": "Bidding", "networkName": "Meta", "isBidder": True},
+                ],
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml_loader = YAML(typ="safe")
+        presets = yaml_loader.load(tmp_path / "networks.yaml")
+        # Top-level keys should be preset names, not "presets" wrapper
+        assert "presets" not in presets
+        assert any(isinstance(v, list) for v in presets.values())
+
+    def test_manual_rate_preserved_in_preset(self, tmp_path: Path) -> None:
+        """Manual instance rate is preserved in the preset entry."""
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+
+        groups = [
+            Group.model_validate({
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+                "instances": [
+                    {"id": 1, "name": "Bidding", "networkName": "Meta", "isBidder": True},
+                    {"id": 2, "name": "Default", "networkName": "AppLovin", "isBidder": False, "groupRate": 1.5},
+                ],
+            }),
+        ]
+        profile = _make_profile()
+
+        generate_app_settings(groups, profile, settings_dir=str(settings_dir))
+
+        yaml_loader = YAML(typ="safe")
+        presets = yaml_loader.load(tmp_path / "networks.yaml")
+        preset_name = next(iter(presets))
+        entries = presets[preset_name]
+        manual = [e for e in entries if not e["bidder"]][0]
+        assert manual["rate"] == 1.5
+
+
 class TestEngineExportsCorrectness:
     """Verify engine/__init__.py exports are complete and correct."""
 
-    def test_engine_all_has_seven_entries(self) -> None:
-        """Engine __all__ has exactly 7 entries."""
+    def test_engine_all_has_nine_entries(self) -> None:
+        """Engine __all__ has exactly 9 entries."""
         import admedi.engine
 
-        assert len(admedi.engine.__all__) == 7
+        assert len(admedi.engine.__all__) == 9
 
     def test_engine_exports_all_expected_names(self) -> None:
         """Engine __all__ contains all expected names."""
@@ -2761,8 +3786,10 @@ class TestEngineExportsCorrectness:
             "Applier",
             "ConfigEngine",
             "Profile",
+            "SyncScope",
             "compute_diff",
             "load_country_groups",
+            "load_network_presets",
             "load_profiles",
             "resolve_app_tiers",
         }
