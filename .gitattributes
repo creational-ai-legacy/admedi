@@ -6,3 +6,6 @@ docs/** filter=git-crypt diff=git-crypt
 docs/**/** filter=git-crypt diff=git-crypt
 settings/** filter=git-crypt diff=git-crypt
 snapshots/** filter=git-crypt diff=git-crypt
+profiles.yaml filter=git-crypt diff=git-crypt
+.session-agents/** filter=git-crypt diff=git-crypt
+.session-agents/**/** filter=git-crypt diff=git-crypt
