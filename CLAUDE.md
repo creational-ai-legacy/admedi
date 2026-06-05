@@ -42,3 +42,11 @@ When using Mission Control MCP tools (`mcp__mission-control__*`) to manage tasks
 - **Read 2nd:** `get_guide(name="MCP_TOOLS_REFERENCE")` - Complete tool parameters
 
 ---
+
+## Session Agents
+
+This project uses session agents — see `.session-agents/agents.md` for the roster. Activation model and standard role definitions live in the `session-agents` skill at `~/.claude/skills/session-agents/`.
+
+**Utility pane completion protocol:** Utility panes ack work via doorbell — `comms reply` (emits `[--reply]`) when you want completion confirmation, `comms no-reply` (emits `[--no-reply]`) when you don't. On `[--reply]` receipt the `/comms` command (1) **TaskCreates the reply as Protocol-step 0** with subject `[protocol] fire reply to <sender>` and description = the exact `comms no-reply <sender> -m "<task> done"` command (this puts the pending reply in CC's task list — the strongest forget-resistant surface the harness offers, addressing the documented "agent forgets reply at turn-end" failure mode), (2) runs the body (executes as slash command if `/`-prefixed, else acknowledges in conversation), (3) fires the doorbell as its final tool call and marks the step-0 task complete. On `[--no-reply]` receipt: same body-execution rule, no reply. No-marker wires fall back to no-reply mode AND emit a one-line conversation diagnostic. See `claude-code/session-agents/commands/comms.md` (deployed to `~/.claude/commands/comms.md`) for canonical protocol mechanics; `SKILL.md` § Persistent behaviors carries the "Fire pending doorbell reply before turn end" anchor.
+
+---

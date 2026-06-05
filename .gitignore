@@ -49,6 +49,3 @@ docs-main
 # Runtime data (snapshots, logs from live API calls)
 .admedi/
 *_snapshot.yaml
-
-# Nested separate git repo (own repo: mochibits/levelplay-revenue-export)
-/levelplay-revenue-export/
