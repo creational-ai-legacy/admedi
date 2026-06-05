@@ -508,8 +508,9 @@ def _compare_waterfall(
                 )
 
     # Check for extra live instances not in preset (informational only).
-    # adSourcePriority PUT reorders instances but cannot remove them --
-    # instance removal requires the LevelPlay dashboard.
+    # adSourcePriority PUT reorders/adds only; instance removal IS possible via
+    # Groups v4 PUT (omit the id from the group's instances[]) -- not yet
+    # implemented here (see core-remove-instances).
     for idx, inst in enumerate(live_instances):
         if idx not in matched_live_indices:
             inst_desc = (
@@ -525,8 +526,7 @@ def _compare_waterfall(
                     new_value=None,
                     description=(
                         f"Waterfall: {inst_desc} is in live but not in "
-                        f"preset (cannot be removed via API -- manage "
-                        f"in LevelPlay dashboard)"
+                        f"preset (not yet auto-removed by admedi)"
                     ),
                 )
             )

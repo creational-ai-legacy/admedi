@@ -943,6 +943,13 @@ class LevelPlayAdapter(MediationAdapter):
     async def get_instances(self, app_key: str) -> list[Instance]:
         """Get all ad network instances for an app from the Instances API.
 
+        .. note::
+            Deprecated path / currently unused. v3 and v1 are sunset
+            (March 2025); production reads instances from Groups v4
+            (``group.instances``). Repoint to Instances v4
+            (``/levelPlay/network/instances/v4/{appKey}/``) if a standalone
+            instance read is ever needed.
+
         Uses v3 as the primary endpoint and falls back to v1 if v3 returns
         a 404 (``ApiError`` with ``status_code=404``). Field names from
         the API response are normalized to match the ``Instance`` model
@@ -991,9 +998,11 @@ class LevelPlayAdapter(MediationAdapter):
                     if v1_exc.status_code in (404, 410):
                         logger.warning(
                             "Instances v1 also returned %d for app '%s'. "
-                            "Standalone Instances API is unavailable — "
-                            "instance data is only available embedded in "
-                            "Groups v4 responses.",
+                            "Instances v3/v1 are deprecated (March 2025); admedi "
+                            "reads instances from Groups v4 (group.instances). "
+                            "The standalone Instances v4 API "
+                            "(/levelPlay/network/instances/v4) is the upgrade "
+                            "path if a direct instance read is ever needed.",
                             v1_exc.status_code,
                             app_key,
                         )

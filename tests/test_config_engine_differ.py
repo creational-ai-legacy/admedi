@@ -1086,7 +1086,7 @@ class TestWaterfallExtraManual:
     """Extra manual instance in live not in preset is flagged as informational."""
 
     def test_extra_manual_instance_informational(self) -> None:
-        """Live has a manual instance not in preset -- informational FieldChange (cannot remove via API)."""
+        """Live has a manual instance not in preset -- informational FieldChange (not yet auto-removed)."""
         preset = [{"network": "Meta", "bidder": True}]
         presets = {"standard": preset}
 
@@ -1111,7 +1111,7 @@ class TestWaterfallExtraManual:
         ]
         assert len(waterfall_changes) == 1
         assert "ironSource" in waterfall_changes[0].description
-        assert "cannot be removed via API" in waterfall_changes[0].description
+        assert "not yet auto-removed" in waterfall_changes[0].description
 
 
 class TestWaterfallRateChange:
