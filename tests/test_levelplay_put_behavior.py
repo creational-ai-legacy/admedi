@@ -25,7 +25,7 @@ import logging
 import pytest
 
 from admedi.adapters.levelplay import LevelPlayAdapter, load_credential_from_env
-from admedi.constants import GROUPS_V4_URL, MEDIATION_MGMT_V2_URL
+from admedi.constants import GROUPS_V4_URL
 from admedi.exceptions import AuthError
 
 logger = logging.getLogger(__name__)
@@ -396,7 +396,7 @@ class TestLevelPlayPutBehavior:
         group_id: int,
         headers: dict[str, str],
     ) -> None:
-        """Attempt to delete a throwaway group. Try v4 DELETE, then v2 fallback."""
+        """Attempt to delete a throwaway group via the Groups v4 DELETE endpoint."""
         # v4 DELETE with correct payload: {"ids": [groupId]}
         # Discovered 2026-03-12: API expects {"ids": [int]} not [{"groupId": int}]
         try:
@@ -412,20 +412,5 @@ class TestLevelPlayPutBehavior:
             print(f"  Cleanup: v4 DELETE returned {del_resp.status_code}: {del_resp.text[:200]}")
         except Exception as exc:
             print(f"  Cleanup: v4 DELETE failed: {exc}")
-
-        # Fallback: try v2 DELETE
-        try:
-            del_resp = await adapter._client.request(
-                "DELETE",
-                MEDIATION_MGMT_V2_URL,
-                params={"appKey": app_key, "groupId": str(group_id)},
-                headers=headers,
-            )
-            if del_resp.status_code in (200, 204):
-                print(f"  Cleanup: deleted group {group_id} via v2 DELETE")
-                return
-            print(f"  Cleanup: v2 DELETE returned {del_resp.status_code}: {del_resp.text[:200]}")
-        except Exception as exc:
-            print(f"  Cleanup: v2 DELETE failed: {exc}")
 
         print(f"  WARNING: Could not delete test group {group_id}. Manual cleanup required.")

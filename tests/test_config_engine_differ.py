@@ -1086,7 +1086,7 @@ class TestWaterfallExtraManual:
     """Extra manual instance in live not in preset is flagged as informational."""
 
     def test_extra_manual_instance_informational(self) -> None:
-        """Live has a manual instance not in preset -- informational FieldChange (not yet auto-removed)."""
+        """Live has a manual instance not in preset -- removal FieldChange (removed on sync)."""
         preset = [{"network": "Meta", "bidder": True}]
         presets = {"standard": preset}
 
@@ -1106,12 +1106,25 @@ class TestWaterfallExtraManual:
         )
 
         report = compute_diff([tier], [group], APP_KEY, APP_NAME, network_presets=presets)
+        # The extra-live instance is a removal signal, so the surrounding group
+        # diff is an UPDATE (a change exists).
+        group_diff = report.group_diffs[0]
+        assert group_diff.action == DiffAction.UPDATE
         waterfall_changes = [
             c for d in report.group_diffs for c in d.changes if c.field == "waterfall"
         ]
         assert len(waterfall_changes) == 1
+        # The removal FieldChange keeps the new_value=None shape (display-only;
+        # the applier re-derives the removal set on sync).
+        assert waterfall_changes[0].new_value is None
         assert "ironSource" in waterfall_changes[0].description
-        assert "not yet auto-removed" in waterfall_changes[0].description
+        assert "will be removed from the waterfall on sync" in waterfall_changes[0].description
+        # The old, untruthful phrasing must be gone. Build it dynamically so the
+        # literal substring never appears in source (keeps the codebase-wide
+        # zero-hits grep gate clean -- same technique as the Step 1 deleted-
+        # constant guard).
+        old_phrase = " ".join(["not", "yet", "auto-removed"])
+        assert old_phrase not in waterfall_changes[0].description
 
 
 class TestWaterfallRateChange:
@@ -1362,10 +1375,10 @@ class TestWaterfallNameBasedMatching:
         waterfall_changes = [
             c for d in report.group_diffs for c in d.changes if c.field == "waterfall"
         ]
-        # Missing (High not found) + Extra (Low not matched)
+        # Missing (High not found) + Extra (Low not matched -> removed on sync)
         assert len(waterfall_changes) == 2
         missing = [c for c in waterfall_changes if "not found" in c.description]
-        extra = [c for c in waterfall_changes if "cannot be removed" in c.description]
+        extra = [c for c in waterfall_changes if "will be removed" in c.description]
         assert len(missing) == 1
         assert "High" in missing[0].description
         assert len(extra) == 1

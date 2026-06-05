@@ -23,15 +23,12 @@ APPS_URL: str = f"{LEVELPLAY_BASE_URL}/partners/publisher/applications/v6"
 GROUPS_V4_URL: str = f"{LEVELPLAY_BASE_URL}/levelPlay/groups/v4"
 """LevelPlay Groups API v4 endpoint (per-app mediation groups)."""
 
-MEDIATION_MGMT_V2_URL: str = f"{LEVELPLAY_BASE_URL}/partners/publisher/mediation/management/v2"
-"""Legacy Mediation Management v2 endpoint."""
+INSTANCES_V4_URL: str = f"{LEVELPLAY_BASE_URL}/levelPlay/network/instances/v4"
+"""LevelPlay Instances API v4 endpoint (the supported standalone instances API).
 
-INSTANCES_V1_URL: str = f"{LEVELPLAY_BASE_URL}/partners/publisher/instances/v1"
-"""Standalone Instances API v1 endpoint (returns 410 Gone as of 2026-03)."""
-
-INSTANCES_V3_URL: str = f"{LEVELPLAY_BASE_URL}/partners/publisher/instances/v3"
-"""Standalone Instances API v3 endpoint (returns 410 Gone as of 2026-03).
-Instance data is now only available embedded in Groups v4 responses."""
+The ``appKey`` is passed as a **path segment** with a trailing slash:
+``f"{INSTANCES_V4_URL}/{app_key}/"`` (NOT a ``?appKey=`` query param). Supersedes
+the sunset v3/v1 endpoints (now ``410 Gone``)."""
 
 PLACEMENTS_URL: str = f"{LEVELPLAY_BASE_URL}/partners/publisher/placements/v1"
 """Placements API v1 endpoint."""

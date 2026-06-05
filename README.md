@@ -1,18 +1,18 @@
 # admedi
 
-Define ad mediation tiers in YAML, diff against live configs, and sync across your entire app portfolio in one command.
+Define ad mediation tiers and waterfalls as YAML, diff against live LevelPlay configs, and sync across your entire app portfolio in one command.
 
-* `admedi show --app <key>` — inspect live mediation groups with waterfall details, saves both a full-fidelity snapshot and modular settings
-* `admedi audit` — diff your YAML template against live LevelPlay configs, report drift per app
-* `admedi sync <source> [dest]` — sync settings to live LevelPlay configs: creates, updates, and deletes groups to match the source
+* `admedi pull --app <alias>` — fetch live mediation groups, render them as tables, and write per-app settings + a full-fidelity snapshot
+* `admedi audit` — diff your settings against live LevelPlay configs, report drift per app (exit 1 on drift, for CI gating)
+* `admedi sync <source> [dest]` — reconcile live groups to your settings: create, update, **and delete** groups (and remove networks from waterfalls) to make live match
 * `admedi status` — group counts, platforms, and last sync times at a glance
-* `profiles.yaml` aliases — use `--app mygame-ios` instead of `--app abc123def`
+* Config-as-code in four files — `profiles.yaml` (app identity), `countries.yaml` (shared country groups), `settings/<alias>.yaml` (per-app tiers), `networks.yaml` (shared waterfall presets)
 
 ## Table of Contents
 
 - [Getting started](#getting-started)
 - [Configuration](#configuration)
-- [Show](#show)
+- [Pull](#pull)
 - [Audit](#audit)
 - [Sync](#sync)
 - [Status](#status)
@@ -24,13 +24,13 @@ Define ad mediation tiers in YAML, diff against live configs, and sync across yo
 Requires Python 3.14+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-pip install git+https://github.com/creational-ai/admedi
+pip install git+https://github.com/creational-ai-legacy/admedi
 ```
 
 Or clone for development:
 
 ```bash
-git clone https://github.com/creational-ai/admedi.git
+git clone https://github.com/creational-ai-legacy/admedi.git
 cd admedi
 uv sync
 ```
@@ -48,145 +48,163 @@ LEVELPLAY_REFRESH_TOKEN=your_refresh_token_here
 
 Verify the install:
 
-```bash
+```
 $ admedi --help
 
-Usage: admedi [OPTIONS] COMMAND [ARGS]...
+ Usage: admedi [OPTIONS] COMMAND [ARGS]...
 
  Config-driven ad mediation management
 
 ╭─ Commands ───────────────────────────────────────────────────────────────────╮
-│ show    Show live mediation settings for an app.                             │
-│ audit   Audit the portfolio for drift against the tier template.             │
+│ pull    Pull live mediation settings for an app.                             │
+│ audit   Audit the portfolio for drift against per-app settings.              │
 │ sync    Sync settings to live LevelPlay mediation groups.                    │
 │ status  Show current portfolio status.                                       │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
-> Get credentials from the ironSource / Unity LevelPlay dashboard under API Keys.
+> Get credentials from the ironSource / Unity LevelPlay dashboard under API Keys. Every command loads them from the environment or `.env`; a missing key exits with code 2 and a clear message.
 
 ## Configuration
 
-### Tier template
+admedi reads four YAML files from the working directory. There is no monolithic template — each file owns one concern, and per-app settings reference the shared files by name.
 
-The tier template (`admedi.yaml` by default) defines your desired mediation state. Every command that operates on the portfolio reads from this file.
+### `profiles.yaml` — app identity
 
-```yaml
-schema_version: 1
-mediator: levelplay
-
-portfolio:
-  - app_key: "abc123def"
-    name: "My Game iOS"
-    platform: iOS
-  - app_key: "def456ghi"
-    name: "My Game Android"
-    platform: Android
-
-tiers:
-  # Position 1 = highest priority, checked first by the SDK
-  - name: "Tier 1"
-    countries: ["US"]
-    position: 1
-    ad_formats: [interstitial, rewarded]
-
-  - name: "Tier 2"
-    countries: ["AU", "CA", "DE", "GB", "JP", "NZ", "KR", "TW"]
-    position: 2
-    ad_formats: [interstitial, rewarded]
-
-  - name: "Tier 3"
-    countries: ["FR", "NL"]
-    position: 3
-    ad_formats: [interstitial, rewarded]
-
-  # Exactly one tier must be is_default: true
-  - name: "All Countries"
-    countries: ["*"]         # "*" = catch-all for unassigned countries
-    position: 4
-    is_default: true
-    ad_formats: [banner, interstitial, rewarded, native]
-```
-
-Each tier is scoped per `ad_formats` — a tier with `[interstitial, rewarded]` creates separate mediation groups for each format in LevelPlay. Country codes are ISO 3166-1 alpha-2.
-
-### Profiles
-
-`profiles.yaml` maps short aliases to LevelPlay app keys, so you can use `--app mygame-ios` instead of `--app abc123def`:
+The single source of truth mapping a short alias to its LevelPlay app key, name, and platform. Every `--app`/`SOURCE`/`DESTINATION` value is a profile alias (raw app keys are not accepted).
 
 ```yaml
 profiles:
-  mygame-ios: "abc123def"
-  mygame-android: "def456ghi"
+  ss-ios:
+    app_key: "1f93a90ad"
+    app_name: "Shelf Sort - Organize & Match"
+    platform: iOS
+  ss-google:
+    app_key: "1f93aca35"
+    app_name: "Shelf Sort - Organize & Match"
+    platform: Android
 ```
 
-All `--app` flags across every command accept either a profile alias or a raw app key.
+### `countries.yaml` — shared country groups
 
-## Show
+Named country groups, referenced by per-app settings. Country codes are ISO 3166-1 alpha-2.
 
-Inspect an app's live mediation settings, organized by ad format with waterfall details. Produces dual output from a single API fetch: a full-fidelity raw snapshot and derived modular settings.
+```yaml
+US:
+- US
+tier-2:
+- AU
+- CA
+- DE
+- FR
+- GB
+- JP
+- KR
+- NL
+- NZ
+- SA
+- TW
+```
+
+### `settings/<alias>.yaml` — per-app tiers
+
+One file per app (written by `admedi pull`, edited by you, read by `admedi sync`). Each ad format lists its groups in priority order; each group names a country group from `countries.yaml` and a waterfall preset from `networks.yaml`. The `networks` key is optional.
+
+```yaml
+alias: ss-ios
+banner:
+- All Countries: {countries: '*', networks: bidding-6-2}
+interstitial:
+- Tier 1: {countries: US, networks: bidding-6-applovin}
+- Tier 2: {countries: tier-2, networks: bidding-6-applovin}
+- All Countries: {countries: '*', networks: bidding-6-applovin}
+rewarded:
+- Tier 1: {countries: US, networks: bidding-6-applovin}
+- Tier 2: {countries: tier-2, networks: bidding-6-applovin}
+- All Countries: {countries: '*', networks: bidding-6-applovin}
+```
+
+`countries: '*'` is the catch-all for unassigned countries. The same group name across formats (e.g. `Tier 1`) creates a separate LevelPlay group per format.
+
+### `networks.yaml` — shared waterfall presets
+
+Named waterfall presets reused across apps, so a network change is one edit that propagates portfolio-wide. Each entry is a network with `bidder: true|false`; manual (non-bidder) entries may carry a `rate`, and a network with multiple instances disambiguates with `name`.
+
+```yaml
+bidding-6-applovin:
+- network: Google
+  bidder: true
+- network: InMobi
+  bidder: true
+- network: Meta
+  bidder: true
+- network: ironSource
+  bidder: true
+- network: AppLovin
+  bidder: false
+  rate: 1.0
+```
+
+**Resolution:** `settings/<alias>.yaml` → `countries.yaml` (group → country list) + `networks.yaml` (preset → waterfall) → the desired live state for that app.
+
+## Pull
+
+Fetch an app's live mediation groups, render them by ad format, and write per-app settings + a snapshot. Groups are matched to existing tier definitions by country content, so re-pulling preserves your tier names.
 
 ```
-$ admedi show --app mygame-ios
+$ admedi pull --app ss-ios
 
 ╭─────────────────────────────────── admedi ───────────────────────────────────╮
-│ My Game                                                                      │
-│ Platform: iOS  Key: abc123def  Groups: 8                                     │
+│ Shelf Sort - Organize & Match                                                │
+│ Platform: iOS  Key: 1f93a90ad  Groups: 8                                     │
 ╰──────────────────────────────────────────────────────────────────────────────╯
-                                     banner
-╭─────┬───────────────┬───────────┬────────────────────────────────────────────╮
-│   # │ Group         │ Countries │ Waterfall                                  │
-├─────┼───────────────┼───────────┼────────────────────────────────────────────┤
-│   1 │ All Countries │ * (all)   │ Bidding: AdColony, AdMob, UnityAds         │
-╰─────┴───────────────┴───────────┴────────────────────────────────────────────╯
                                   interstitial
 ╭─────┬───────────────┬────────────────────────────┬───────────────────────────╮
 │   # │ Group         │ Countries                  │ Waterfall                 │
 ├─────┼───────────────┼────────────────────────────┼───────────────────────────┤
-│   1 │ Tier 1        │ US                         │ Bidding: AdColony, AdMob, │
-│     │               │                            │ Meta, Pangle, UnityAds    │
-│     │               │                            │ Manual:  AppLovin @ $2.00 │
+│   1 │ Tier 1        │ US                         │ Bidding: Google, InMobi,  │
+│     │               │                            │ Meta, UnityAds, ironSource│
+│     │               │                            │ Manual:  AppLovin @ $1.00 │
 ├─────┼───────────────┼────────────────────────────┼───────────────────────────┤
-│   2 │ Tier 2        │ AU, CA, DE, GB, JP, KR,    │ Bidding: AdColony, AdMob, │
-│     │               │ NZ, TW                     │ Meta, Pangle, UnityAds    │
+│   2 │ Tier 2        │ AU, CA, DE, FR, GB, JP,    │ Bidding: Google, InMobi,  │
+│     │               │ KR, NL, NZ, SA, TW         │ Meta, UnityAds, ironSource│
 ├─────┼───────────────┼────────────────────────────┼───────────────────────────┤
-│   3 │ Tier 3        │ FR, NL                     │ Bidding: AdColony, AdMob, │
-│     │               │                            │ Meta, Pangle, UnityAds    │
-├─────┼───────────────┼────────────────────────────┼───────────────────────────┤
-│   4 │ All Countries │ * (all)                    │ Bidding: AdColony, AdMob, │
-│     │               │                            │ Meta, Pangle, UnityAds    │
+│   3 │ All Countries │ * (all)                    │ Bidding: Google, InMobi,  │
+│     │               │                            │ Meta, UnityAds, ironSource│
 ╰─────┴───────────────┴────────────────────────────┴───────────────────────────╯
-  ... (rewarded, native tables follow the same pattern)
+  ... (banner, rewarded, native tables follow the same pattern)
 
-Snapshot saved to: snapshots/mygame-ios.yaml
-Settings saved to: settings/mygame-ios.yaml
+Snapshot saved to: snapshots/ss-ios.yaml
+Settings saved to: settings/ss-ios.yaml
+Networks saved to: networks.yaml
 ```
 
-Two outputs are saved:
+Three outputs are written from a single fetch:
 
-- **Snapshot** (`snapshots/{alias}.yaml`) — full-fidelity capture of live API data (group IDs, instance IDs, rates, floor prices, A/B test state). Lossless round-trip via Pydantic `model_dump`/`model_validate`.
-- **Settings** (`settings/`) — derived modular view with per-app files: `{alias}.yaml` (tier names + waterfall refs), `{alias}-tiers.yaml` (country groupings), and `{alias}-networks.yaml` (waterfall presets).
+- **Snapshot** (`snapshots/<alias>.yaml`) — full-fidelity capture of live API data (group IDs, instance IDs, rates, floor prices, A/B state). Lossless Pydantic round-trip. `snapshots/` is gitignored (ephemeral; regenerated by `pull`).
+- **Settings** (`settings/<alias>.yaml`) — the editable per-app tier file (tracked).
+- **Networks** (`networks.yaml`) — shared waterfall presets, merged across pulls.
 
-> The `--output` flag overrides the settings file path only. Snapshots always write to `snapshots/`.
+> `--output` overrides the per-app settings file path only. The snapshot always writes to `snapshots/`, and `networks.yaml` is always shared.
 
 | Flag | Purpose |
 |------|---------|
-| `--app` | App key or profile alias (required) |
-| `--output`, `-o` | Override settings file path |
+| `--app` | Profile alias from `profiles.yaml` (required) |
+| `--output`, `-o` | Override the per-app settings file path |
 
 ## Audit
 
-Compare your tier template against live LevelPlay configs and report drift per app.
+Compare your per-app settings against live LevelPlay configs and report drift per app. Read-only — no writes.
 
 ```
 $ admedi audit
 
-              Audit Results
-┏━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━┓
-┃ App           ┃ Status ┃ Issues      ┃
-┡━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━┩
-│ My Game iOS   │ DRIFT  │ 1 to update │
-└───────────────┴────────┴─────────────┘
+         Audit Results
+┏━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━┓
+┃ App              ┃ Status ┃ Issues      ┃
+┡━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━┩
+│ Shelf Sort …     │ DRIFT  │ 1 to update │
+└──────────────────┴────────┴─────────────┘
 
 1 change(s) across 1 app(s)
 ```
@@ -196,12 +214,12 @@ When everything matches:
 ```
 $ admedi audit
 
-              Audit Results
-┏━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━━┓
-┃ App           ┃ Status ┃ Issues          ┃
-┡━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━━┩
-│ My Game iOS   │ OK     │ All groups match│
-└───────────────┴────────┴─────────────────┘
+         Audit Results
+┏━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━━┓
+┃ App              ┃ Status ┃ Issues          ┃
+┡━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━━┩
+│ Shelf Sort …     │ OK     │ All groups match│
+└──────────────────┴────────┴─────────────────┘
 
 All apps in sync.
 ```
@@ -209,132 +227,148 @@ All apps in sync.
 Filter to a single app:
 
 ```bash
-admedi audit --app mygame-ios
+admedi audit --app ss-ios
 ```
 
-> Exit code 0 = no drift. Exit code 1 = drift detected. Use this in CI to gate deployments.
+> Exit code 0 = no drift, 1 = drift detected, 2 = error. Use the exit code in CI to gate deployments.
 
 | Flag | Purpose |
 |------|---------|
-| `--config` | Path to YAML tier template (default: `admedi.yaml`) |
-| `--app` | Filter to a specific app key or profile alias |
+| `--app` | Filter to a specific profile alias (default: all apps in `profiles.yaml`) |
 | `--format` | `text` (default) or `json` |
 
 ## Sync
 
-Sync settings to live LevelPlay mediation groups. The source app's settings files (generated by `admedi show`) define the desired state — sync creates, updates, and deletes groups to make the destination match.
+Reconcile live LevelPlay groups to a source app's settings. `SOURCE` defines the desired state; `DESTINATION` is the app to write to (defaults to `SOURCE` for self-sync). Sync **creates, updates, and deletes** groups — and removes networks from waterfalls — to make live match. `--dry-run` is the single safety gate.
 
 ```
-$ admedi sync mygame-ios --dry-run
+$ admedi sync ss-ios --dry-run
 
-                          Sync Preview
-┏━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃ App           ┃ Group  ┃ Change                                  ┃
-┡━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-│ My Game iOS   │ Tier 2 │ UPDATE: Countries: added NZ; removed NL │
-└───────────────┴────────┴─────────────────────────────────────────┘
+           Sync Preview
+┏━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ App              ┃ Group  ┃ Change                                  ┃
+┡━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ Shelf Sort …     │ Tier 2 │ UPDATE: Countries: added NZ; removed NL │
+└──────────────────┴────────┴─────────────────────────────────────────┘
 
 1 change(s) will be applied (0 create, 1 update, 0 delete)
 ```
 
-Without `--dry-run`, sync applies directly:
+Without `--dry-run`, sync applies and prints an apply summary:
 
 ```
-$ admedi sync mygame-ios
+$ admedi sync ss-ios
 
-                          Sync Preview
-┏━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃ App           ┃ Group  ┃ Change                                  ┃
-┡━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-│ My Game iOS   │ Tier 2 │ UPDATE: Countries: added NZ; removed NL │
-└───────────────┴────────┴─────────────────────────────────────────┘
+           ... (Sync Preview as above) ...
 
-1 change(s) will be applied (0 create, 1 update, 0 delete)
-
-              Apply Results
-┏━━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┓
-┃ App           ┃ Status  ┃ Created ┃ Updated ┃ Deleted ┃
-┡━━━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━┩
-│ My Game iOS   │ SUCCESS │       0 │       1 │       0 │
-└───────────────┴─────────┴─────────┴─────────┴─────────┘
+        Apply Results
+┏━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┓
+┃ App              ┃ Status  ┃ Created ┃ Updated ┃ Deleted ┃
+┡━━━━━━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━┩
+│ Shelf Sort …     │ SUCCESS │       0 │       1 │       0 │
+└──────────────────┴─────────┴─────────┴─────────┴─────────┘
 
 Summary: 1 success, 0 skipped, 0 failed
 ```
 
-Cross-app sync — apply one app's settings to a different app. Groups on the destination that don't exist in the source are deleted:
+### Deprecating a network
+
+Drop a network from a preset in `networks.yaml`, then sync each affected app — admedi removes that network from every live waterfall it appears in (across all formats and tiers), including default instances. Removal rides the existing `sync` path; no special flag.
 
 ```
-$ admedi sync mygame-ios mygame-android --dry-run
+$ admedi sync ss-google --dry-run
 
-                          Sync Preview
-┏━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃ App                   ┃ Group  ┃ Change                            ┃
-┡━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-│ My Game Android       │ Tier 2 │ UPDATE: Countries: added NZ       │
-│                       │ Tier 3 │ DELETE                            │
-└───────────────────────┴────────┴───────────────────────────────────┘
+                                  Sync Preview
+┃ App                           ┃ Group         ┃ Change
+│ Shelf Sort - Organize & Match │ Tier 1        │ UPDATE: Waterfall: InMobi (bidder)
+│                               │               │ is in live but not in preset (will be
+│                               │               │ removed from the waterfall on sync)
+│                               │ Tier 2        │ UPDATE: Waterfall: InMobi (bidder) …
+│                               │ All Countries │ UPDATE: Waterfall: InMobi (bidder) …
 
-2 change(s) will be applied (0 create, 1 update, 1 delete)
+3 change(s) will be applied (0 create, 3 update, 0 delete)
 ```
 
-> The sync pipeline has layered safety guards: dry-run preview before applying, pre-write snapshot of live state, A/B test detection (skips apps with active A/B tests), per-app isolation (one app failing doesn't affect others), and post-write verification via follow-up GET.
+### Scoped sync
+
+Pass no scope flag for a full sync (tiers + networks). Pass `--tiers` and/or `--networks` to narrow what is reconciled.
+
+```bash
+admedi sync ss-ios --tiers      # tier/country groups only
+admedi sync ss-ios --networks   # waterfall membership/ordering only
+```
+
+### Cross-app sync
+
+Apply one app's settings to a different app. Groups on the destination that aren't in the source are deleted:
+
+```bash
+admedi sync ss-ios ss-google --dry-run
+```
+
+> The sync pipeline has layered safety guards: dry-run preview, a pre-write snapshot of live state, A/B test detection (apps with an active A/B test are skipped wholesale), per-app isolation (one app failing doesn't affect others), abort-on-ambiguity for waterfall resolution, and post-write verification via a follow-up GET. Exit code 0 = applied or no drift, 1 = drift detected under `--dry-run`, 2 = error.
 
 | Argument / Flag | Purpose |
 |-----------------|---------|
-| `SOURCE` | App alias whose settings files define the desired state (required) |
-| `DESTINATION` | Target app alias to sync against (defaults to SOURCE for self-sync) |
-| `--tiers` | Sync tier definitions (default if no scope flag given) |
-| `--dry-run` | Preview changes without applying |
+| `SOURCE` | Source app alias — its settings define the desired state (required) |
+| `DESTINATION` | Target app alias (defaults to `SOURCE` for self-sync) |
+| `--tiers` | Sync tier/country definitions |
+| `--networks` | Sync network waterfall configurations |
+| `--dry-run` | Preview changes without applying (exits 1 if drift exists) |
 | `--format` | `text` (default) or `json` |
 
 ## Status
 
-Show group counts, platforms, and last sync times for all portfolio apps.
+Group counts, platforms, and last sync times for every app in `profiles.yaml`.
 
 ```
 $ admedi status
 
-                    Portfolio Status (levelplay)
-┏━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━━━┓
-┃ App              ┃ Platform ┃ Groups ┃ Last Sync        ┃
-┡━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━━━┩
-│ My Game          │ iOS      │      8 │ 2026-03-12 14:30 │
-│ My Game          │ Android  │      8 │ Never            │
-└──────────────────┴──────────┴────────┴──────────────────┘
+              Portfolio Status (levelplay)
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━━━┓
+┃ App                          ┃ Platform ┃ Groups ┃ Last Sync        ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━━━┩
+│ Shelf Sort - Organize & Match│ iOS      │      8 │ 2026-06-04 14:30 │
+│ Shelf Sort - Organize & Match│ Android  │      8 │ Never            │
+└──────────────────────────────┴──────────┴────────┴──────────────────┘
 ```
 
 | Flag | Purpose |
 |------|---------|
-| `--config` | Path to YAML tier template (default: `admedi.yaml`) |
 | `--format` | `text` (default) or `json` |
 
 ## Development
 
 ```bash
-git clone https://github.com/creational-ai/admedi.git
+git clone https://github.com/creational-ai-legacy/admedi.git
 cd admedi
-uv sync --extra dev
+uv sync
 ```
 
 ```bash
-# Unit tests (excludes integration tests)
-uv run pytest tests/ -v
+# Unit tests (scope to tests/ — the repo root contains vendored reference repos)
+uv run pytest tests/
 
-# Integration tests (requires credentials)
+# Integration tests (require live credentials; deselected by default)
+set -a; . ./.env; set +a            # export creds into the environment first
 uv run pytest tests/ -m integration -v -s
+uv run pytest tests/integration/    # live shape probes (module-skip without creds)
 
 # Lint and type check
 uv run ruff check src/admedi/
 uv run mypy src/admedi/
 ```
 
+> Integration tests read credentials from the process environment (`os.getenv`), not from `.env` directly. Source `.env` first (`set -a; . ./.env; set +a`) — a bare run silently skips them and looks like a pass.
+
 | Dependency | Purpose |
 |------------|---------|
 | `httpx` | Async HTTP for concurrent multi-app API calls |
 | `pydantic` | Typed models with camelCase alias support |
+| `pyjwt` | LevelPlay JWT auth tokens |
 | `typer` + `rich` | CLI with styled tables and panels |
 | `ruamel.yaml` | Round-trip YAML (preserves comments) |
-| `fastmcp` | MCP server framework |
+| `fastmcp` | MCP server framework (post-core) |
 | `python-dotenv` | `.env` credential loading |
 | `ruff` + `mypy` | Linting and strict type checking |
 | `pytest` + `pytest-asyncio` | Testing |

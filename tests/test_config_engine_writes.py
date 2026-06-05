@@ -613,3 +613,230 @@ class TestUpdateGroupWaterfallPayload:
         assert payload_dict["groupName"] == "Tier 1"
         assert payload_dict["countries"] == ["US", "CA"]
         assert payload_dict["position"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Tests: update_group() with membership_payload (Step 4 -- removal lever)
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateGroupMembershipPayload:
+    """Tests for update_group() with the membership_payload removal lever.
+
+    membership_payload sets the group's ``instances`` array (the trimmed
+    keep-set). When provided, ``segments``/``floorPrice`` are echoed from the
+    passed ``group`` so the server does not strip them. When ``None``, the PUT
+    body is byte-identical to today's waterfall/tier-only update.
+    """
+
+    @staticmethod
+    def _mock_request_returning_group(
+        request_calls: list[tuple[str, str, dict[str, Any] | None]],
+        group_id: int = 555,
+    ):
+        """Build a mock _request side_effect that captures PUT and answers GET."""
+
+        async def mock_request(
+            method: str, url: str, *, json_body: Any = None, **kwargs: Any
+        ) -> Any:
+            request_calls.append((method, url, json_body))
+            if method == "PUT":
+                return {}
+            return [
+                {
+                    "groupId": group_id,
+                    "groupName": "Tier 1",
+                    "adFormat": "interstitial",
+                    "countries": ["US"],
+                    "position": 1,
+                }
+            ]
+
+        return mock_request
+
+    async def test_membership_payload_sets_instances_array_exactly(self) -> None:
+        """PUT body's [0]['instances'] equals exactly the passed membership list."""
+        adapter = _make_adapter()
+        group = _make_group(
+            name="Tier 1", ad_format="interstitial", countries=["US"], position=1
+        )
+
+        # Kept-set: two instances remain, the dropped network's id is absent.
+        membership = [
+            {"id": 101, "name": "Meta-bid", "networkName": "Meta", "isBidder": True},
+            {
+                "id": 202,
+                "name": "AdMob",
+                "networkName": "AdMob",
+                "isBidder": False,
+                "groupRate": 1.5,
+            },
+        ]
+
+        request_calls: list[tuple[str, str, dict[str, Any] | None]] = []
+
+        with patch.object(
+            adapter,
+            "_request",
+            side_effect=self._mock_request_returning_group(request_calls),
+        ):
+            await adapter.update_group(
+                "app123", 555, group, membership_payload=membership
+            )
+
+        put_payload = request_calls[0][2]
+        assert put_payload is not None
+        assert len(put_payload) == 1
+        assert put_payload[0]["instances"] == membership
+        # Exactly the kept ids present; the dropped id (e.g. 303) is absent.
+        assert [entry["id"] for entry in put_payload[0]["instances"]] == [101, 202]
+
+    async def test_membership_payload_echoes_segments_and_floor_price(self) -> None:
+        """When the group carries segments/floor_price, they appear in the PUT body."""
+        adapter = _make_adapter()
+        group = Group.model_validate(
+            {
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+                "floorPrice": 0.75,
+                "segments": [{"id": 5, "name": "whales"}],
+            }
+        )
+
+        membership = [
+            {"id": 101, "name": "Meta-bid", "networkName": "Meta", "isBidder": True},
+        ]
+
+        request_calls: list[tuple[str, str, dict[str, Any] | None]] = []
+
+        with patch.object(
+            adapter,
+            "_request",
+            side_effect=self._mock_request_returning_group(request_calls),
+        ):
+            await adapter.update_group(
+                "app123", 555, group, membership_payload=membership
+            )
+
+        payload_dict = request_calls[0][2][0]  # type: ignore[index]
+        assert payload_dict["instances"] == membership
+        # segments has NO Pydantic alias -- literal key "segments".
+        assert payload_dict["segments"] == [{"id": 5, "name": "whales"}]
+        # floorPrice is the alias for Group.floor_price.
+        assert payload_dict["floorPrice"] == 0.75
+
+    async def test_membership_payload_omits_metadata_when_group_lacks_it(self) -> None:
+        """segments/floorPrice are only echoed when present (non-None) on the group."""
+        adapter = _make_adapter()
+        # _make_group leaves segments=None and floor_price=None.
+        group = _make_group(
+            name="Tier 1", ad_format="interstitial", countries=["US"], position=1
+        )
+
+        membership = [
+            {"id": 101, "name": "Meta-bid", "networkName": "Meta", "isBidder": True},
+        ]
+
+        request_calls: list[tuple[str, str, dict[str, Any] | None]] = []
+
+        with patch.object(
+            adapter,
+            "_request",
+            side_effect=self._mock_request_returning_group(request_calls),
+        ):
+            await adapter.update_group(
+                "app123", 555, group, membership_payload=membership
+            )
+
+        payload_dict = request_calls[0][2][0]  # type: ignore[index]
+        assert payload_dict["instances"] == membership
+        # No echo when the group carries no segments/floor_price.
+        assert "segments" not in payload_dict
+        assert "floorPrice" not in payload_dict
+
+    async def test_membership_payload_none_is_byte_identical_to_today(self) -> None:
+        """Regression guard: membership_payload=None yields no instances/segments/floorPrice keys.
+
+        The PUT body must be byte-identical to today's waterfall/tier-only
+        update so existing PUTs are unaffected.
+        """
+        adapter = _make_adapter()
+        # Group carries segments/floor_price, but with membership_payload=None
+        # neither (nor an instances key) may leak into the PUT body.
+        group = Group.model_validate(
+            {
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+                "floorPrice": 0.75,
+                "segments": [{"id": 5, "name": "whales"}],
+            }
+        )
+
+        request_calls: list[tuple[str, str, dict[str, Any] | None]] = []
+
+        with patch.object(
+            adapter,
+            "_request",
+            side_effect=self._mock_request_returning_group(request_calls),
+        ):
+            await adapter.update_group("app123", 555, group, membership_payload=None)
+
+        payload_dict = request_calls[0][2][0]  # type: ignore[index]
+        # Byte-identical to today's tier-only PUT body.
+        assert payload_dict == {
+            "groupId": 555,
+            "adFormat": "interstitial",
+            "groupName": "Tier 1",
+            "countries": ["US"],
+            "position": 1,
+        }
+        assert "instances" not in payload_dict
+        assert "segments" not in payload_dict
+        assert "floorPrice" not in payload_dict
+
+    async def test_membership_payload_combines_with_waterfall_payload(self) -> None:
+        """membership_payload coexists with waterfall_payload in the same PUT."""
+        adapter = _make_adapter()
+        group = Group.model_validate(
+            {
+                "groupName": "Tier 1",
+                "adFormat": "interstitial",
+                "countries": ["US"],
+                "position": 1,
+                "floorPrice": 0.5,
+            }
+        )
+
+        waterfall = {
+            "bidding": {
+                "tierType": "bidding",
+                "instances": [{"providerName": "Meta", "instanceId": 101}],
+            }
+        }
+        membership = [
+            {"id": 101, "name": "Meta-bid", "networkName": "Meta", "isBidder": True},
+        ]
+
+        request_calls: list[tuple[str, str, dict[str, Any] | None]] = []
+
+        with patch.object(
+            adapter,
+            "_request",
+            side_effect=self._mock_request_returning_group(request_calls),
+        ):
+            await adapter.update_group(
+                "app123",
+                555,
+                group,
+                waterfall_payload=waterfall,
+                membership_payload=membership,
+            )
+
+        payload_dict = request_calls[0][2][0]  # type: ignore[index]
+        assert payload_dict["adSourcePriority"] == waterfall
+        assert payload_dict["instances"] == membership
+        assert payload_dict["floorPrice"] == 0.5

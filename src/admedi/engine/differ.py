@@ -507,10 +507,12 @@ def _compare_waterfall(
                     )
                 )
 
-    # Check for extra live instances not in preset (informational only).
-    # adSourcePriority PUT reorders/adds only; instance removal IS possible via
-    # Groups v4 PUT (omit the id from the group's instances[]) -- not yet
-    # implemented here (see core-remove-instances).
+    # Check for extra live instances not in preset (removal signal).
+    # These instances are present in the live waterfall but absent from the
+    # preset, so they will be removed from the group's waterfall membership on
+    # ``sync`` -- the applier drops each unmatched id from the group's
+    # instances[] array and PUTs the trimmed membership via Groups v4 (it
+    # re-derives this unmatched set itself; this FieldChange is display-only).
     for idx, inst in enumerate(live_instances):
         if idx not in matched_live_indices:
             inst_desc = (
@@ -526,7 +528,7 @@ def _compare_waterfall(
                     new_value=None,
                     description=(
                         f"Waterfall: {inst_desc} is in live but not in "
-                        f"preset (not yet auto-removed by admedi)"
+                        f"preset (will be removed from the waterfall on sync)"
                     ),
                 )
             )

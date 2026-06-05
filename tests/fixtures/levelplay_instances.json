@@ -1,55 +1,57 @@
 [
   {
-    "id": 201,
-    "name": "ironSource Default",
+    "instanceId": 201,
+    "instanceName": "ironSource Default",
     "networkName": "ironSource",
     "isBidder": false,
-    "groupRate": 10.5,
-    "countriesRate": [
-      {"countryCode": "US", "rate": 15.0},
-      {"countryCode": "GB", "rate": 12.0}
-    ],
     "adUnit": "interstitial",
+    "adFormat": "interstitial",
     "isLive": true,
-    "isOptimized": false
+    "isOptimized": false,
+    "groups": [501, 502],
+    "rate": 10,
+    "appConfig1": "MISSING_INSTANCE_CONFIGURATION",
+    "instanceConfig1": "MISSING_INSTANCE_CONFIGURATION"
   },
   {
-    "id": 202,
-    "name": "AdMob Bidding",
+    "instanceId": 202,
+    "instanceName": "AdMob Bidding",
     "networkName": "AdMob",
     "isBidder": true,
-    "groupRate": 8.0,
-    "countriesRate": null,
     "adUnit": "banner",
+    "adFormat": "banner",
     "isLive": true,
-    "isOptimized": true
+    "isOptimized": true,
+    "groups": [],
+    "appConfig1": "app-config-value",
+    "appConfig2": "bidder-only-value",
+    "instanceConfig1": "instance-config-value"
   },
   {
-    "providerName": "Meta",
-    "instanceName": "Meta Audience Network",
     "instanceId": 203,
+    "instanceName": "Meta Audience Network",
+    "networkName": "Meta",
     "isBidder": true,
-    "globalPricing": 12.0,
-    "countriesPricing": [
-      {"country": "US", "eCPM": 20.0},
-      {"country": "CA", "eCPM": 16.5},
-      {"country": "JP", "eCPM": 14.0}
-    ],
     "adUnit": "rewardedVideo",
-    "isLive": "active",
-    "isOptimized": false
+    "adFormat": "rewarded",
+    "isLive": true,
+    "isOptimized": false,
+    "groups": [503],
+    "appConfig1": "MISSING_INSTANCE_CONFIGURATION",
+    "appConfig2": "meta-bidder-value",
+    "instanceConfig1": "MISSING_INSTANCE_CONFIGURATION",
+    "null": "1"
   },
   {
-    "providerName": "Liftoff",
-    "instanceName": "Liftoff Monetize",
     "instanceId": 204,
+    "instanceName": "Liftoff Monetize",
+    "networkName": "Liftoff Monetize",
     "isBidder": false,
-    "globalPricing": 6.5,
-    "countriesPricing": [
-      {"country": "DE", "eCPM": 9.0}
-    ],
     "adUnit": "interstitial",
-    "isLive": "inactive",
-    "isOptimized": false
+    "adFormat": "interstitial",
+    "isLive": false,
+    "isOptimized": false,
+    "groups": [504],
+    "rate": 6
   }
 ]

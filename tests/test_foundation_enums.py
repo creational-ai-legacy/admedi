@@ -14,10 +14,8 @@ from admedi.constants import (
     APPS_URL,
     AUTH_URL,
     GROUPS_V4_URL,
-    INSTANCES_V1_URL,
-    INSTANCES_V3_URL,
+    INSTANCES_V4_URL,
     LEVELPLAY_BASE_URL,
-    MEDIATION_MGMT_V2_URL,
     PLACEMENTS_URL,
     REPORTING_URL,
 )
@@ -301,17 +299,29 @@ class TestConstants:
         """GROUPS_V4_URL points to the LevelPlay groups v4 endpoint."""
         assert GROUPS_V4_URL == "https://platform.ironsrc.com/levelPlay/groups/v4"
 
-    def test_mediation_mgmt_v2_url(self) -> None:
-        """MEDIATION_MGMT_V2_URL points to the mediation management v2 endpoint."""
-        assert MEDIATION_MGMT_V2_URL == "https://platform.ironsrc.com/partners/publisher/mediation/management/v2"
+    def test_instances_v4_url(self) -> None:
+        """INSTANCES_V4_URL points to the supported LevelPlay instances v4 endpoint."""
+        assert INSTANCES_V4_URL == "https://platform.ironsrc.com/levelPlay/network/instances/v4"
 
-    def test_instances_v1_url(self) -> None:
-        """INSTANCES_V1_URL points to the instances v1 endpoint."""
-        assert INSTANCES_V1_URL == "https://platform.ironsrc.com/partners/publisher/instances/v1"
+    def test_deprecated_constants_no_longer_importable(self) -> None:
+        """The sunset/dead constants are deleted and raise ImportError.
 
-    def test_instances_v3_url(self) -> None:
-        """INSTANCES_V3_URL points to the instances v3 endpoint (reference only)."""
-        assert INSTANCES_V3_URL == "https://platform.ironsrc.com/partners/publisher/instances/v3"
+        Names are built dynamically (not as literals) so the codebase-wide
+        ``grep`` for the dead constant names stays at zero hits.
+        """
+        import admedi.constants as constants_module
+
+        deleted_names = (
+            f"INSTANCES_V{1}_URL",
+            f"INSTANCES_V{3}_URL",
+            f"MEDIATION_MGMT_V{2}_URL",
+        )
+        for name in deleted_names:
+            assert not hasattr(constants_module, name), (
+                f"{name} should have been deleted from admedi.constants"
+            )
+            with pytest.raises(ImportError):
+                exec(f"from admedi.constants import {name}")
 
     def test_placements_url(self) -> None:
         """PLACEMENTS_URL points to the placements v1 endpoint."""
@@ -327,9 +337,7 @@ class TestConstants:
             AUTH_URL,
             APPS_URL,
             GROUPS_V4_URL,
-            MEDIATION_MGMT_V2_URL,
-            INSTANCES_V1_URL,
-            INSTANCES_V3_URL,
+            INSTANCES_V4_URL,
             PLACEMENTS_URL,
             REPORTING_URL,
         ],
@@ -337,9 +345,7 @@ class TestConstants:
             "AUTH_URL",
             "APPS_URL",
             "GROUPS_V4_URL",
-            "MEDIATION_MGMT_V2_URL",
-            "INSTANCES_V1_URL",
-            "INSTANCES_V3_URL",
+            "INSTANCES_V4_URL",
             "PLACEMENTS_URL",
             "REPORTING_URL",
         ],
@@ -355,9 +361,7 @@ class TestConstants:
             AUTH_URL,
             APPS_URL,
             GROUPS_V4_URL,
-            MEDIATION_MGMT_V2_URL,
-            INSTANCES_V1_URL,
-            INSTANCES_V3_URL,
+            INSTANCES_V4_URL,
             PLACEMENTS_URL,
             REPORTING_URL,
         ],

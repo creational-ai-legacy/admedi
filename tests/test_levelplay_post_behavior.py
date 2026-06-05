@@ -22,7 +22,7 @@ import json
 import pytest
 
 from admedi.adapters.levelplay import LevelPlayAdapter, load_credential_from_env
-from admedi.constants import GROUPS_V4_URL, MEDIATION_MGMT_V2_URL
+from admedi.constants import GROUPS_V4_URL
 from admedi.exceptions import AuthError
 from admedi.models.app import App
 from admedi.models.enums import Platform

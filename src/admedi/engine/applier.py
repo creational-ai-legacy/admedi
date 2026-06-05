@@ -169,6 +169,138 @@ def build_waterfall_payload(
     return payload, warnings
 
 
+def build_membership_payload(
+    preset_entries: list[dict[str, Any]],
+    live_instances: list[Instance],
+) -> tuple[list[dict[str, Any]] | None, list[str]]:
+    """Resolve preset entries against live instances to build a membership payload.
+
+    This is the network-removal lever. It mirrors :func:`build_waterfall_payload`'s
+    resolution (same ``(network_name, is_bidder[, instance_name])`` matching, same
+    ambiguity/name-change aborts), but instead of producing an ``adSourcePriority``
+    ordering payload it returns the **kept** live instances serialized as the
+    group's ``instances[]`` membership array.
+
+    The kept set is built from the LIVE instances whose index appears in the
+    matched set (mirroring ``build_waterfall_payload``'s ``matched_live_indices``),
+    NOT by serializing preset entries: a preset entry with no live match simply
+    yields no kept instance and no removal (rule-4 no-match-skip). The removed set
+    is the complement — live instances matching no preset entry. Dropping the
+    network from the preset therefore drops its live instance(s) from the kept
+    set, and PUTting the trimmed array removes the network from the waterfall.
+
+    Resolution rules (identical to :func:`build_waterfall_payload`):
+        1. **Exact match** (network + bidder + name): keep that live instance.
+        2. **Unique match** (network + bidder, no name in preset): keep it.
+        3. **Ambiguous** (network + bidder, no name, multiple candidates): abort.
+        4. **No match** (network not in app): skip with warning (no removal for it).
+        5. **Name changed** (preset has name, no match): abort.
+
+    Args:
+        preset_entries: List of preset entry dicts, each with ``network`` (str),
+            ``bidder`` (bool), and optional ``name`` (str) and ``rate`` (float).
+        live_instances: Flat list of live ``Instance`` objects from the group
+            (sourced from the fresh live group, never from a preset-derived group).
+
+    Returns:
+        A tuple of ``(payload, warnings)``:
+        - ``payload``: A list of membership entries (each
+          ``Instance.model_dump(by_alias=True, exclude_none=True)``) for the kept
+          live instances, OR ``None`` when there is nothing to remove (the kept
+          set equals the full live set — a no-op, so the caller omits the
+          membership field) or when resolution aborted (ambiguity / name-change).
+        - ``warnings``: List of warning messages. Empty for a clean no-removal
+          resolution; non-empty for skipped or aborted entries.
+
+    Examples:
+        >>> kept, warnings = build_membership_payload(
+        ...     [{"network": "Meta", "bidder": True}],
+        ...     [
+        ...         Instance(instance_id=1, instance_name="Meta", network_name="Meta", is_bidder=True),
+        ...         Instance(instance_id=2, instance_name="InMobi", network_name="InMobi", is_bidder=True),
+        ...     ],
+        ... )
+        >>> [e["id"] for e in kept]  # InMobi (id=2) dropped
+        [1]
+    """
+    if not preset_entries:
+        return None, []
+
+    warnings: list[str] = []
+    matched_live_indices: set[int] = set()
+    abort = False
+
+    for entry in preset_entries:
+        network = entry["network"]
+        is_bidder = entry["bidder"]
+        preset_name = entry.get("name")
+
+        # Find candidates matching network + bidder (carry original indices)
+        candidates = [
+            (idx, inst)
+            for idx, inst in enumerate(live_instances)
+            if inst.network_name == network and inst.is_bidder == is_bidder
+        ]
+
+        if not candidates:
+            # Rule 4: No match -- skip with warning (nothing to keep or remove)
+            warnings.append(
+                f"Network '{network}' (bidder={is_bidder}) not found in live "
+                f"instances; skipping"
+            )
+            continue
+
+        if preset_name is not None:
+            # Narrow by instance_name
+            named_candidates = [
+                (idx, inst)
+                for idx, inst in candidates
+                if inst.instance_name == preset_name
+            ]
+            if not named_candidates:
+                # Rule 5: Name changed -- abort
+                abort = True
+                warnings.append(
+                    f"Network '{network}' (bidder={is_bidder}) has no instance "
+                    f"named '{preset_name}'; aborting membership update"
+                )
+                continue
+            matched_idx = named_candidates[0][0]
+        elif len(candidates) == 1:
+            # Rule 2: Unique match
+            matched_idx = candidates[0][0]
+        else:
+            # Rule 3: Ambiguous -- abort
+            abort = True
+            candidate_names = [inst.instance_name for _, inst in candidates]
+            warnings.append(
+                f"Network '{network}' (bidder={is_bidder}) has {len(candidates)} "
+                f"instances {candidate_names}; cannot resolve without 'name' "
+                f"in preset; aborting membership update"
+            )
+            continue
+
+        matched_live_indices.add(matched_idx)
+
+    if abort:
+        return None, warnings
+
+    # Kept = live instances whose index matched a preset entry.
+    # Removed = the complement (live instances matching no preset entry).
+    if len(matched_live_indices) == len(live_instances):
+        # Nothing to remove (kept set == full live set) -- no-op; the caller
+        # omits the membership field to preserve current behavior.
+        return None, warnings
+
+    kept = [
+        inst.model_dump(by_alias=True, exclude_none=True)
+        for idx, inst in enumerate(live_instances)
+        if idx in matched_live_indices
+    ]
+
+    return kept, warnings
+
+
 class Applier:
     """Executes a DiffReport by calling adapter write methods.
 
@@ -541,10 +673,16 @@ class Applier:
 
         # Build group_id -> instances lookup from fresh groups for waterfall resolution
         group_instances: dict[int, list[Instance]] = {}
+        # Build group_id -> fresh Group lookup -- used as the update_group `group`
+        # arg (carrying segments/floor_price/full instances) when a membership
+        # removal payload is sent, so Step 4's metadata echo preserves them.
+        fresh_group_by_id: dict[int, Group] = {}
         if include_networks and fresh_groups:
             for g in fresh_groups:
-                if g.group_id is not None and g.instances is not None:
-                    group_instances[g.group_id] = g.instances
+                if g.group_id is not None:
+                    fresh_group_by_id[g.group_id] = g
+                    if g.instances is not None:
+                        group_instances[g.group_id] = g.instances
 
         # Build group_name -> preset_name lookup from tiers
         tier_preset_lookup: dict[str, str] = {}
@@ -556,8 +694,9 @@ class Applier:
         count = 0
         for diff in updates:
             if diff.desired_group is not None and diff.group_id is not None:
-                # Build waterfall payload if networks scope is active
+                # Build waterfall + membership payloads if networks scope is active
                 waterfall_payload: dict[str, Any] | None = None
+                membership_payload: list[dict[str, Any]] | None = None
                 if include_networks and network_presets is not None:
                     has_waterfall_changes = any(
                         c.field == "waterfall" for c in diff.changes
@@ -568,6 +707,8 @@ class Applier:
                         preset_name = tier_preset_lookup.get(group_name)
                         if preset_name and preset_name in network_presets:
                             preset_entries = network_presets[preset_name]
+                            # SAME live_instances drive both ordering and
+                            # membership resolution (sourced from fresh_groups).
                             live_instances = group_instances.get(
                                 diff.group_id, []
                             )
@@ -581,11 +722,75 @@ class Applier:
                                     "Waterfall warning for %s: %s",
                                     group_name, w,
                                 )
+                            # Removal lever: trimmed keep-set membership array.
+                            membership_payload, m_warnings = (
+                                build_membership_payload(
+                                    preset_entries, live_instances
+                                )
+                            )
+                            for w in m_warnings:
+                                logger.warning(
+                                    "Membership warning for %s: %s",
+                                    group_name, w,
+                                )
 
+                # Group-arg / metadata-echo resolution: when (and only when) a
+                # membership removal is being sent, pass the FRESH live group as
+                # the `group` arg so Step 4's segments/floorPrice echo preserves
+                # metadata (diff.desired_group is preset-derived and lacks them).
+                group_arg = diff.desired_group
+                if membership_payload is not None:
+                    fresh_group = fresh_group_by_id.get(diff.group_id)
+                    if fresh_group is None:
+                        # No fresh group to source metadata from -- abort this
+                        # group's write rather than risk a metadata-stripping PUT.
+                        logger.error(
+                            "Skipping membership update for group %d ('%s'): "
+                            "no fresh live group found to source metadata from",
+                            diff.group_id,
+                            diff.desired_group.group_name,
+                        )
+                        continue
+                    # REQUIRED GUARD: substituting fresh_group changes the
+                    # tier-field source for this PUT (update_group reads
+                    # groupName/countries/position from the `group` arg under
+                    # include_tier_fields). Abort-on-drift compares live-vs-live,
+                    # NOT live-vs-desired, so a group-name change that is itself
+                    # part of the diff would silently alter the PUT. Assert the
+                    # fresh group's tier fields match the desired group before
+                    # substituting; abort (no write) on any mismatch.
+                    if (
+                        fresh_group.group_name != diff.desired_group.group_name
+                        or fresh_group.countries != diff.desired_group.countries
+                        or fresh_group.position != diff.desired_group.position
+                    ):
+                        logger.error(
+                            "Skipping membership update for group %d: fresh live "
+                            "group tier fields differ from desired "
+                            "(name %r vs %r, countries %r vs %r, position %r vs "
+                            "%r); refusing to send a PUT that would alter tier "
+                            "fields from the fresh-group source",
+                            diff.group_id,
+                            fresh_group.group_name,
+                            diff.desired_group.group_name,
+                            fresh_group.countries,
+                            diff.desired_group.countries,
+                            fresh_group.position,
+                            diff.desired_group.position,
+                        )
+                        continue
+                    group_arg = fresh_group
+
+                # `membership_payload` is a keyword-only optional on the
+                # concrete LevelPlayAdapter.update_group; the abstract
+                # MediationAdapter signature is intentionally left unchanged
+                # (Step 4 decision -- LSP-safe at runtime). The call is correct
+                # against the real adapter; mypy only sees the narrower ABC type.
                 await self._adapter.update_group(
-                    app_key, diff.group_id, diff.desired_group,
+                    app_key, diff.group_id, group_arg,
                     include_tier_fields=include_tiers,
                     waterfall_payload=waterfall_payload,
+                    membership_payload=membership_payload,  # type: ignore[call-arg]
                 )
                 count += 1
         return count

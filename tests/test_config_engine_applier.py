@@ -3,7 +3,8 @@
 Covers dry-run behavior, idempotency guard, A/B test skipping,
 CREATE/UPDATE execution, DELETE/EXTRA skipping, pre-write snapshots,
 post-write verification, sync log recording, per-app error isolation,
-pre-write A/B test re-check, and build_waterfall_payload() resolution.
+pre-write A/B test re-check, build_waterfall_payload() resolution, and
+build_membership_payload() resolution + removal wiring into _execute_updates.
 """
 
 from __future__ import annotations
@@ -13,7 +14,11 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from admedi.engine.applier import Applier, build_waterfall_payload
+from admedi.engine.applier import (
+    Applier,
+    build_membership_payload,
+    build_waterfall_payload,
+)
 from admedi.models.apply_result import ApplyStatus
 from admedi.models.diff import (
     AppDiffReport,
@@ -25,6 +30,7 @@ from admedi.models.diff import (
 from admedi.models.enums import AdFormat
 from admedi.models.group import Group
 from admedi.models.instance import Instance
+from admedi.models.portfolio import PortfolioTier, SyncScope
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +491,7 @@ class TestUpdateExecution:
         adapter.update_group.assert_called_once_with(
             "app1", 42, desired,
             include_tier_fields=True, waterfall_payload=None,
+            membership_payload=None,
         )
 
     @pytest.mark.asyncio
@@ -1311,3 +1318,520 @@ class TestCrossAppSyncPresetResolution:
             i["instanceId"] for i in payload["tier1"]["instances"]
         ]
         assert 201 in manual_ids
+
+
+# ---------------------------------------------------------------------------
+# Tests: build_membership_payload()
+# ---------------------------------------------------------------------------
+
+
+class TestBuildMembershipPayloadResolved:
+    """Tests for build_membership_payload() kept/removed resolution."""
+
+    def test_dropped_network_removed_kept_present(self) -> None:
+        """Preset dropping a live network → kept = live minus dropped id."""
+        # Preset keeps Meta + AppLovin; live also has InMobi (not in preset).
+        preset = [
+            {"network": "Meta", "bidder": True},
+            {"network": "AppLovin", "bidder": False, "rate": 5.0},
+        ]
+        live = [
+            _make_instance(101, "Meta Default", "Meta", is_bidder=True),
+            _make_instance(202, "InMobi Default", "InMobi", is_bidder=True),
+            _make_instance(303, "AppLovin Default", "AppLovin", is_bidder=False),
+        ]
+
+        kept, warnings = build_membership_payload(preset, live)
+
+        assert kept is not None
+        kept_ids = [e["id"] for e in kept]
+        # Dropped (InMobi 202) absent; kept (Meta 101, AppLovin 303) present.
+        assert 202 not in kept_ids
+        assert 101 in kept_ids
+        assert 303 in kept_ids
+        assert len(kept) == 2
+
+    def test_no_deprecation_returns_none(self) -> None:
+        """Kept set == full live set (nothing to remove) → returns None (no-op)."""
+        preset = [
+            {"network": "Meta", "bidder": True},
+            {"network": "AppLovin", "bidder": True},
+        ]
+        live = [
+            _make_instance(101, "Meta Default", "Meta", is_bidder=True),
+            _make_instance(102, "AppLovin Default", "AppLovin", is_bidder=True),
+        ]
+
+        kept, warnings = build_membership_payload(preset, live)
+
+        assert kept is None
+        assert warnings == []
+
+    def test_membership_entries_use_model_dump_by_alias_exclude_none(self) -> None:
+        """Entries match model_dump(by_alias=True, exclude_none=True) shape."""
+        preset = [{"network": "Meta", "bidder": True}]
+        live = [
+            _make_instance(101, "Meta Default", "Meta", is_bidder=True),
+            _make_instance(202, "InMobi", "InMobi", is_bidder=True),
+        ]
+
+        kept, _ = build_membership_payload(preset, live)
+
+        assert kept is not None
+        entry = kept[0]
+        # Aliased keys present; isBidder always present (non-None default False).
+        assert entry["id"] == 101
+        assert entry["name"] == "Meta Default"
+        assert entry["networkName"] == "Meta"
+        assert entry["isBidder"] is True
+        # None-valued aliases dropped by exclude_none.
+        assert "adUnit" not in entry
+        assert "isLive" not in entry
+        assert "isOptimized" not in entry
+        assert "groupRate" not in entry
+        assert "countriesRate" not in entry
+        # No literal null key leaks.
+        assert "null" not in entry
+
+    def test_non_bidder_with_rate_carries_group_rate(self) -> None:
+        """A non-bidder kept instance with a live group_rate keeps groupRate."""
+        preset = [
+            {"network": "AppLovin", "bidder": False, "rate": 1.0},
+        ]
+        live = [
+            _make_instance(
+                301, "AppLovin", "AppLovin", is_bidder=False, group_rate=1.5
+            ),
+            _make_instance(202, "InMobi", "InMobi", is_bidder=False),
+        ]
+
+        kept, _ = build_membership_payload(preset, live)
+
+        assert kept is not None
+        assert len(kept) == 1
+        assert kept[0]["id"] == 301
+        assert kept[0]["groupRate"] == 1.5
+        assert kept[0]["isBidder"] is False
+
+    def test_isbidder_always_present_even_when_false(self) -> None:
+        """isBidder has a non-None default of False → never dropped."""
+        preset = [{"network": "AppLovin", "bidder": False}]
+        live = [
+            _make_instance(301, "AppLovin", "AppLovin", is_bidder=False),
+            _make_instance(202, "InMobi", "InMobi", is_bidder=False),
+        ]
+
+        kept, _ = build_membership_payload(preset, live)
+
+        assert kept is not None
+        assert kept[0]["isBidder"] is False
+        assert "isBidder" in kept[0]
+
+
+class TestBuildMembershipPayloadAborts:
+    """Tests that ambiguity/name-change abort membership (return None) with a warning."""
+
+    def test_ambiguous_match_aborts(self) -> None:
+        """Two same-network+bidder candidates, no name in preset → abort (None)."""
+        preset = [{"network": "Meta", "bidder": True}]
+        live = [
+            _make_instance(101, "Meta A", "Meta", is_bidder=True),
+            _make_instance(102, "Meta B", "Meta", is_bidder=True),
+        ]
+
+        kept, warnings = build_membership_payload(preset, live)
+
+        assert kept is None
+        assert any("cannot resolve" in w for w in warnings)
+
+    def test_name_change_aborts(self) -> None:
+        """Preset names an instance that no live candidate has → abort (None)."""
+        preset = [{"network": "Meta", "bidder": True, "name": "Old Name"}]
+        live = [
+            _make_instance(101, "New Name", "Meta", is_bidder=True),
+        ]
+
+        kept, warnings = build_membership_payload(preset, live)
+
+        assert kept is None
+        assert any("no instance named" in w for w in warnings)
+
+    def test_empty_preset_returns_none(self) -> None:
+        """Empty preset → (None, []) (no resolution, no removal)."""
+        kept, warnings = build_membership_payload([], [])
+
+        assert kept is None
+        assert warnings == []
+
+
+class TestBuildMembershipPayloadGroupEmbeddedShape:
+    """Group-embedded instances (no adUnit) produce membership entries with no adUnit key."""
+
+    def test_group_embedded_instance_has_no_ad_unit_key(self) -> None:
+        """Group-embedded instances carry no adUnit → None → dropped by exclude_none."""
+        # Group-embedded shape: no adUnit/isLive (those are standalone-only).
+        live = [
+            Instance.model_validate(
+                {"id": 101, "name": "Meta", "networkName": "Meta", "isBidder": True}
+            ),
+            Instance.model_validate(
+                {"id": 202, "name": "InMobi", "networkName": "InMobi", "isBidder": True}
+            ),
+        ]
+        preset = [{"network": "Meta", "bidder": True}]
+
+        kept, _ = build_membership_payload(preset, live)
+
+        assert kept is not None
+        for entry in kept:
+            assert "adUnit" not in entry
+            assert "isLive" not in entry
+
+
+class TestBuildMembershipPayloadImport:
+    """Tests for build_membership_payload import."""
+
+    def test_import_from_applier(self) -> None:
+        """build_membership_payload is importable from admedi.engine.applier."""
+        from admedi.engine.applier import (
+            build_membership_payload as imported,
+        )
+
+        assert imported is build_membership_payload
+
+
+# ---------------------------------------------------------------------------
+# Helpers + Tests: removal wiring into _execute_updates via apply()
+# ---------------------------------------------------------------------------
+
+
+def _make_waterfall_change() -> FieldChange:
+    """A waterfall FieldChange so has_waterfall_changes is True."""
+    return FieldChange(
+        field="waterfall",
+        old_value="InMobi (bidder)",
+        new_value=None,
+        description="Waterfall: InMobi (bidder) will be removed from the waterfall on sync",
+    )
+
+
+def _make_removal_report(
+    *,
+    group_id: int = 42,
+    group_name: str = "Tier 1",
+    ad_format: AdFormat = AdFormat.INTERSTITIAL,
+    countries: list[str] | None = None,
+    position: int = 1,
+    app_key: str = "app1",
+) -> DiffReport:
+    """A single-app UPDATE diff report with a waterfall change."""
+    desired = _make_group(
+        group_name,
+        ad_format=ad_format,
+        countries=countries or ["US"],
+        position=position,
+        group_id=group_id,
+    )
+    return _make_diff_report(
+        app_reports=[
+            _make_app_report(
+                app_key=app_key,
+                group_diffs=[
+                    _make_group_diff(
+                        action=DiffAction.UPDATE,
+                        name=group_name,
+                        group_id=group_id,
+                        ad_format=ad_format,
+                        desired_group=desired,
+                        changes=[_make_waterfall_change()],
+                    )
+                ],
+            ),
+        ]
+    )
+
+
+def _full_scope() -> SyncScope:
+    return SyncScope(tiers=True, networks=True)
+
+
+def _tier(name: str, preset: str, ad_format: AdFormat = AdFormat.INTERSTITIAL) -> PortfolioTier:
+    return PortfolioTier(
+        name=name,
+        countries=["US"],
+        position=1,
+        is_default=False,
+        ad_formats=[ad_format],
+        network_preset=preset,
+    )
+
+
+class TestRemovalWiring:
+    """End-to-end: removal payload wired into _execute_updates via apply()."""
+
+    @pytest.mark.asyncio
+    async def test_dropped_network_passes_membership_minus_dropped_id(self) -> None:
+        """update_group called with membership_payload = live minus dropped id."""
+        adapter, storage = _make_mocks()
+        applier = Applier(adapter=adapter, storage=storage)
+
+        # Fresh live group with Meta(101) + InMobi(202). Preset keeps Meta only.
+        fresh = _make_group("Tier 1", countries=["US"], position=1, group_id=42)
+        fresh.instances = [
+            _make_instance(101, "Meta", "Meta", is_bidder=True),
+            _make_instance(202, "InMobi", "InMobi", is_bidder=True),
+        ]
+        adapter.get_groups.return_value = [fresh]
+
+        report = _make_removal_report(group_id=42)
+        presets = {"keep-meta": [{"network": "Meta", "bidder": True}]}
+        tiers = [_tier("Tier 1", "keep-meta")]
+
+        await applier.apply(
+            report, dry_run=False,
+            scope=_full_scope(), network_presets=presets, tiers=tiers,
+        )
+
+        adapter.update_group.assert_called_once()
+        kwargs = adapter.update_group.call_args.kwargs
+        membership = kwargs["membership_payload"]
+        assert membership is not None
+        ids = [e["id"] for e in membership]
+        assert 202 not in ids  # dropped
+        assert ids == [101]  # kept
+
+    @pytest.mark.asyncio
+    async def test_no_deprecation_passes_membership_none(self) -> None:
+        """Kept == full live set → membership_payload=None passed to update_group."""
+        adapter, storage = _make_mocks()
+        applier = Applier(adapter=adapter, storage=storage)
+
+        fresh = _make_group("Tier 1", countries=["US"], position=1, group_id=42)
+        fresh.instances = [
+            _make_instance(101, "Meta", "Meta", is_bidder=True),
+            _make_instance(102, "AppLovin", "AppLovin", is_bidder=True),
+        ]
+        adapter.get_groups.return_value = [fresh]
+
+        report = _make_removal_report(group_id=42)
+        presets = {
+            "keep-all": [
+                {"network": "Meta", "bidder": True},
+                {"network": "AppLovin", "bidder": True},
+            ]
+        }
+        tiers = [_tier("Tier 1", "keep-all")]
+
+        await applier.apply(
+            report, dry_run=False,
+            scope=_full_scope(), network_presets=presets, tiers=tiers,
+        )
+
+        adapter.update_group.assert_called_once()
+        assert adapter.update_group.call_args.kwargs["membership_payload"] is None
+
+    @pytest.mark.asyncio
+    async def test_membership_entry_shape_no_leaked_keys(self) -> None:
+        """Membership entries from real fresh instances: aliased keys, no adUnit/isLive/null."""
+        adapter, storage = _make_mocks()
+        applier = Applier(adapter=adapter, storage=storage)
+
+        fresh = _make_group("Tier 1", countries=["US"], position=1, group_id=42)
+        fresh.instances = [
+            Instance.model_validate(
+                {"id": 101, "name": "Meta", "networkName": "Meta", "isBidder": True}
+            ),
+            Instance.model_validate(
+                {"id": 202, "name": "InMobi", "networkName": "InMobi", "isBidder": True}
+            ),
+        ]
+        adapter.get_groups.return_value = [fresh]
+
+        report = _make_removal_report(group_id=42)
+        presets = {"keep-meta": [{"network": "Meta", "bidder": True}]}
+        tiers = [_tier("Tier 1", "keep-meta")]
+
+        await applier.apply(
+            report, dry_run=False,
+            scope=_full_scope(), network_presets=presets, tiers=tiers,
+        )
+
+        membership = adapter.update_group.call_args.kwargs["membership_payload"]
+        assert membership == [
+            {"id": 101, "name": "Meta", "networkName": "Meta", "isBidder": True}
+        ]
+        entry = membership[0]
+        assert "adUnit" not in entry
+        assert "isLive" not in entry
+        assert "null" not in entry
+
+    @pytest.mark.asyncio
+    async def test_group_arg_is_fresh_group_not_desired(self) -> None:
+        """When removing, the `group` arg passed to update_group is the fresh group."""
+        adapter, storage = _make_mocks()
+        applier = Applier(adapter=adapter, storage=storage)
+
+        fresh = _make_group("Tier 1", countries=["US"], position=1, group_id=42)
+        fresh.instances = [
+            _make_instance(101, "Meta", "Meta", is_bidder=True),
+            _make_instance(202, "InMobi", "InMobi", is_bidder=True),
+        ]
+        # Fresh group carries metadata the preset-derived desired group lacks.
+        fresh.segments = [{"id": 7}]
+        fresh.floor_price = 0.5
+        adapter.get_groups.return_value = [fresh]
+
+        report = _make_removal_report(group_id=42)
+        desired = report.app_reports[0].group_diffs[0].desired_group
+        presets = {"keep-meta": [{"network": "Meta", "bidder": True}]}
+        tiers = [_tier("Tier 1", "keep-meta")]
+
+        await applier.apply(
+            report, dry_run=False,
+            scope=_full_scope(), network_presets=presets, tiers=tiers,
+        )
+
+        # Positional group arg is the fresh group object, never desired.
+        passed_group = adapter.update_group.call_args.args[2]
+        assert passed_group is fresh
+        assert passed_group is not desired
+        assert passed_group.segments == [{"id": 7}]
+        assert passed_group.floor_price == 0.5
+
+    @pytest.mark.asyncio
+    async def test_waterfall_only_path_keeps_desired_group(self) -> None:
+        """No deprecation (membership None) → `group` arg stays desired_group."""
+        adapter, storage = _make_mocks()
+        applier = Applier(adapter=adapter, storage=storage)
+
+        fresh = _make_group("Tier 1", countries=["US"], position=1, group_id=42)
+        fresh.instances = [
+            _make_instance(101, "Meta", "Meta", is_bidder=True),
+        ]
+        adapter.get_groups.return_value = [fresh]
+
+        report = _make_removal_report(group_id=42)
+        desired = report.app_reports[0].group_diffs[0].desired_group
+        presets = {"keep-meta": [{"network": "Meta", "bidder": True}]}
+        tiers = [_tier("Tier 1", "keep-meta")]
+
+        await applier.apply(
+            report, dry_run=False,
+            scope=_full_scope(), network_presets=presets, tiers=tiers,
+        )
+
+        # membership_payload is None (nothing removed) → desired group retained.
+        assert adapter.update_group.call_args.kwargs["membership_payload"] is None
+        assert adapter.update_group.call_args.args[2] is desired
+
+    @pytest.mark.asyncio
+    async def test_dry_run_issues_zero_update_group_calls(self) -> None:
+        """Dry-run makes zero update_group calls even with a removal pending."""
+        adapter, storage = _make_mocks()
+        applier = Applier(adapter=adapter, storage=storage)
+
+        fresh = _make_group("Tier 1", countries=["US"], position=1, group_id=42)
+        fresh.instances = [
+            _make_instance(101, "Meta", "Meta", is_bidder=True),
+            _make_instance(202, "InMobi", "InMobi", is_bidder=True),
+        ]
+        adapter.get_groups.return_value = [fresh]
+
+        report = _make_removal_report(group_id=42)
+        presets = {"keep-meta": [{"network": "Meta", "bidder": True}]}
+        tiers = [_tier("Tier 1", "keep-meta")]
+
+        result = await applier.apply(
+            report, dry_run=True,
+            scope=_full_scope(), network_presets=presets, tiers=tiers,
+        )
+
+        assert result.was_dry_run is True
+        adapter.update_group.assert_not_called()
+        adapter.get_groups.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fresh_ab_test_skips_with_zero_update_group_calls(self) -> None:
+        """An app whose fresh read shows ab_test != 'N/A' is SKIPPED, zero writes."""
+        adapter, storage = _make_mocks()
+        applier = Applier(adapter=adapter, storage=storage)
+
+        fresh = _make_group(
+            "Tier 1", countries=["US"], position=1, group_id=42,
+            ab_test="experiment_99",
+        )
+        fresh.instances = [
+            _make_instance(101, "Meta", "Meta", is_bidder=True),
+            _make_instance(202, "InMobi", "InMobi", is_bidder=True),
+        ]
+        adapter.get_groups.return_value = [fresh]
+
+        report = _make_removal_report(group_id=42)
+        presets = {"keep-meta": [{"network": "Meta", "bidder": True}]}
+        tiers = [_tier("Tier 1", "keep-meta")]
+
+        result = await applier.apply(
+            report, dry_run=False,
+            scope=_full_scope(), network_presets=presets, tiers=tiers,
+        )
+
+        assert result.app_results[0].status == ApplyStatus.SKIPPED
+        adapter.update_group.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_resolution_aborts_membership_none(self) -> None:
+        """Ambiguous resolution → membership_payload None (same as build_waterfall_payload)."""
+        adapter, storage = _make_mocks()
+        applier = Applier(adapter=adapter, storage=storage)
+
+        # Two Meta bidders, preset has no name → ambiguous → abort.
+        fresh = _make_group("Tier 1", countries=["US"], position=1, group_id=42)
+        fresh.instances = [
+            _make_instance(101, "Meta A", "Meta", is_bidder=True),
+            _make_instance(102, "Meta B", "Meta", is_bidder=True),
+        ]
+        adapter.get_groups.return_value = [fresh]
+
+        report = _make_removal_report(group_id=42)
+        presets = {"keep-meta": [{"network": "Meta", "bidder": True}]}
+        tiers = [_tier("Tier 1", "keep-meta")]
+
+        await applier.apply(
+            report, dry_run=False,
+            scope=_full_scope(), network_presets=presets, tiers=tiers,
+        )
+
+        adapter.update_group.assert_called_once()
+        # Both waterfall and membership abort → both None; group arg stays desired.
+        assert adapter.update_group.call_args.kwargs["membership_payload"] is None
+
+    @pytest.mark.asyncio
+    async def test_tier_field_mismatch_aborts_write(self) -> None:
+        """Fresh group tier fields differing from desired → no update_group call."""
+        adapter, storage = _make_mocks()
+        applier = Applier(adapter=adapter, storage=storage)
+
+        # Fresh group_name differs from the desired (diff-driven rename) — the
+        # guard must refuse to PUT from the fresh-group tier-field source.
+        fresh = _make_group(
+            "OLD NAME", countries=["US"], position=1, group_id=42
+        )
+        fresh.instances = [
+            _make_instance(101, "Meta", "Meta", is_bidder=True),
+            _make_instance(202, "InMobi", "InMobi", is_bidder=True),
+        ]
+        adapter.get_groups.return_value = [fresh]
+
+        # desired group_name = "Tier 1" (≠ fresh "OLD NAME")
+        report = _make_removal_report(group_id=42, group_name="Tier 1")
+        presets = {"keep-meta": [{"network": "Meta", "bidder": True}]}
+        tiers = [_tier("Tier 1", "keep-meta")]
+
+        result = await applier.apply(
+            report, dry_run=False,
+            scope=_full_scope(), network_presets=presets, tiers=tiers,
+        )
+
+        # Guard aborts this group's write entirely.
+        adapter.update_group.assert_not_called()
+        assert result.app_results[0].groups_updated == 0

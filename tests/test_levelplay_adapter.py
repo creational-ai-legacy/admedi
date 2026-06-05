@@ -102,7 +102,7 @@ from admedi.adapters.levelplay import (
     load_credential_from_env,
 )
 from admedi.adapters.mediation import AdapterCapability
-from admedi.constants import APPS_URL, AUTH_URL, GROUPS_V4_URL, INSTANCES_V1_URL, INSTANCES_V3_URL
+from admedi.constants import APPS_URL, AUTH_URL, GROUPS_V4_URL, INSTANCES_V4_URL
 from admedi.exceptions import AdapterNotSupportedError, ApiError, AuthError, RateLimitError
 from admedi.models import Credential, Group, Mediator
 from admedi.models.app import App
@@ -921,12 +921,6 @@ class TestAbstractMethodStubs:
         with pytest.raises(AdapterNotSupportedError, match="update_instances"):
             await adapter.update_instances("test_key", [])
 
-    async def test_delete_instance_raises(self, mock_credential: Credential) -> None:
-        """delete_instance() should raise AdapterNotSupportedError."""
-        adapter = LevelPlayAdapter(mock_credential)
-        with pytest.raises(AdapterNotSupportedError, match="delete_instance"):
-            await adapter.delete_instance("test_key", 456)
-
     async def test_get_placements_raises(self, mock_credential: Credential) -> None:
         """get_placements() should raise AdapterNotSupportedError."""
         adapter = LevelPlayAdapter(mock_credential)
@@ -961,10 +955,12 @@ class TestAbstractMethodStubs:
         """Each stub should include the method name and a deferral reason."""
         adapter = LevelPlayAdapter(mock_credential)
 
-        # Test a sample of stubs for descriptive messages
+        # Test a sample of stubs for descriptive messages.
+        # NOTE: delete_instance() is now a real v4 implementation (Step 3), so
+        # sample update_instances() -- a method still deferred as a stub.
         with pytest.raises(AdapterNotSupportedError) as exc_info:
-            await adapter.delete_instance("test_key", 1)
-        assert "delete_instance()" in str(exc_info.value)
+            await adapter.update_instances("test_key", [])
+        assert "update_instances()" in str(exc_info.value)
         assert "not yet implemented" in str(exc_info.value)
 
         with pytest.raises(AdapterNotSupportedError) as exc_info:
@@ -2599,28 +2595,19 @@ class TestGetGroups:
 
 
 class TestNormalizeInstanceResponse:
-    """Tests for LevelPlayAdapter._normalize_instance_response() -- Step 6.
+    """Tests for LevelPlayAdapter._normalize_instance_response() -- Instances v4.
 
-    Verifies that alternate field names from the Instances API are
-    defensively remapped to canonical model aliases before validation.
+    Verifies the v4 re-map: ``instanceId`` -> ``id`` and ``instanceName`` ->
+    ``name`` (defensive — only when canonical key absent); v4-only keys are
+    left in place to be dropped by the model's ``extra="ignore"``.
     """
-
-    def test_providerName_maps_to_networkName(
-        self, mock_credential: Credential
-    ) -> None:
-        """providerName should be remapped to networkName."""
-        adapter = LevelPlayAdapter(mock_credential)
-        raw = {"providerName": "Meta", "name": "Test", "id": 1}
-        result = adapter._normalize_instance_response(raw)
-        assert result["networkName"] == "Meta"
-        assert "providerName" not in result
 
     def test_instanceName_maps_to_name(
         self, mock_credential: Credential
     ) -> None:
         """instanceName should be remapped to name."""
         adapter = LevelPlayAdapter(mock_credential)
-        raw = {"instanceName": "Meta Audience Network", "networkName": "Meta", "id": 1}
+        raw = {"instanceName": "Meta Audience Network", "networkName": "Meta", "instanceId": 1}
         result = adapter._normalize_instance_response(raw)
         assert result["name"] == "Meta Audience Network"
         assert "instanceName" not in result
@@ -2635,106 +2622,51 @@ class TestNormalizeInstanceResponse:
         assert result["id"] == 99
         assert "instanceId" not in result
 
-    def test_globalPricing_maps_to_groupRate(
+    def test_canonical_fields_pass_through(
         self, mock_credential: Credential
     ) -> None:
-        """globalPricing should be remapped to groupRate."""
-        adapter = LevelPlayAdapter(mock_credential)
-        raw = {"globalPricing": 12.5, "name": "Test", "networkName": "Meta", "id": 1}
-        result = adapter._normalize_instance_response(raw)
-        assert result["groupRate"] == 12.5
-        assert "globalPricing" not in result
-
-    def test_countriesPricing_maps_to_countriesRate(
-        self, mock_credential: Credential
-    ) -> None:
-        """countriesPricing should be remapped to countriesRate with sub-field normalization."""
+        """networkName/adUnit/isBidder/isLive already match aliases and pass through."""
         adapter = LevelPlayAdapter(mock_credential)
         raw = {
-            "countriesPricing": [
-                {"country": "US", "eCPM": 15.0},
-                {"country": "GB", "eCPM": 12.0},
-            ],
-            "name": "Test",
-            "networkName": "Meta",
-            "id": 1,
+            "instanceId": 1,
+            "instanceName": "Test",
+            "networkName": "ironSource",
+            "adUnit": "rewardedVideo",
+            "isBidder": True,
+            "isLive": True,
         }
         result = adapter._normalize_instance_response(raw)
-        assert "countriesRate" in result
-        assert "countriesPricing" not in result
-        assert len(result["countriesRate"]) == 2
-        assert result["countriesRate"][0]["countryCode"] == "US"
-        assert result["countriesRate"][0]["rate"] == 15.0
-        assert result["countriesRate"][1]["countryCode"] == "GB"
-        assert result["countriesRate"][1]["rate"] == 12.0
+        assert result["networkName"] == "ironSource"
+        assert result["adUnit"] == "rewardedVideo"
+        assert result["isBidder"] is True
+        assert result["isLive"] is True
 
-    def test_countriesPricing_subfield_country_to_countryCode(
+    def test_v4_only_keys_left_for_model_to_ignore(
         self, mock_credential: Credential
     ) -> None:
-        """Each countriesPricing entry's 'country' should map to 'countryCode'."""
+        """v4-only keys (adFormat/groups/rate/config sentinels/'null') are left in place.
+
+        The normalizer does not strip them; the Instance model's default
+        extra="ignore" drops them at validation time (Option B — model unchanged).
+        """
         adapter = LevelPlayAdapter(mock_credential)
         raw = {
-            "countriesPricing": [{"country": "JP", "eCPM": 10.0}],
-            "name": "Test",
+            "instanceId": 1,
+            "instanceName": "Test",
             "networkName": "Meta",
-            "id": 1,
+            "adFormat": "rewarded",
+            "groups": [101, 102],
+            "rate": 5,
+            "appConfig1": "MISSING_INSTANCE_CONFIGURATION",
+            "instanceConfig1": "MISSING_INSTANCE_CONFIGURATION",
+            "null": "1",
         }
         result = adapter._normalize_instance_response(raw)
-        entry = result["countriesRate"][0]
-        assert entry["countryCode"] == "JP"
-        assert "country" not in entry
-
-    def test_countriesPricing_subfield_eCPM_to_rate(
-        self, mock_credential: Credential
-    ) -> None:
-        """Each countriesPricing entry's 'eCPM' should map to 'rate'."""
-        adapter = LevelPlayAdapter(mock_credential)
-        raw = {
-            "countriesPricing": [{"country": "CA", "eCPM": 8.5}],
-            "name": "Test",
-            "networkName": "Meta",
-            "id": 1,
-        }
-        result = adapter._normalize_instance_response(raw)
-        entry = result["countriesRate"][0]
-        assert entry["rate"] == 8.5
-        assert "eCPM" not in entry
-
-    def test_isLive_string_active_maps_to_true(
-        self, mock_credential: Credential
-    ) -> None:
-        """isLive string 'active' should be normalized to True."""
-        adapter = LevelPlayAdapter(mock_credential)
-        raw = {"isLive": "active", "name": "Test", "networkName": "Meta", "id": 1}
-        result = adapter._normalize_instance_response(raw)
-        assert result["isLive"] is True
-
-    def test_isLive_string_inactive_maps_to_false(
-        self, mock_credential: Credential
-    ) -> None:
-        """isLive string 'inactive' should be normalized to False."""
-        adapter = LevelPlayAdapter(mock_credential)
-        raw = {"isLive": "inactive", "name": "Test", "networkName": "Meta", "id": 1}
-        result = adapter._normalize_instance_response(raw)
-        assert result["isLive"] is False
-
-    def test_isLive_string_Active_case_insensitive(
-        self, mock_credential: Credential
-    ) -> None:
-        """isLive normalization should be case-insensitive."""
-        adapter = LevelPlayAdapter(mock_credential)
-        raw = {"isLive": "Active", "name": "Test", "networkName": "Meta", "id": 1}
-        result = adapter._normalize_instance_response(raw)
-        assert result["isLive"] is True
-
-    def test_isLive_bool_not_changed(
-        self, mock_credential: Credential
-    ) -> None:
-        """isLive that is already a bool should not be changed."""
-        adapter = LevelPlayAdapter(mock_credential)
-        raw = {"isLive": True, "name": "Test", "networkName": "Meta", "id": 1}
-        result = adapter._normalize_instance_response(raw)
-        assert result["isLive"] is True
+        # Left in place by the normalizer (the model, not the normalizer, ignores them)
+        assert result["adFormat"] == "rewarded"
+        assert result["groups"] == [101, 102]
+        assert result["rate"] == 5
+        assert result["null"] == "1"
 
     def test_defensive_no_overwrite_existing_canonical_key(
         self, mock_credential: Credential
@@ -2742,70 +2674,36 @@ class TestNormalizeInstanceResponse:
         """If both alternate and canonical keys exist, canonical is preserved."""
         adapter = LevelPlayAdapter(mock_credential)
         raw = {
-            "providerName": "Alt Network",
-            "networkName": "Canonical Network",
-            "name": "Test",
+            "instanceId": 99,
             "id": 1,
-        }
-        result = adapter._normalize_instance_response(raw)
-        assert result["networkName"] == "Canonical Network"
-        # providerName should still be in the dict since it wasn't remapped
-        assert result.get("providerName") == "Alt Network"
-
-    def test_countriesPricing_null_preserves_null(
-        self, mock_credential: Credential
-    ) -> None:
-        """countriesPricing that is null should be normalized to null countriesRate."""
-        adapter = LevelPlayAdapter(mock_credential)
-        raw = {
-            "countriesPricing": None,
-            "name": "Test",
+            "instanceName": "Alt Name",
+            "name": "Canonical Name",
             "networkName": "Meta",
-            "id": 1,
         }
         result = adapter._normalize_instance_response(raw)
-        assert result["countriesRate"] is None
-        assert "countriesPricing" not in result
-
-    def test_all_alternate_fields_at_once(
-        self, mock_credential: Credential
-    ) -> None:
-        """All alternate field names should be normalized in a single pass."""
-        adapter = LevelPlayAdapter(mock_credential)
-        raw = {
-            "providerName": "Meta",
-            "instanceName": "Meta AN",
-            "instanceId": 100,
-            "globalPricing": 5.0,
-            "countriesPricing": [{"country": "US", "eCPM": 10.0}],
-            "isLive": "active",
-        }
-        result = adapter._normalize_instance_response(raw)
-        assert result["networkName"] == "Meta"
-        assert result["name"] == "Meta AN"
-        assert result["id"] == 100
-        assert result["groupRate"] == 5.0
-        assert result["countriesRate"][0]["countryCode"] == "US"
-        assert result["countriesRate"][0]["rate"] == 10.0
-        assert result["isLive"] is True
+        assert result["id"] == 1
+        assert result["name"] == "Canonical Name"
+        # The alternate keys are left untouched since canonical already existed.
+        assert result["instanceId"] == 99
+        assert result["instanceName"] == "Alt Name"
 
 
 # ---------------------------------------------------------------------------
-# Tests: get_instances() -- Step 6
+# Tests: get_instances() -- Instances v4
 # ---------------------------------------------------------------------------
 
 
 class TestGetInstances:
-    """Tests for LevelPlayAdapter.get_instances() -- Step 6.
+    """Tests for LevelPlayAdapter.get_instances() against Instances v4.
 
-    All tests mock the HTTP client to return fixture data, exercising
-    the get_instances() parsing, normalization, v3/v1 fallback, and
-    validation logic without network calls.
+    All tests mock the HTTP client to return v4-shaped fixture data,
+    exercising get_instances()'s v4 GET, response re-map, the defensive
+    dict-unwrap, and validation logic without network calls.
     """
 
     @pytest.fixture
     def instances_fixture_data(self) -> list[dict]:
-        """Load the levelplay_instances.json fixture file."""
+        """Load the v4 levelplay_instances.json fixture file."""
         fixture_path = _FIXTURES_DIR / "levelplay_instances.json"
         with open(fixture_path) as f:
             return json.load(f)
@@ -2841,26 +2739,51 @@ class TestGetInstances:
         assert len(bidders) >= 1, "Fixture should have at least 1 bidder"
         assert len(non_bidders) >= 1, "Fixture should have at least 1 non-bidder"
 
-    async def test_fixture_has_alternate_field_names(
+    async def test_fixture_uses_v4_field_names(
         self, instances_fixture_data: list[dict]
     ) -> None:
-        """Fixture should have at least 1 instance with alternate field names."""
-        alt_fields = {"providerName", "instanceName", "instanceId", "globalPricing", "countriesPricing"}
-        found_alt = False
+        """Fixture should use the v4 instanceId/instanceName/adFormat keys."""
+        first = instances_fixture_data[0]
+        assert "instanceId" in first
+        assert "instanceName" in first
+        assert "adFormat" in first
+        # No v3-only keys should appear anywhere in the fixture.
+        v3_only = {"providerName", "globalPricing", "countriesPricing"}
         for inst in instances_fixture_data:
-            if alt_fields & set(inst.keys()):
-                found_alt = True
-                break
-        assert found_alt, "Fixture should have at least 1 instance with alternate field names"
+            assert not (v3_only & set(inst.keys())), (
+                f"v3-only key found in v4 fixture: {v3_only & set(inst.keys())}"
+            )
 
-    # -- Core parsing tests (v3 response) --
+    # -- URL / request-shape test --
+
+    async def test_calls_v4_path_segment_url_no_query(
+        self,
+        adapter_with_mock_client: LevelPlayAdapter,
+    ) -> None:
+        """get_instances() should GET the v4 path-segment URL (trailing slash, no ?appKey=)."""
+        adapter = adapter_with_mock_client
+        response = _make_response(json_data=[])
+        adapter._client.request = AsyncMock(return_value=response)
+
+        await adapter.get_instances("my_app_key_123")
+
+        call_args = adapter._client.request.call_args
+        assert call_args[0][0] == "GET"
+        assert call_args[0][1] == f"{INSTANCES_V4_URL}/my_app_key_123/"
+        assert call_args[0][1] == (
+            "https://platform.ironsrc.com/levelPlay/network/instances/v4/my_app_key_123/"
+        )
+        # No ?appKey= query param on v4 (appKey is a path segment).
+        assert call_args.kwargs.get("params") is None
+
+    # -- Core parsing tests (v4 response) --
 
     async def test_returns_instance_models_from_fixture(
         self,
         adapter_with_mock_client: LevelPlayAdapter,
         instances_fixture_data: list[dict],
     ) -> None:
-        """get_instances() should return Instance models from fixture data."""
+        """get_instances() should return Instance models from v4 fixture data."""
         adapter = adapter_with_mock_client
         response = _make_response(json_data=instances_fixture_data)
         adapter._client.request = AsyncMock(return_value=response)
@@ -2875,7 +2798,7 @@ class TestGetInstances:
         adapter_with_mock_client: LevelPlayAdapter,
         instances_fixture_data: list[dict],
     ) -> None:
-        """Returned instances should have correct instance_name values."""
+        """Returned instances should have correct instance_name values (instanceName -> name)."""
         adapter = adapter_with_mock_client
         response = _make_response(json_data=instances_fixture_data)
         adapter._client.request = AsyncMock(return_value=response)
@@ -2884,7 +2807,6 @@ class TestGetInstances:
 
         assert instances[0].instance_name == "ironSource Default"
         assert instances[1].instance_name == "AdMob Bidding"
-        # Alternate field name: instanceName -> name
         assert instances[2].instance_name == "Meta Audience Network"
         assert instances[3].instance_name == "Liftoff Monetize"
 
@@ -2893,7 +2815,7 @@ class TestGetInstances:
         adapter_with_mock_client: LevelPlayAdapter,
         instances_fixture_data: list[dict],
     ) -> None:
-        """Returned instances should have correct network_name values."""
+        """Returned instances should have correct network_name values (networkName passes through)."""
         adapter = adapter_with_mock_client
         response = _make_response(json_data=instances_fixture_data)
         adapter._client.request = AsyncMock(return_value=response)
@@ -2902,16 +2824,15 @@ class TestGetInstances:
 
         assert instances[0].network_name == "ironSource"
         assert instances[1].network_name == "AdMob"
-        # Alternate field name: providerName -> networkName
         assert instances[2].network_name == "Meta"
-        assert instances[3].network_name == "Liftoff"
+        assert instances[3].network_name == "Liftoff Monetize"
 
     async def test_correct_instance_id(
         self,
         adapter_with_mock_client: LevelPlayAdapter,
         instances_fixture_data: list[dict],
     ) -> None:
-        """Returned instances should have correct instance_id values."""
+        """Returned instances should have correct instance_id values (instanceId -> id)."""
         adapter = adapter_with_mock_client
         response = _make_response(json_data=instances_fixture_data)
         adapter._client.request = AsyncMock(return_value=response)
@@ -2920,7 +2841,6 @@ class TestGetInstances:
 
         assert instances[0].instance_id == 201
         assert instances[1].instance_id == 202
-        # Alternate field name: instanceId -> id
         assert instances[2].instance_id == 203
         assert instances[3].instance_id == 204
 
@@ -2941,90 +2861,12 @@ class TestGetInstances:
         assert instances[2].is_bidder is True
         assert instances[3].is_bidder is False
 
-    async def test_correct_group_rate(
-        self,
-        adapter_with_mock_client: LevelPlayAdapter,
-        instances_fixture_data: list[dict],
-    ) -> None:
-        """Returned instances should have correct group_rate values."""
-        adapter = adapter_with_mock_client
-        response = _make_response(json_data=instances_fixture_data)
-        adapter._client.request = AsyncMock(return_value=response)
-
-        instances = await adapter.get_instances("test_key")
-
-        assert instances[0].group_rate == 10.5
-        assert instances[1].group_rate == 8.0
-        # Alternate field name: globalPricing -> groupRate
-        assert instances[2].group_rate == 12.0
-        assert instances[3].group_rate == 6.5
-
-    async def test_correct_countries_rate_canonical(
-        self,
-        adapter_with_mock_client: LevelPlayAdapter,
-        instances_fixture_data: list[dict],
-    ) -> None:
-        """Instance with canonical countriesRate should have CountryRate objects."""
-        adapter = adapter_with_mock_client
-        response = _make_response(json_data=instances_fixture_data)
-        adapter._client.request = AsyncMock(return_value=response)
-
-        instances = await adapter.get_instances("test_key")
-
-        # First instance: canonical countriesRate
-        inst = instances[0]
-        assert inst.countries_rate is not None
-        assert len(inst.countries_rate) == 2
-        assert isinstance(inst.countries_rate[0], CountryRate)
-        assert inst.countries_rate[0].country_code == "US"
-        assert inst.countries_rate[0].rate == 15.0
-        assert inst.countries_rate[1].country_code == "GB"
-        assert inst.countries_rate[1].rate == 12.0
-
-    async def test_correct_countries_rate_normalized(
-        self,
-        adapter_with_mock_client: LevelPlayAdapter,
-        instances_fixture_data: list[dict],
-    ) -> None:
-        """Instance with countriesPricing (alternate) should be normalized to CountryRate."""
-        adapter = adapter_with_mock_client
-        response = _make_response(json_data=instances_fixture_data)
-        adapter._client.request = AsyncMock(return_value=response)
-
-        instances = await adapter.get_instances("test_key")
-
-        # Third instance: alternate countriesPricing -> countriesRate
-        inst = instances[2]
-        assert inst.countries_rate is not None
-        assert len(inst.countries_rate) == 3
-        assert inst.countries_rate[0].country_code == "US"
-        assert inst.countries_rate[0].rate == 20.0
-        assert inst.countries_rate[1].country_code == "CA"
-        assert inst.countries_rate[1].rate == 16.5
-        assert inst.countries_rate[2].country_code == "JP"
-        assert inst.countries_rate[2].rate == 14.0
-
-    async def test_countries_rate_null(
-        self,
-        adapter_with_mock_client: LevelPlayAdapter,
-        instances_fixture_data: list[dict],
-    ) -> None:
-        """Instance with null countriesRate should parse as None."""
-        adapter = adapter_with_mock_client
-        response = _make_response(json_data=instances_fixture_data)
-        adapter._client.request = AsyncMock(return_value=response)
-
-        instances = await adapter.get_instances("test_key")
-
-        # Second instance: countriesRate is null
-        assert instances[1].countries_rate is None
-
     async def test_is_live_bool_preserved(
         self,
         adapter_with_mock_client: LevelPlayAdapter,
         instances_fixture_data: list[dict],
     ) -> None:
-        """Instance with bool isLive should be preserved."""
+        """v4 isLive is already a bool and should be preserved as-is."""
         adapter = adapter_with_mock_client
         response = _make_response(json_data=instances_fixture_data)
         adapter._client.request = AsyncMock(return_value=response)
@@ -3033,36 +2875,22 @@ class TestGetInstances:
 
         assert instances[0].is_live is True
         assert instances[1].is_live is True
-
-    async def test_is_live_string_active_normalized(
-        self,
-        adapter_with_mock_client: LevelPlayAdapter,
-        instances_fixture_data: list[dict],
-    ) -> None:
-        """Instance with isLive='active' should be normalized to True."""
-        adapter = adapter_with_mock_client
-        response = _make_response(json_data=instances_fixture_data)
-        adapter._client.request = AsyncMock(return_value=response)
-
-        instances = await adapter.get_instances("test_key")
-
-        # Third instance: isLive was "active"
-        assert instances[2].is_live is True
-
-    async def test_is_live_string_inactive_normalized(
-        self,
-        adapter_with_mock_client: LevelPlayAdapter,
-        instances_fixture_data: list[dict],
-    ) -> None:
-        """Instance with isLive='inactive' should be normalized to False."""
-        adapter = adapter_with_mock_client
-        response = _make_response(json_data=instances_fixture_data)
-        adapter._client.request = AsyncMock(return_value=response)
-
-        instances = await adapter.get_instances("test_key")
-
-        # Fourth instance: isLive was "inactive"
         assert instances[3].is_live is False
+
+    async def test_is_optimized_model_field_preserved(
+        self,
+        adapter_with_mock_client: LevelPlayAdapter,
+        instances_fixture_data: list[dict],
+    ) -> None:
+        """is_optimized remains a live Instance model field (alias isOptimized)."""
+        adapter = adapter_with_mock_client
+        response = _make_response(json_data=instances_fixture_data)
+        adapter._client.request = AsyncMock(return_value=response)
+
+        instances = await adapter.get_instances("test_key")
+
+        assert instances[0].is_optimized is False
+        assert instances[1].is_optimized is True
 
     async def test_ad_unit_parsed(
         self,
@@ -3080,138 +2908,48 @@ class TestGetInstances:
         assert instances[1].ad_unit == AdFormat.BANNER
         assert instances[2].ad_unit == AdFormat.REWARDED_VIDEO
 
-    # -- v3/v1 fallback tests --
-
-    async def test_v3_404_falls_back_to_v1(
+    async def test_v4_only_keys_dropped_no_validation_error(
         self,
         adapter_with_mock_client: LevelPlayAdapter,
         instances_fixture_data: list[dict],
-        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """When v3 returns 404, should fall back to v1 and return instances."""
+        """v4-only keys (adFormat/groups/rate/config sentinels/'null') don't break deserialization.
+
+        The fixture carries these keys; the Instance model's extra="ignore"
+        drops them silently. All 4 instances must still validate.
+        """
         adapter = adapter_with_mock_client
+        response = _make_response(json_data=instances_fixture_data)
+        adapter._client.request = AsyncMock(return_value=response)
 
-        # First call (v3) raises ApiError 404, second call (v1) returns data
-        v1_response = _make_response(json_data=instances_fixture_data)
+        instances = await adapter.get_instances("test_key")
 
-        call_count = 0
-        original_request = adapter._client.request
-
-        async def side_effect(*args: Any, **kwargs: Any) -> httpx.Response:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                # v3 returns 404
-                return _make_response(404)
-            else:
-                return v1_response
-
-        adapter._client.request = AsyncMock(side_effect=side_effect)
-
-        with caplog.at_level(logging.WARNING, logger="admedi.adapters.levelplay"):
-            instances = await adapter.get_instances("test_key")
-
+        # All 4 validate despite carrying adFormat/groups/rate/appConfig*/"null".
         assert len(instances) == 4
-        assert any("falling back to v1" in msg for msg in caplog.messages)
+        # The model does not expose any v4-only attribute.
+        assert not hasattr(instances[0], "ad_format")
+        assert not hasattr(instances[0], "groups")
 
-    async def test_v1_fallback_uses_correct_url(
-        self,
-        adapter_with_mock_client: LevelPlayAdapter,
-    ) -> None:
-        """v1 fallback should use INSTANCES_V1_URL."""
-        adapter = adapter_with_mock_client
-
-        v1_response = _make_response(json_data=[])
-
-        call_count = 0
-
-        async def side_effect(*args: Any, **kwargs: Any) -> httpx.Response:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return _make_response(404)
-            else:
-                return v1_response
-
-        adapter._client.request = AsyncMock(side_effect=side_effect)
-
-        await adapter.get_instances("test_key")
-
-        # Second call should be to v1 URL
-        second_call = adapter._client.request.call_args_list[1]
-        assert second_call[0][1] == INSTANCES_V1_URL
-
-    async def test_v3_410_falls_back_to_v1(
-        self,
-        adapter_with_mock_client: LevelPlayAdapter,
-        instances_fixture_data: list[dict],
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """When v3 returns 410 Gone, should fall back to v1."""
-        adapter = adapter_with_mock_client
-
-        v1_response = _make_response(json_data=instances_fixture_data)
-
-        call_count = 0
-
-        async def side_effect(*args: Any, **kwargs: Any) -> httpx.Response:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return _make_response(410)
-            else:
-                return v1_response
-
-        adapter._client.request = AsyncMock(side_effect=side_effect)
-
-        with caplog.at_level(logging.WARNING, logger="admedi.adapters.levelplay"):
-            instances = await adapter.get_instances("test_key")
-
-        assert len(instances) == 4
-        assert any("falling back to v1" in msg for msg in caplog.messages)
-
-    async def test_both_v3_and_v1_410_returns_empty(
-        self,
-        adapter_with_mock_client: LevelPlayAdapter,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """When both v3 and v1 return 410, should return empty list gracefully."""
-        adapter = adapter_with_mock_client
-
-        adapter._client.request = AsyncMock(return_value=_make_response(410))
-
-        with caplog.at_level(logging.WARNING, logger="admedi.adapters.levelplay"):
-            instances = await adapter.get_instances("test_key")
-
-        assert instances == []
-        assert any("unavailable" in msg for msg in caplog.messages)
-
-    async def test_non_404_error_raises(
-        self,
-        adapter_with_mock_client: LevelPlayAdapter,
-    ) -> None:
-        """Non-404/410 ApiError (e.g., 403) should be raised, not caught for fallback."""
-        adapter = adapter_with_mock_client
-        resp_403 = _make_response(403)
-
-        adapter._client.request = AsyncMock(return_value=resp_403)
-
-        with pytest.raises(ApiError) as exc_info:
-            await adapter.get_instances("test_key")
-
-        assert exc_info.value.status_code == 403
-
-    # -- Object wrapper extraction tests --
+    # -- Defensive object-wrapper extraction tests --
 
     async def test_dict_with_instances_key_unwrapped(
         self,
         adapter_with_mock_client: LevelPlayAdapter,
     ) -> None:
-        """Response wrapped in a dict with 'instances' key should be unwrapped."""
+        """A (synthetic, contract-defensive) dict with 'instances' key should be unwrapped.
+
+        NOT an observed v4 shape — v4 returns a top-level list — but the
+        defensive unwrap is exercised here so it stays covered.
+        """
         adapter = adapter_with_mock_client
         wrapped = {
             "instances": [
-                {"id": 1, "name": "Test", "networkName": "ironSource", "isBidder": False},
+                {
+                    "instanceId": 1,
+                    "instanceName": "Test",
+                    "networkName": "ironSource",
+                    "isBidder": False,
+                },
             ]
         }
         response = _make_response(json_data=wrapped)
@@ -3221,6 +2959,7 @@ class TestGetInstances:
 
         assert len(instances) == 1
         assert instances[0].instance_name == "Test"
+        assert instances[0].instance_id == 1
 
     async def test_dict_without_instances_key_returns_empty(
         self,
@@ -3237,6 +2976,25 @@ class TestGetInstances:
 
         assert instances == []
         assert any("expected a list or dict" in msg for msg in caplog.messages)
+
+    # -- Error propagation --
+
+    async def test_error_response_raises(
+        self,
+        adapter_with_mock_client: LevelPlayAdapter,
+    ) -> None:
+        """A non-2xx ApiError (e.g., 403) propagates — there is no v3/v1 fallback."""
+        adapter = adapter_with_mock_client
+        resp_403 = _make_response(403)
+
+        adapter._client.request = AsyncMock(return_value=resp_403)
+
+        with pytest.raises(ApiError) as exc_info:
+            await adapter.get_instances("test_key")
+
+        assert exc_info.value.status_code == 403
+        # Only a single (v4) call — no fallback.
+        assert adapter._client.request.call_count == 1
 
     # -- Edge case tests --
 
@@ -3261,7 +3019,7 @@ class TestGetInstances:
         """Instance with only required fields should parse with defaults."""
         adapter = adapter_with_mock_client
         data = [
-            {"name": "Minimal Instance", "networkName": "TestNetwork"},
+            {"instanceName": "Minimal Instance", "networkName": "TestNetwork"},
         ]
         response = _make_response(json_data=data)
         adapter._client.request = AsyncMock(return_value=response)
@@ -3280,21 +3038,140 @@ class TestGetInstances:
         assert inst.is_live is None
         assert inst.is_optimized is None
 
-    async def test_calls_v3_with_correct_params(
-        self,
-        adapter_with_mock_client: LevelPlayAdapter,
-    ) -> None:
-        """get_instances() should call v3 URL with appKey query param."""
-        adapter = adapter_with_mock_client
-        response = _make_response(json_data=[])
-        adapter._client.request = AsyncMock(return_value=response)
 
-        await adapter.get_instances("my_app_key_123")
+# ---------------------------------------------------------------------------
+# Tests: delete_instance() -- Instances v4 DELETE + error mapping
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteInstance:
+    """Tests for LevelPlayAdapter.delete_instance() against Instances v4.
+
+    All tests mock the HTTP transport (no network). They assert the exact
+    DELETE URL + ``{"ids": [id]}`` body and that the v4 error codes
+    ``ERR-1412`` (default instance) / ``ERR-1427`` (invalid id) map to a
+    clear, method-named ApiError that preserves the original status code and
+    errorsArray payload.
+    """
+
+    @pytest.fixture
+    def adapter_with_mock_client(
+        self, mock_credential: Credential
+    ) -> LevelPlayAdapter:
+        """Return a pre-authenticated adapter with a mocked httpx client."""
+        adapter = LevelPlayAdapter(mock_credential)
+        _pre_authenticate(adapter)
+        adapter._client = AsyncMock(spec=httpx.AsyncClient)
+        return adapter
+
+    async def test_issues_v4_delete_with_ids_body(
+        self, adapter_with_mock_client: LevelPlayAdapter
+    ) -> None:
+        """delete_instance() should DELETE the v4 path-segment URL with {"ids":[id]}."""
+        adapter = adapter_with_mock_client
+        adapter._client.request.return_value = _make_response(200, json_data={})
+
+        await adapter.delete_instance("my_app_key_123", 123456789)
 
         call_args = adapter._client.request.call_args
-        assert call_args[0][0] == "GET"
-        assert call_args[0][1] == INSTANCES_V3_URL
-        assert call_args.kwargs["params"] == {"appKey": "my_app_key_123"}
+        assert call_args[0][0] == "DELETE"
+        assert call_args[0][1] == f"{INSTANCES_V4_URL}/my_app_key_123/"
+        assert call_args[0][1] == (
+            "https://platform.ironsrc.com/levelPlay/network/instances/v4/"
+            "my_app_key_123/"
+        )
+        assert call_args.kwargs["json"] == {"ids": [123456789]}
+
+    async def test_returns_none_on_success(
+        self, adapter_with_mock_client: LevelPlayAdapter
+    ) -> None:
+        """A successful delete returns None."""
+        adapter = adapter_with_mock_client
+        adapter._client.request.return_value = _make_response(200, json_data={})
+
+        result = await adapter.delete_instance("app_key", 42)
+
+        assert result is None
+
+    async def test_err_1412_default_instance_maps_to_clear_error(
+        self, adapter_with_mock_client: LevelPlayAdapter
+    ) -> None:
+        """A 400 with ERR-1412 (default instance) maps to a clear, method-named ApiError."""
+        adapter = adapter_with_mock_client
+        body = {
+            "errorsArray": [
+                {
+                    "code": "ERR-1412",
+                    "errorMessage": "This is a default instance and can't be deleted",
+                    "params": {},
+                }
+            ],
+            "code": 400,
+        }
+        adapter._client.request.return_value = _make_response(400, json_data=body)
+
+        with pytest.raises(ApiError) as exc_info:
+            await adapter.delete_instance("app_key", 777)
+
+        err = exc_info.value
+        # Message names the method and surfaces the default-instance reason.
+        assert "delete_instance()" in str(err)
+        assert "default instance" in str(err)
+        assert "ERR-1412" in str(err)
+        assert str(777) in str(err)
+        # Original status code + errorsArray payload preserved.
+        assert err.status_code == 400
+        assert err.response_body == body
+
+    async def test_err_1427_invalid_id_maps_to_clear_error(
+        self, adapter_with_mock_client: LevelPlayAdapter
+    ) -> None:
+        """A 400 with ERR-1427 (invalid id) maps to a clear, method-named ApiError."""
+        adapter = adapter_with_mock_client
+        body = {
+            "errorsArray": [
+                {
+                    "code": "ERR-1427",
+                    "errorMessage": "Instance ID value is not valid",
+                    "params": {},
+                }
+            ],
+            "code": 400,
+        }
+        adapter._client.request.return_value = _make_response(400, json_data=body)
+
+        with pytest.raises(ApiError) as exc_info:
+            await adapter.delete_instance("app_key", 999999999)
+
+        err = exc_info.value
+        assert "delete_instance()" in str(err)
+        assert "invalid instance id" in str(err)
+        assert "ERR-1427" in str(err)
+        assert str(999999999) in str(err)
+        assert err.status_code == 400
+        assert err.response_body == body
+
+    async def test_unmapped_4xx_error_propagates_unchanged(
+        self, adapter_with_mock_client: LevelPlayAdapter
+    ) -> None:
+        """A 4xx whose code is not ERR-1412/ERR-1427 propagates unchanged."""
+        adapter = adapter_with_mock_client
+        body = {
+            "errorsArray": [
+                {"code": "ERR-9999", "errorMessage": "Some other error", "params": {}}
+            ],
+            "code": 400,
+        }
+        adapter._client.request.return_value = _make_response(400, json_data=body)
+
+        with pytest.raises(ApiError) as exc_info:
+            await adapter.delete_instance("app_key", 5)
+
+        err = exc_info.value
+        # Not re-wrapped: original generic _request message, not method-named.
+        assert "delete_instance()" not in str(err)
+        assert err.status_code == 400
+        assert err.response_body == body
 
 
 # ===========================================================================

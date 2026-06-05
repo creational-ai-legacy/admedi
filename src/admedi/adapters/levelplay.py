@@ -34,7 +34,7 @@ from admedi import __version__
 from admedi.adapters.mediation import AdapterCapability, MediationAdapter
 from pydantic import ValidationError
 
-from admedi.constants import APPS_URL, AUTH_URL, GROUPS_V4_URL, INSTANCES_V1_URL, INSTANCES_V3_URL
+from admedi.constants import APPS_URL, AUTH_URL, GROUPS_V4_URL, INSTANCES_V4_URL
 from admedi.exceptions import (
     AdapterNotSupportedError,
     ApiError,
@@ -822,6 +822,7 @@ class LevelPlayAdapter(MediationAdapter):
         *,
         waterfall_payload: dict[str, Any] | None = None,
         include_tier_fields: bool = True,
+        membership_payload: list[dict[str, Any]] | None = None,
     ) -> Group:
         """Update an existing mediation group.
 
@@ -834,6 +835,19 @@ class LevelPlayAdapter(MediationAdapter):
         When ``waterfall_payload`` is provided, it is included as
         ``adSourcePriority`` in the PUT body to set waterfall ordering.
 
+        When ``membership_payload`` is provided (the network-removal lever),
+        it is included as the group's ``instances`` array — the trimmed
+        keep-set of instances that should remain in the group. This is how a
+        network is dropped from a live waterfall: omitting an instance from
+        ``membership_payload`` removes it (including default instances, which
+        cannot be erased via the Instances v4 DELETE). To avoid the server
+        stripping group metadata when ``instances`` is sent, ``segments`` and
+        ``floorPrice`` are additionally echoed from the passed ``group``
+        object when present (the caller sources these from the fresh live
+        group, never from a preset-derived group). When ``membership_payload``
+        is ``None`` (default), the PUT body is byte-identical to a
+        waterfall/tier-only update — no ``instances`` key and no metadata echo.
+
         Args:
             app_key: The LevelPlay app key.
             group_id: ID of the group to update.
@@ -845,6 +859,12 @@ class LevelPlayAdapter(MediationAdapter):
             include_tier_fields: When ``True`` (default), include
                 ``groupName``, ``countries``, and ``position`` in the PUT
                 body. When ``False``, omit them for waterfall-only updates.
+            membership_payload: Optional trimmed list of instance membership
+                entries (each ``Instance.model_dump(by_alias=True,
+                exclude_none=True)``) to set as the group's ``instances``
+                array — the removal lever. When ``None`` (default), no
+                ``instances`` key and no ``segments``/``floorPrice`` echo are
+                sent (no-op relative to today's behavior).
 
         Returns:
             The updated ``Group`` fetched from the server after the PUT.
@@ -877,6 +897,21 @@ class LevelPlayAdapter(MediationAdapter):
 
         if waterfall_payload is not None:
             payload["adSourcePriority"] = waterfall_payload
+
+        if membership_payload is not None:
+            # Removal lever: set the group's instance membership to the
+            # trimmed keep-set. Echo segments/floorPrice from the passed
+            # group so the server does not strip them when instances is sent.
+            # NOTE (provisional until Step 7 live round-trip): these PUT-body
+            # keys ("segments" — no alias on Group.segments; "floorPrice" —
+            # the alias for Group.floor_price) and server preservation of a
+            # combined instances+metadata PUT are unverified-by-live; the echo
+            # is implemented defensively per the plan's Open Question 1.
+            payload["instances"] = membership_payload
+            if group.segments is not None:
+                payload["segments"] = group.segments
+            if group.floor_price is not None:
+                payload["floorPrice"] = group.floor_price
 
         logger.info(
             "Updating group %d ('%s') for app '%s'",
@@ -941,19 +976,16 @@ class LevelPlayAdapter(MediationAdapter):
         )
 
     async def get_instances(self, app_key: str) -> list[Instance]:
-        """Get all ad network instances for an app from the Instances API.
+        """Get all ad network instances for an app from the Instances v4 API.
 
-        .. note::
-            Deprecated path / currently unused. v3 and v1 are sunset
-            (March 2025); production reads instances from Groups v4
-            (``group.instances``). Repoint to Instances v4
-            (``/levelPlay/network/instances/v4/{appKey}/``) if a standalone
-            instance read is ever needed.
-
-        Uses v3 as the primary endpoint and falls back to v1 if v3 returns
-        a 404 (``ApiError`` with ``status_code=404``). Field names from
-        the API response are normalized to match the ``Instance`` model
-        aliases before validation.
+        Issues ``GET f"{INSTANCES_V4_URL}/{app_key}/"`` — the ``appKey`` is a
+        path segment with a trailing slash (NOT a ``?appKey=`` query param).
+        The supported v4 endpoint returns a top-level JSON list of instance
+        dicts; field names are re-mapped to the ``Instance`` model aliases via
+        :meth:`_normalize_instance_response` before validation. The old
+        standalone v3/v1 endpoints are sunset (``410 Gone`` as of March 2026)
+        and are no longer consulted; production also reads instances embedded
+        in Groups v4 (``group.instances``).
 
         Args:
             app_key: The LevelPlay app key to fetch instances for.
@@ -962,8 +994,7 @@ class LevelPlayAdapter(MediationAdapter):
             List of ``Instance`` models, one per ad network instance.
 
         Raises:
-            ApiError: If the API returns a non-retryable HTTP error
-                (other than 404 during v3/v1 fallback).
+            ApiError: If the API returns a non-retryable HTTP error.
             RateLimitError: If the instances endpoint rate budget is exhausted.
 
         Example::
@@ -973,49 +1004,18 @@ class LevelPlayAdapter(MediationAdapter):
                 for inst in instances:
                     print(f"{inst.instance_name} ({inst.network_name})")
         """
-        try:
-            response = await self._request(
-                "GET",
-                INSTANCES_V3_URL,
-                params={"appKey": app_key},
-                endpoint_key="instances",
-            )
-        except ApiError as exc:
-            if exc.status_code in (404, 410):
-                logger.warning(
-                    "Instances v3 returned %d for app '%s', falling back to v1",
-                    exc.status_code,
-                    app_key,
-                )
-                try:
-                    response = await self._request(
-                        "GET",
-                        INSTANCES_V1_URL,
-                        params={"appKey": app_key},
-                        endpoint_key="instances",
-                    )
-                except ApiError as v1_exc:
-                    if v1_exc.status_code in (404, 410):
-                        logger.warning(
-                            "Instances v1 also returned %d for app '%s'. "
-                            "Instances v3/v1 are deprecated (March 2025); admedi "
-                            "reads instances from Groups v4 (group.instances). "
-                            "The standalone Instances v4 API "
-                            "(/levelPlay/network/instances/v4) is the upgrade "
-                            "path if a direct instance read is ever needed.",
-                            v1_exc.status_code,
-                            app_key,
-                        )
-                        return []
-                    raise
-            else:
-                raise
+        response = await self._request(
+            "GET",
+            f"{INSTANCES_V4_URL}/{app_key}/",
+            endpoint_key="instances",
+        )
 
         if not response:
             return []
 
-        # Unwrap object wrapper: if response is a dict with an "instances" key,
-        # extract the list from that key
+        # Defensive unwrap (contract-defensive only — NOT an observed v4 shape):
+        # the v4 endpoint returns a top-level list, but if a dict with an
+        # "instances" key ever appears, extract the list from that key.
         if isinstance(response, dict):
             if "instances" in response:
                 response = response["instances"]
@@ -1054,64 +1054,40 @@ class LevelPlayAdapter(MediationAdapter):
         return instances
 
     def _normalize_instance_response(self, raw: dict[str, Any]) -> dict[str, Any]:
-        """Normalize alternate field names from the Instances API to model aliases.
+        """Re-map raw Instances v4 field names to ``Instance`` model aliases.
 
-        Performs defensive remapping: only renames a field if the alternate key
-        exists and the canonical key does not. This avoids data loss if the API
-        returns both keys.
+        The v4 GET schema names the instance identifier ``instanceId`` and its
+        display name ``instanceName``; the ``Instance`` model expects the
+        canonical aliases ``id`` and ``name``. ``networkName``/``adUnit``/
+        ``isBidder``/``isLive`` already match the model aliases and pass through
+        unchanged (v4 ``isLive`` is already a bool — no string normalization).
 
-        Field mappings:
-        - ``providerName`` -> ``networkName``
-        - ``instanceName`` -> ``name``
-        - ``instanceId`` -> ``id``
-        - ``globalPricing`` -> ``groupRate``
-        - ``countriesPricing`` -> ``countriesRate`` (with sub-field
-          normalization: ``country`` -> ``countryCode``, ``eCPM`` -> ``rate``)
-        - ``isLive`` string normalization: ``"active"`` -> ``True``,
-          ``"inactive"`` -> ``False``
+        v4-only keys (``adFormat``, ``groups``, instance-level ``rate``,
+        ``appConfig*``/``instanceConfig*`` incl. the
+        ``MISSING_INSTANCE_CONFIGURATION`` sentinel, and the literal ``"null"``
+        quirk key) are left in place and silently dropped by Pydantic's default
+        ``extra="ignore"`` — the ``Instance`` model is intentionally NOT
+        extended for them (Option B).
+
+        The remap is defensive: a field is only renamed when the alternate key
+        exists and the canonical key does not, so no data is lost if both appear.
 
         Args:
-            raw: Raw instance dict from the API response.
+            raw: Raw instance dict from the v4 API response.
 
         Returns:
             Normalized dict ready for ``Instance.model_validate()``.
         """
         result = dict(raw)
 
-        # Top-level field renames (defensive: only if alternate exists and canonical does not)
+        # v4 field renames (defensive: only if alternate exists and canonical does not)
         field_renames: dict[str, str] = {
-            "providerName": "networkName",
-            "instanceName": "name",
             "instanceId": "id",
-            "globalPricing": "groupRate",
+            "instanceName": "name",
         }
         for alt_key, canonical_key in field_renames.items():
             if alt_key in result and canonical_key not in result:
                 result[canonical_key] = result.pop(alt_key)
-
-        # countriesPricing -> countriesRate with sub-field normalization
-        if "countriesPricing" in result and "countriesRate" not in result:
-            countries_pricing = result.pop("countriesPricing")
-            if countries_pricing is not None and isinstance(countries_pricing, list):
-                normalized_entries: list[dict[str, Any]] = []
-                for entry in countries_pricing:
-                    normalized_entry = dict(entry)
-                    if "country" in normalized_entry and "countryCode" not in normalized_entry:
-                        normalized_entry["countryCode"] = normalized_entry.pop("country")
-                    if "eCPM" in normalized_entry and "rate" not in normalized_entry:
-                        normalized_entry["rate"] = normalized_entry.pop("eCPM")
-                    normalized_entries.append(normalized_entry)
-                result["countriesRate"] = normalized_entries
-            else:
-                result["countriesRate"] = countries_pricing
-
-        # isLive string normalization: "active" -> True, "inactive" -> False
-        if "isLive" in result and isinstance(result["isLive"], str):
-            is_live_str = result["isLive"].lower()
-            if is_live_str == "active":
-                result["isLive"] = True
-            elif is_live_str == "inactive":
-                result["isLive"] = False
 
         return result
 
@@ -1161,23 +1137,91 @@ class LevelPlayAdapter(MediationAdapter):
     async def delete_instance(
         self, app_key: str, instance_id: int
     ) -> None:
-        """Delete an ad network instance.
+        """Erase an ad network instance record via the Instances v4 DELETE.
 
-        .. note::
-            Not yet implemented. Deferred to the ConfigEngine write task.
-            Will use the LevelPlay Instances API DELETE endpoint.
+        Issues ``DELETE f"{INSTANCES_V4_URL}/{app_key}/"`` with a JSON body of
+        ``{"ids": [instance_id]}`` (atomic batch shape; this method deletes a
+        single id). The API returns HTTP 200 on success.
+
+        .. important::
+            This is **record erasure**, NOT the waterfall-removal lever. To
+            remove a network from an app's live waterfalls (including default
+            instances), the engine trims the Groups v4 ``instances[]``
+            membership array via :meth:`update_group` -- it does NOT call this
+            method. ``delete_instance`` permanently deletes the instance record
+            itself, which is rarely what removal needs.
+
+        The LevelPlay v4 API blocks deleting a **default** instance with
+        ``ERR-1412`` ("This is a default instance and can't be deleted"); this
+        is expected -- the removal lever (Groups membership PUT) does not rely
+        on DELETE, so a default instance is simply dropped from the waterfall
+        membership rather than erased. An invalid/unknown id returns
+        ``ERR-1427`` ("Instance ID value is not valid"). Both are re-raised as
+        an :class:`ApiError` whose message names this method and preserves the
+        original status code and ``errorsArray`` payload for the caller.
+
+        Error body shape (LevelPlay v4)::
+
+            {"errorsArray": [{"code", "errorMessage", "params"}], "code": 400}
 
         Args:
             app_key: The LevelPlay app key.
-            instance_id: ID of the instance to delete.
+            instance_id: ID of the instance record to erase.
 
         Raises:
-            AdapterNotSupportedError: Always -- method not yet implemented.
+            ApiError: If the API request fails. For a 4xx whose first
+                ``errorsArray`` code is ``ERR-1412`` (default instance) or
+                ``ERR-1427`` (invalid id), a clear, method-named error is
+                raised that preserves ``status_code``, the original code, and
+                the original ``errorsArray`` payload; other errors propagate
+                unchanged.
+
+        Example::
+
+            await adapter.delete_instance("1a2b3c4d5", 123456789)
         """
-        raise AdapterNotSupportedError(
-            "delete_instance() is not yet implemented in the LevelPlay adapter. "
-            "Write operations are deferred to the ConfigEngine task."
+        logger.info(
+            "Deleting instance %d for app '%s'",
+            instance_id,
+            app_key,
         )
+
+        try:
+            await self._request(
+                "DELETE",
+                f"{INSTANCES_V4_URL}/{app_key}/",
+                json_body={"ids": [instance_id]},
+                endpoint_key="instances",
+            )
+        except ApiError as exc:
+            if 400 <= exc.status_code <= 499 and isinstance(exc.response_body, dict):
+                errors = exc.response_body.get("errorsArray")
+                first = errors[0] if isinstance(errors, list) and errors else None
+                code = first.get("code") if isinstance(first, dict) else None
+
+                if code == "ERR-1412":
+                    raise ApiError(
+                        f"delete_instance() cannot delete instance {instance_id} "
+                        f"for app '{app_key}': it is a default instance "
+                        f"(ERR-1412 — default instances can't be deleted; use the "
+                        f"Groups v4 membership PUT to remove it from a waterfall).",
+                        status_code=exc.status_code,
+                        response_body=exc.response_body,
+                    ) from exc
+                if code == "ERR-1427":
+                    reason = (
+                        first.get("errorMessage", "instance id value is not valid")
+                        if isinstance(first, dict)
+                        else "instance id value is not valid"
+                    )
+                    raise ApiError(
+                        f"delete_instance() cannot delete instance {instance_id} "
+                        f"for app '{app_key}': invalid instance id "
+                        f"(ERR-1427 — {reason}).",
+                        status_code=exc.status_code,
+                        response_body=exc.response_body,
+                    ) from exc
+            raise
 
     async def get_placements(self, app_key: str) -> list[Placement]:
         """Get all placements for an app.

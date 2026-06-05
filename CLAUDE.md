@@ -26,7 +26,7 @@ See `PROJECT_STATE.md` for current status and progress. See `README.md` for how 
 - Install via GitHub, not PyPI: `pip install git+https://github.com/creational-ai-legacy/admedi`
 - GitHub repo: `creational-ai-legacy/admedi` (repo moved here from the `creational-ai` org). Use the legacy identity for git remotes: `git@github-creational-legacy:creational-ai-legacy/admedi.git` (key `id_ed25519_creational`). The `docchang` account has only READ access.
 - Existing open-source base to draw patterns from: `ironSource/mobile-api-lib-python` (abandoned Dec 2022, Apache-2.0)
-- Licensing: Apache-2.0 for open-source core. Commercial `/ee` directory for SaaS features.
+- Licensing: MIT for open-source core. Commercial `/ee` directory for SaaS features.
 
 ---
 

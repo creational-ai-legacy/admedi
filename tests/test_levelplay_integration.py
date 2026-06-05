@@ -124,12 +124,12 @@ class TestLevelPlayIntegration:
                 )
 
     async def test_get_instances(self, credential: Credential) -> None:
-        """Test standalone Instances API and group-embedded instances.
+        """Test the standalone Instances v4 API and group-embedded instances.
 
-        The standalone Instances API (v3 and v1) returns 410 Gone as of
-        2026. The adapter should handle this gracefully by returning an
-        empty list. Instance data is now only available embedded in
-        Groups v4 responses.
+        ``get_instances`` now runs against the supported Instances v4 endpoint
+        (``levelPlay/network/instances/v4/{appKey}/``), which returns a live
+        list of instances. Group-embedded instances (Groups v4) are still
+        available and should also be non-empty.
         """
         async with LevelPlayAdapter(credential) as adapter:
             apps = await adapter.list_apps()
@@ -137,12 +137,15 @@ class TestLevelPlayIntegration:
 
             app_key = apps[0].app_key
 
-            # Standalone API returns 410 — adapter should return empty list
+            # Standalone Instances v4 returns a live list of instances.
             instances = await adapter.get_instances(app_key)
             print(f"\n  App: {apps[0].app_name} (key={app_key})")
-            print(f"  Standalone instances: {len(instances)} (expected 0 — API is 410 Gone)")
+            print(f"  Standalone v4 instances: {len(instances)}")
+            assert len(instances) > 0, (
+                "Expected at least one instance from the Instances v4 endpoint"
+            )
 
-            # Instance data is embedded in Groups v4 responses
+            # Instance data is also embedded in Groups v4 responses.
             groups = await adapter.get_groups(app_key)
             total_instances = sum(
                 len(g.instances) for g in groups if g.instances

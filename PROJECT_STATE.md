@@ -1,10 +1,10 @@
 # Project State: Admedi
 
-> **Last Updated**: 2026-03-18T00:40:25-0700
+> **Last Updated**: 2026-06-05T01:07:03-0700
 
 **Admedi** is a config-driven ad mediation management tool that replaces manual dashboard clicking with config-as-code: define country tiers in YAML, diff against live mediation configs via platform APIs, and sync across an entire app portfolio.
 
-**Current Status**: Core milestone nearing completion -- Foundation, Auth-Reads, Config-Engine, Snapshot-Unify, Unified-Settings, Sync-UX, Settings-Redesign, and Sync-Networks tasks complete. Network waterfall sync operational via shared `networks.yaml` presets, dict-format settings, and scoped `--tiers`/`--networks` sync flags. 1533 tests passing. Next: Dogfood on Shelf Sort portfolio.
+**Current Status**: Core milestone nearing completion -- Foundation, Auth-Reads, Config-Engine, Snapshot-Unify, Unified-Settings, Sync-UX, Settings-Redesign, Sync-Networks, and V4-Remove-Instances tasks complete. Network removal now wired end-to-end (drop a network from a preset + `sync` removes it from every live waterfall via Groups v4 `instances[]` membership PUT, including default instances), and the Instances adapter runs on the supported v4 endpoint (`get`/`delete`; `create`/`update` deferred under Option B). 1546 tests passing. Next: operator-gated applied-group round-trip, then Dogfood on Shelf Sort portfolio.
 
 ---
 
@@ -22,11 +22,12 @@
 | sync-ux | Sync command UX improvements | refactor | ✅ Complete | 242 passing | `core-sync-ux-*.md` |
 | settings-redesign | Three-layer settings architecture | refactor | ✅ Complete | 469 passing | `core-settings-redesign-*.md` |
 | sync-networks | Network waterfall sync | feature | ✅ Complete | 128 new (776 affected) | `core-sync-networks-*.md` |
+| v4-remove-instances | Network removal on sync + Instances v4 migration | feature+refactor | ✅ Complete | 1546 passing (24 new) | `core-v4-remove-instances-*.md` |
 | dogfood | Shelf Sort Dogfood | validation | ⬜ Pending | -- | -- |
 
-**Post-Core (deferred)**: Instance CRUD, placement ops, reporting API, MCP server, `admedi revenue`, `admedi manage-instances`
+**Post-Core (deferred)**: Instance create/update (Option B — shapes banked in `migration.md`), placement ops, reporting API, MCP server, `admedi revenue`, `admedi manage-instances`
 
-**Total Tests**: 1533 passing, 10 deselected (integration markers)
+**Total Tests**: 1546 passing, 10 deselected (integration markers); 7 live `tests/integration/` probes RAN+passed with creds
 
 ---
 
@@ -60,64 +61,67 @@
 | 2026-03-18 | SyncScope as Pydantic model with dual booleans | Validated defaults (both=True), type-safe field access, composable `--tiers`/`--networks` flags |
 | 2026-03-18 | Abort-on-ambiguity for waterfall resolution | Ambiguous or name-change failures block the entire group's waterfall update; conservative safety for live API writes |
 | 2026-03-18 | `include_tier_fields` partial PUT pattern | `--networks` only sends `groupId + adFormat + adSourcePriority`, server preserves existing tier fields |
+| 2026-06-05 | Removal lever = Groups v4 `instances[]` membership PUT (not Instances DELETE) | Membership trim works on default instances where Instances v4 DELETE is blocked by `ERR-1412`; removal rides `scope.networks`, no new flag |
+| 2026-06-05 | Removal set re-derived in applier (Option A1), differ stays display-only | Reuses the proven preset-vs-live resolver; no `FieldChange` schema change |
+| 2026-06-05 | Defer `create_instances`/`update_instances` (Option B) | No live consumer; `create` bidder-gating unverified; both alone would force extending the central `Instance` model. Shapes banked in `migration.md` |
+| 2026-06-05 | `Instance` model unchanged under v4 migration | `get` re-map drops extra v4 keys via `extra="ignore"`; `delete` takes an `int`; only the deferred create/update needed new fields |
+| 2026-06-05 | Echo `segments`/`floorPrice` from fresh live group behind tier-field equality guard | Metadata-source and tier-field source share `update_group`'s `group` arg; guard aborts on live-vs-desired mismatch to prevent silent rename in the PUT |
 
 ---
 
 ## What's Next
 
 **Recommended Next Steps**:
-1. Run `admedi pull --app hexar-ios` against live API to verify end-to-end with dict-format settings and networks.yaml
-2. Migrate: pull all apps, rename auto-generated groups, delete old files (`admedi.yaml`, `*-tiers.yaml`)
-3. Portfolio Dogfood -- real Shelf Sort validation with `admedi sync` (tiers + networks)
-4. After dogfood: open-source packaging, MCP server, extended operations
+1. **Operator-gated applied-group round-trip** (Open Question 1) -- apply network removal on ONE real group (e.g. ss-google rewarded Tier 1) and confirm in the dashboard that the network is gone AND `segments`/`floorPrice`/other instances survive the combined `instances`+metadata PUT. This validates the provisional Step-4 PUT-body keys; do this BEFORE any portfolio sweep. (NOT dev work -- a live-write operator action the executor deliberately stopped short of.)
+2. Run `admedi pull --app hexar-ios` against live API to verify end-to-end with dict-format settings and networks.yaml
+3. Migrate: pull all apps, rename auto-generated groups, delete old files (`admedi.yaml`, `*-tiers.yaml`)
+4. Portfolio Dogfood -- real Shelf Sort validation with `admedi sync` (tiers + networks + removal)
+5. After dogfood: open-source packaging, MCP server, extended operations (instance create/update under Option B)
 
-**System Status**: ✅ **Network Sync Complete**
+**System Status**: ✅ **Network Removal + Instances v4 Complete**
 - Three-layer resolution: per-app -> tiers.yaml -> countries.yaml -> `list[PortfolioTier]`
 - Network waterfall sync: shared `networks.yaml` presets, `adSourcePriority` PUT
+- **Network removal: drop from preset + `sync` trims it from every live waterfall via Groups v4 `instances[]` membership PUT (incl. default instances); rides `scope.networks`, no new flag**
+- **Instances adapter on supported v4 endpoint: `get_instances` re-mapped, `delete_instance` live (ERR-1412/ERR-1427 mapped); `create`/`update` deferred (Option B); 3 dead constants removed; `Instance` model unchanged**
 - Scoped sync: `--tiers` only, `--networks` only, no flags = full sync
 - Dict-format settings: `{countries: ref, networks: ref}` per group
-- 4 CLI commands: pull (smart matching + network presets), audit, sync (unified + scoped), status
+- 4 CLI commands: pull (smart matching + network presets), audit, sync (unified + scoped + removal), status
 - Pull-edit-sync workflow: `pull` writes settings + networks.yaml, user edits, `sync` reads and applies
 - Cross-app sync with network preset resolution against destination app instances
 - Graceful degradation: missing networks produce warnings, not errors
-- Safety: dry-run default, pre-write snapshots, A/B test detection, post-write verification, per-app error isolation, abort-on-ambiguity
-- 1533 tests passing
+- Safety: dry-run default, pre-write snapshots, A/B test detection, post-write verification, per-app error isolation, abort-on-ambiguity, tier-field equality guard on the removal PUT
+- 1546 tests passing; 7 live `tests/integration/` probes RAN+passed with creds
 
 ---
 
 ## Latest Health Check
 
-### 2026-03-18 - Sync-Networks Task Finalization
+### 2026-06-05T01:07:03-0700 - V4-Remove-Instances Task Finalization
 **Status**: ✅ On Track
 
 **Context**:
-Sync-Networks task completed -- a feature task in the Core milestone. Added network waterfall sync: shared `networks.yaml` presets, dict-format `{countries: ref, networks: ref}` settings, network differ, waterfall apply via `adSourcePriority` PUT, and scoped `--tiers`/`--networks` sync flags. All 12 success criteria met.
+V4-Remove-Instances task completed via an autonomous `/dev-execute-run --auto` run -- a feature (network removal) + refactor (Instances v4 migration) task in the Core milestone. All 8 steps (Step 0 baseline + Steps 1-7) complete. Closes the two gaps flagged in design: (1) `sync` refused to remove a network dropped from a preset (manual dashboard work), and (2) the Instances adapter pointed at `410 Gone` v3/v1 endpoints. All 7 success criteria met; the applied-group round-trip is intentionally operator-gated.
 
 **Findings**:
-- ✅ Work directly aligned with Core milestone -- network sync was the last feature before dogfood
-- ✅ Architecture clean: SyncScope threads through differ (skip tier comparisons) and applier (control PUT payload) as layered concerns, no coupling between layers
-- ✅ No scope drift -- all 11 steps implemented per plan, one pragmatic deviation (passing tiers list through applier chain for preset lookup) documented and justified
-- ✅ Complexity proportionate -- SyncScope is 2 fields, network differ follows existing tier differ pattern, `build_waterfall_payload()` is a standalone function
-- ✅ Production integration solid -- `adSourcePriority` PUT uses real LevelPlay v4 API field, waterfall payloads structured per API documentation
-- ✅ 1533 tests passing (up from 1392), 10 integration tests deselected
-- ✅ 128 new tests added across 11 steps; 338 network-specific tests total
+- ✅ Alignment: directly serves the Core milestone -- removal was the last functional gap before dogfood; both goals (removal on `sync`, Instances on v4) map straight to the goal/design docs with documented per-step goal cross-checks, no drift.
+- ✅ Production integration: live-verified, not mocked -- `get_instances` validates 29 real v4 records, `delete_instance` maps a bogus id to the live `ERR-1427`, and the ss-google dry-run renders the exact instances leaving each rewarded tier on real live data. 7 live `tests/integration/` probes RAN+passed with creds (verified RAN, not false-skipped via `env -i`).
+- ✅ Scope discipline: `Instance` model byte-for-byte unchanged (Option B), no new CLI flag (removal rides `scope.networks`), `create`/`update` deferred with shapes banked -- complexity held to the minimum the goal needs.
+- ✅ Complexity proportionate: `build_membership_payload` mirrors the existing `build_waterfall_payload` resolver (no new abstraction), the removal lever is one optional kwarg on `update_group`, the differ stays display-only (Option A1).
+- ✅ Hard gates green: dead-constants grep zero hits; `git diff --stat src/admedi/models/instance.py` empty; full suite 1546 passed / 0 failed / 10 deselected.
 
 **Challenges**:
-- Step 8 (sync flag scoping) required threading `scope`, `network_presets`, and `tiers` through the full applier call chain (apply -> _process_app -> _process_app_inner -> _execute_updates). Each layer needed parameter additions and existing mock-based tests needed assertion updates.
-- Step 5 (pull flow) naturally subsumed Step 9 (stop writing per-app network files), making Step 9 a verification-only step rather than a code change step.
+- Baseline was NOT green -- 2 pre-existing reds (`test_both_v3_and_v1_410_returns_empty`, `test_name_mismatch_produces_missing`), both inside the rewrite surface. Isolated via stash to confirm pre-existence; Step 2 deleted the first, Step 5 reconciled the second. The plan's "the ONLY test asserting X" note undercounted by one (caught at Step 0).
+- The metadata-echo correctness hinge: `update_group`'s single `group` arg sources both `segments`/`floorPrice` echo AND the tier fields, so swapping to the fresh live group made a diff-driven rename invisible to abort-on-drift. Resolved with an explicit live-vs-desired equality guard that aborts the write on mismatch.
+- Demonstrating the dry-run removal preview required a temporary, reverted `networks.yaml` edit (InMobi dropped from `bidding-6-2`) since live config already matched the preset; working tree confirmed clean after capture.
 
 **Results**:
-- ✅ Shared `networks.yaml` with portfolio-wide named waterfall presets
-- ✅ Dict-format settings: `{countries: ref, networks: ref}` per group
-- ✅ Scoped sync: `--tiers`, `--networks`, no flags = full sync
-- ✅ Network differ compares desired preset against live waterfall per group
-- ✅ Waterfall apply via `adSourcePriority` PUT with 5-rule instance resolution
-- ✅ Cross-app sync resolves network presets against destination app instances
-- ✅ Graceful degradation: missing networks produce warnings, not errors
+- ✅ Goal 1 (removal on `sync`): differ truthful signal + `update_group` `instances[]` lever + `build_membership_payload` keep-set + `_execute_updates` wiring; works on default instances; A/B apps skipped; dry-run lists exact instances leaving, zero writes.
+- ✅ Goal 2 (Instances on v4): `get_instances` re-mapped + `delete_instance` (ERR-1412/ERR-1427 mapped); 3 dead constants removed; `Instance` model unchanged; `create`/`update` remain documented stubs (Option B).
+- ✅ 24 net new tests; full suite 1546 passed, 0 failed, 10 deselected; ruff/mypy add zero net findings on changed source.
 
 **Lessons Learned**:
-- Scope threading as layered concern keeps each component focused: differ reads scope for comparison control, applier reads scope for payload control
-- Abort-on-ambiguity is the right safety posture for live API waterfall writes -- partial payloads with unresolved instances risk breaking production ad serving
-- Sequential plan steps can naturally subsume later steps; the later step's value becomes verification tests
+- The membership-PUT metadata echo and the tier-field source flow through one `update_group` arg, so preserving `segments`/`floorPrice` from the fresh group also swaps the tier-field source -- the live-vs-desired guard is load-bearing because abort-on-drift only sees live-vs-live.
+- The Groups v4 `instances[]` membership trim (not Instances DELETE) is the removal lever, so default instances are removed from waterfalls fine despite `ERR-1412` blocking their deletion -- the two operations are deliberately separate.
+- A module-level `pytestmark` skipif is evaluated at collection time, before any body-level dotenv load, so live probes silently module-skip unless creds are already in the process env -- verify RAN vs false-skip with `set -a; . ./.env; set +a` and an `env -i` clean-skip proof.
 
-**Next**: Run `admedi pull --app hexar-ios` against live API with dict-format settings, migrate all apps, then proceed to Portfolio Dogfood
+**Next**: Operator-gated applied-group round-trip on ONE real group (ss-google rewarded Tier 1) to confirm the server preserves `segments`/`floorPrice` on the combined `instances`+metadata PUT (Open Question 1) -- the one outstanding live-write action before any portfolio sweep. Then `admedi pull` end-to-end verification, app migration, and Portfolio Dogfood.
